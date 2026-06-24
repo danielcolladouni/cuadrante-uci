@@ -249,6 +249,136 @@ function clasificarHorarioIndividual(horario, seccion) {
   }
 }
 
+/* ============================================================
+   FASE B — Clasificación por TURNO NATURAL + cómputo de horas.
+   El turno natural (base de datos) es la verdad de referencia;
+   lo del Excel son modificaciones. El dato decisivo es el TOTAL
+   de horas del día, no la forma del horario.
+   ============================================================ */
+const UMBRAL_H = {
+  min7: 6, max7: 9,        // 7h: entre 6 y 9 horas
+  min10: 9, max10: 11,     // 10h noche: alrededor de 10h
+  min12: 11, max12: 13,    // 12h: entre 11 y 13 horas
+  dobleMin: 13,            // doblaje (natural 7h): por encima de ~13h
+  ignMax: 1.5,             // microcambios: < 1.5h se ignoran
+};
+
+// Duración en horas de un tramo "ini-fin" (cruza medianoche si fin<ini)
+function durTramoHoras(horario) {
+  let h = String(horario || "").trim();
+  if (h.charAt(0) === "*") h = h.substring(1).trim();
+  const p = h.split("-");
+  if (p.length !== 2) return 0;
+  const ini = parsearHoraAMinutos(p[0]), fin = parsearHoraAMinutos(p[1]);
+  if (ini < 0 || fin < 0) return 0;
+  const dur = fin > ini ? (fin - ini) : (24 * 60 - ini) + fin;
+  return dur / 60;
+}
+function iniTramoMin(horario) {
+  let h = String(horario || "").trim();
+  if (h.charAt(0) === "*") h = h.substring(1).trim();
+  const p = h.split("-"); return p.length === 2 ? parsearHoraAMinutos(p[0]) : -1;
+}
+// Turno natural de la BD -> categoría canónica D12/N12/N10/M/T
+function turnoNaturalCanon(turnoBD) {
+  const t = String(turnoBD || "").toUpperCase().trim();
+  if (t.indexOf("12") >= 0 && (t.indexOf("NOCHE") >= 0 || t.indexOf("NIT") >= 0)) return "N12";
+  if (t.indexOf("12") >= 0) return "D12";
+  if (t === "TM") return "M";
+  if (t === "TT") return "T";
+  if (t === "TN") return "N10";
+  return "";
+}
+function horasDeNatural(canon) {
+  switch (canon) {
+    case "D12": case "N12": return 12;
+    case "N10": return 10;
+    case "M": case "T": return 7;
+    default: return 0;
+  }
+}
+function unirHorariosTramos(validos) {
+  const ord = validos.slice().sort((a, b) => iniTramoMin(a.horario) - iniTramoMin(b.horario));
+  if (ord.length === 1) return ord[0].horario.replace("* ", "");
+  return ord.map(t => t.horario.replace("* ", "")).join(" + ");
+}
+
+// Clasifica la jornada de un profesional en un día.
+//   natural: turno natural canónico (D12/N12/N10/M/T o "")
+//   tramos: [{horario, seccion}]
+// -> { turnoFinal, horario, etiqueta, totalHoras }
+function clasificarJornadaNatural(natural, tramos) {
+  // Sumar horas SIN contar dos veces tramos idénticos (misma jornada 12h
+  // repetida en MAÑANA y TARDE como "* 8-20").
+  let total = 0;
+  const validos = [];
+  const vistos = new Set();
+  for (const tr of tramos) {
+    const d = durTramoHoras(tr.horario);
+    if (d < UMBRAL_H.ignMax) continue;
+    const clave = String(tr.horario || "").replace(/\s|\*/g, "");
+    validos.push({ ...tr, dur: d });
+    if (!vistos.has(clave)) { total += d; vistos.add(clave); }
+  }
+  if (validos.length === 0) return { turnoFinal: "IGN", horario: tramos[0] ? tramos[0].horario : "", etiqueta: "", totalHoras: 0 };
+
+  const secs = new Set(validos.map(t => t.seccion));
+  const hayMana = secs.has(TURNO.MANANA), hayTarde = secs.has(TURNO.TARDE), hayNoche = secs.has(TURNO.NOCHE);
+
+  // --- NOCHE ---
+  if (natural === "N12" || natural === "N10" || (hayNoche && !hayMana && !hayTarde)) {
+    if (total >= UMBRAL_H.min12) return { turnoFinal: TURNO.N12, horario: unirHorariosTramos(validos), etiqueta: "", totalHoras: total };
+    return { turnoFinal: TURNO.NOCHE, horario: unirHorariosTramos(validos), etiqueta: "", totalHoras: total };
+  }
+
+  // "Doble físico" = mañana Y tarde con tramos DISTINTOS (no la misma jornada repetida)
+  const horariosUnicos = new Set(validos.map(t => String(t.horario || "").replace(/\s|\*/g, "")));
+  const esDobleFisico = hayMana && hayTarde && horariosUnicos.size >= 2;
+
+  // --- 12h día natural ---
+  if (natural === "D12") {
+    if (total >= UMBRAL_H.min12 && total <= UMBRAL_H.max12 + 1) {
+      return { turnoFinal: TURNO.D12, horario: "8-20", etiqueta: "", totalHoras: total };
+    }
+    if (total > UMBRAL_H.max12 + 1) {
+      return { turnoFinal: TURNO.D12, horario: "8-20", etiqueta: "+", totalHoras: total };
+    }
+    // menos horas que un 12h => media jornada pactada. Si es un tramo de ~7h
+    // ocupa posición normal (mañana/tarde); si es muy corto, tapahuecos PARCIAL.
+    if (total >= UMBRAL_H.min7) {
+      return { turnoFinal: iniTramoMin(validos[0].horario) < 13 * 60 + 30 ? TURNO.MANANA : TURNO.TARDE,
+        horario: unirHorariosTramos(validos), etiqueta: "parcial", totalHoras: total };
+    }
+    return { turnoFinal: TURNO.PARCIAL, horario: unirHorariosTramos(validos), etiqueta: "parcial", totalHoras: total };
+  }
+
+  // --- 7h natural (mañana/tarde) ---
+  if (natural === "M" || natural === "T") {
+    if (esDobleFisico && total >= UMBRAL_H.dobleMin) {
+      return { turnoFinal: TURNO.DOBLAJE, horario: unirHorariosTramos(validos), etiqueta: "doblaje", totalHoras: total };
+    }
+    if (total > UMBRAL_H.max7 && total < UMBRAL_H.dobleMin) {
+      return { turnoFinal: esDobleFisico ? TURNO.DOBLAJE : (natural === "M" ? TURNO.MANANA : TURNO.TARDE),
+        horario: unirHorariosTramos(validos), etiqueta: "+", totalHoras: total };
+    }
+    return { turnoFinal: natural === "M" ? TURNO.MANANA : TURNO.TARDE, horario: validos[0].horario.replace("* ", ""), etiqueta: "", totalHoras: total };
+  }
+
+  // --- Natural desconocido: por forma + total ---
+  if (esDobleFisico) {
+    if (total >= UMBRAL_H.dobleMin) return { turnoFinal: TURNO.DOBLAJE, horario: unirHorariosTramos(validos), etiqueta: "", totalHoras: total };
+    return { turnoFinal: TURNO.D12, horario: "8-20", etiqueta: "", totalHoras: total };
+  }
+  // turno genuinamente corto (1.5–6h) sin natural conocido => tapahuecos PARCIAL
+  if (total < UMBRAL_H.min7) {
+    return { turnoFinal: TURNO.PARCIAL, horario: unirHorariosTramos(validos), etiqueta: "parcial", totalHoras: total };
+  }
+  if (hayMana) return { turnoFinal: TURNO.MANANA, horario: validos[0].horario.replace("* ", ""), etiqueta: "", totalHoras: total };
+  if (hayTarde) return { turnoFinal: TURNO.TARDE, horario: validos[0].horario.replace("* ", ""), etiqueta: "", totalHoras: total };
+  if (hayNoche) return { turnoFinal: TURNO.NOCHE, horario: validos[0].horario.replace("* ", ""), etiqueta: "", totalHoras: total };
+  return { turnoFinal: "?", horario: validos[0].horario.replace("* ", ""), etiqueta: "", totalHoras: total };
+}
+
 
 /* ============================================================
    PARTE 2 — Extractor (consolidación), ProfesionalesDB,
@@ -415,7 +545,7 @@ function obtenerProfesionalesDelDia(planilla, db, fechaObj) {
   }
 
   const regs = [];
-  for (const v of dict.values()) regs.push(consolidarRegistro(v));
+  for (const v of dict.values()) regs.push(consolidarRegistro(v, db));
   ordenarRegistros(regs);
   return regs;
 }
@@ -445,8 +575,10 @@ function acumularEnDict(d, nombre, cat, seccion, horario, fila, tipo) {
     v.horarios += "|" + horario;
     v.filas += ", " + fila;
     v.tipos += "|" + tipo;
+    v.tramos.push({ horario, seccion });
   } else {
-    d.set(clave, { nombre, cat, secciones: seccion, horarios: horario, filas: String(fila), tipos: tipo });
+    d.set(clave, { nombre, cat, secciones: seccion, horarios: horario, filas: String(fila), tipos: tipo,
+      tramos: [{ horario, seccion }] });
   }
 }
 
@@ -464,49 +596,20 @@ function buscarHorarioPorTipo(horarios, tipos, buscar) {
   return ph[0];
 }
 
-function consolidarRegistro(v) {
-  const r = { nombre: v.nombre, categoria: v.cat, turnoFinal: "", horario: "", reclasificado: false, filasOrigen: v.filas };
-  const secciones = v.secciones, horarios = v.horarios, tipos = v.tipos;
-  const hayMana = secciones.toUpperCase().indexOf(TURNO.MANANA) >= 0;
-  const hayTarde = secciones.toUpperCase().indexOf(TURNO.TARDE) >= 0;
-  const hayNoche = secciones.toUpperCase().indexOf(TURNO.NOCHE) >= 0;
-  const hayDoble = hayTipo(tipos, "DOBLE");
-  const hay12D = hayTipo(tipos, "D12");
-  const hay12N = hayTipo(tipos, "N12");
-  const hayN10 = hayTipo(tipos, "N10");
-  const partsH = horarios.split("|");
-  const partsS = secciones.split("|");
-
-  if (hayDoble) {
-    r.turnoFinal = TURNO.DOBLAJE; r.horario = buscarHorarioPorTipo(horarios, tipos, "DOBLE");
-  } else if (hay12D) {
-    r.turnoFinal = TURNO.D12; r.horario = "8-20";
-  } else if (hayMana && hayTarde) {
-    r.turnoFinal = TURNO.D12; r.reclasificado = true;
-    let horMana = "", horTarde = "";
-    for (let i = 0; i < partsS.length; i++) {
-      if (partsS[i] === TURNO.MANANA && horMana === "") horMana = partsH[i];
-      if (partsS[i] === TURNO.TARDE && horTarde === "") horTarde = partsH[i];
-    }
-    r.horario = horMana + " + " + horTarde;
-  } else if (hayN10) {
-    r.turnoFinal = TURNO.NOCHE; r.horario = buscarHorarioPorTipo(horarios, tipos, "N10");
-  } else if (hay12N) {
-    r.turnoFinal = TURNO.N12; r.horario = buscarHorarioPorTipo(horarios, tipos, "N12");
-  } else if (hayMana && !hayTarde && !hayNoche) {
-    r.turnoFinal = TURNO.MANANA; r.horario = partsH[0];
-  } else if (hayTarde && !hayMana && !hayNoche) {
-    r.turnoFinal = TURNO.TARDE; r.horario = partsH[0];
-  } else if (hayNoche) {
-    r.turnoFinal = TURNO.NOCHE; r.horario = partsH[0];
-  } else if (todosLosTiposSon(tipos, "IGN")) {
-    r.turnoFinal = "IGN"; r.horario = partsH[0];
-  } else if (hayTipo(tipos, "PARCIAL")) {
-    r.turnoFinal = TURNO.PARCIAL; r.horario = buscarHorarioPorTipo(horarios, tipos, "PARCIAL");
-  } else {
-    r.turnoFinal = "?"; r.horario = partsH[0];
-  }
-  return r;
+function consolidarRegistro(v, db) {
+  // FASE B: clasificar por turno natural + cómputo total de horas.
+  const natural = db ? turnoNaturalCanon(db.turnoHabitual(v.nombre)) : "";
+  const res = clasificarJornadaNatural(natural, v.tramos || []);
+  return {
+    nombre: v.nombre,
+    categoria: v.cat,
+    turnoFinal: res.turnoFinal,
+    horario: res.horario,
+    etiqueta: res.etiqueta || "",        // "doblaje" | "+" | "parcial" | ""
+    totalHoras: res.totalHoras || 0,
+    reclasificado: res.etiqueta === "doblaje",
+    filasOrigen: v.filas,
+  };
 }
 
 function ordenTurno(t) {
@@ -1343,12 +1446,17 @@ const _BLOQUES = [
 function _gridSemana(sem, db, ENGINE, S, areasLayout) {
   const grid = [];
   const fechas = Array.from({ length: 7 }, (_, i) => ENGINE.addDays(sem.fechaLunes, i));
-  // turno por día/nombre para color
+  // turno y etiqueta por día/nombre
   const turnoMap = [];
+  const etiqMap = [];
   for (let d = 0; d < 7; d++) {
     const m = new Map();
-    for (const r of sem.semana[d].regs) m.set(ENGINE.normalizarTexto(r.nombre), r.turnoFinal);
-    turnoMap.push(m);
+    const e = new Map();
+    for (const r of sem.semana[d].regs) {
+      m.set(ENGINE.normalizarTexto(r.nombre), r.turnoFinal);
+      if (r.etiqueta) e.set(ENGINE.normalizarTexto(r.nombre), r.etiqueta);
+    }
+    turnoMap.push(m); etiqMap.push(e);
   }
 
   for (const b of _BLOQUES) {
@@ -1379,7 +1487,9 @@ function _gridSemana(sem, db, ENGINE, S, areasLayout) {
             row.push({ v: "", s: S.cVacio });
           } else {
             const tf = turnoMap[d].get(ENGINE.normalizarTexto(nombre));
-            row.push({ v: db.apodo(nombre), s: _estiloPorTurno(tf, S), t: "s" });
+            const et = etiqMap[d].get(ENGINE.normalizarTexto(nombre));
+            const suf = et === "doblaje" ? " (DBL)" : et === "+" ? " (+)" : et === "parcial" ? " (½)" : "";
+            row.push({ v: db.apodo(nombre) + suf, s: _estiloPorTurno(tf, S), t: "s" });
           }
         }
         grid.push(row);
@@ -1505,6 +1615,7 @@ function exportarCronogramaXLSX(resultado, db, ENGINE) {
     construirAsignacionSemanal, generarCronograma,
     ajustarTurnosDobles, ajustarParciales, construirAvisosDecalaje,
     filasHistoricoDeSemana, regenerarInformeMensual, parsearAntiguedad,
+    turnoNaturalCanon, clasificarJornadaNatural, UMBRAL_H,
     exportarCronogramaXLSX,
   };
 
@@ -2446,7 +2557,7 @@ function Cronograma({ semana, db, ENGINE, planilla, estructura }) {
     const est = estructura || ENGINE.estructuraActiva();
     return (est.areas || []).map(a => ({ nombre: a.nombre, pIni: a.posIni, pFin: a.posFin }));
   }, [estructura, ENGINE]);
-  // Precalcular el turnoFinal de cada profesional por día para decidir color de celda
+  // Precalcular el turnoFinal y la etiqueta de cada profesional por día
   const turnoPorDiaNombre = useMemo(() => {
     const m = [];
     for (let d = 0; d < 7; d++) {
@@ -2456,6 +2567,22 @@ function Cronograma({ semana, db, ENGINE, planilla, estructura }) {
     }
     return m;
   }, [semana, ENGINE]);
+  const etiquetaPorDiaNombre = useMemo(() => {
+    const m = [];
+    for (let d = 0; d < 7; d++) {
+      const map = new Map();
+      for (const r of semana.semana[d].regs) if (r.etiqueta) map.set(ENGINE.normalizarTexto(r.nombre), r.etiqueta);
+      m.push(map);
+    }
+    return m;
+  }, [semana, ENGINE]);
+
+  function etiquetaCorta(et) {
+    if (et === "doblaje") return "DBL";
+    if (et === "+") return "+";
+    if (et === "parcial") return "½";
+    return "";
+  }
 
   function cellColor(nombre, d, bloqueIdx) {
     if (!nombre) return { background: "var(--empty)", color: "transparent" };
@@ -2473,6 +2600,9 @@ function Cronograma({ semana, db, ENGINE, planilla, estructura }) {
         <LegendItem color="#F4B084" label="Doblaje" />
         <LegendItem color="#fff" label="Turno 7 h / parcial" border />
         <LegendItem color="var(--empty)" label="Sin cubrir" />
+        <span className="legend-item"><span className="badge badge-dbl">DBL</span> Doblaje</span>
+        <span className="legend-item"><span className="badge badge-plus">+</span> Turno extra</span>
+        <span className="legend-item"><span className="badge badge-half">½</span> Media jornada</span>
       </div>
       {BLOQUES.map(b => (
         <div key={b.idx} className="bloque">
@@ -2510,10 +2640,13 @@ function Cronograma({ semana, db, ENGINE, planilla, estructura }) {
                         {fechas.map((f, d) => {
                           const nombre = semana.asig.celdas[d][b.idx][p];
                           const st = cellColor(nombre, d, b.idx);
+                          const et = nombre ? etiquetaPorDiaNombre[d].get(ENGINE.normalizarTexto(nombre)) : "";
+                          const etTxt = etiquetaCorta(et);
                           return (
                             <td key={d} className="data-cell" style={st}
-                              title={nombre ? nombre : "Sin cubrir"}>
+                              title={nombre ? (nombre + (et ? " · " + et : "")) : "Sin cubrir"}>
                               {nombre ? db.apodo(nombre) : ""}
+                              {etTxt && <span className={"badge badge-" + (et === "doblaje" ? "dbl" : et === "+" ? "plus" : "half")}>{etTxt}</span>}
                             </td>
                           );
                         })}
@@ -3139,7 +3272,16 @@ const CSS = `
   padding: 5px 8px; font-size: 12px; font-weight: 530;
   text-align: center; white-space: nowrap; color: var(--ink);
   max-width: 120px; overflow: hidden; text-overflow: ellipsis;
+  position: relative;
 }
+.badge {
+  display: inline-block; margin-left: 4px; padding: 0 4px;
+  font-size: 8.5px; font-weight: 700; line-height: 1.5; border-radius: 4px;
+  vertical-align: middle; letter-spacing: .02em;
+}
+.badge-dbl { background: #d4763a; color: #fff; }
+.badge-plus { background: #3a7a6a; color: #fff; }
+.badge-half { background: #888; color: #fff; }
 .area-start td { border-top: 2px solid var(--line-strong); }
 
 /* ---------- Decalajes ---------- */

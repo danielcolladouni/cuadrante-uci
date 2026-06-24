@@ -4,6 +4,12 @@
 > implementar en la Fase B, para no perder detalle entre fases.
 > La Fase A (estructura configurable de la unidad) se hace primero.
 
+## ESTADO
+- [HECHO] B1 — Clasificación por turno natural + cómputo de horas
+- [HECHO] B2 — Detección y etiquetado del doblaje (badges DBL/+/½ en web y Excel)
+- [PENDIENTE] B3 — Anotaciones manuales sobre el cuadrante (COT/COF/franjas)
+- [PENDIENTE] B4 — Afinar continuidad/rotación + registro mensual estilo ROTACIONS_INF
+
 ---
 
 ## B1. Clasificación por TURNO NATURAL (el cambio de fondo)
