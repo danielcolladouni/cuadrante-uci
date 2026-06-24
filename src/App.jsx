@@ -1,5 +1,10 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import * as XLSX from "xlsx";
+import {
+  iniciarSesion, cerrarSesion, sesionActual, onCambioSesion,
+  cargarProfesionales, guardarProfesionales,
+  cargarHistorico, añadirAlHistorico, vaciarHistorico,
+} from "./supabase.js";
 
 /* ============================================================
    MOTOR — embebido (port fiel del VBA). Aislado en un closure;
@@ -1453,40 +1458,6 @@ function exportarCronogramaXLSX(resultado, db, ENGINE) {
 })();
 
 /* ============================================================
-   Persistencia de la base de profesionales (IndexedDB)
-   ============================================================ */
-const DB_NAME = "rotacion_uci";
-const STORE = "config";
-function idbOpen() {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, 1);
-    req.onupgradeneeded = () => { req.result.createObjectStore(STORE); };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-async function idbGet(key) {
-  try {
-    const db = await idbOpen();
-    return await new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE, "readonly").objectStore(STORE).get(key);
-      tx.onsuccess = () => resolve(tx.result);
-      tx.onerror = () => reject(tx.error);
-    });
-  } catch { return undefined; }
-}
-async function idbSet(key, val) {
-  try {
-    const db = await idbOpen();
-    return await new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE, "readwrite").objectStore(STORE).put(val, key);
-      tx.onsuccess = () => resolve(true);
-      tx.onerror = () => reject(tx.error);
-    });
-  } catch { return false; }
-}
-
-/* ============================================================
    Lectura de Excel
    ============================================================ */
 // Planilla -> matriz de filas [ [colA, colB, ...colK], ... ]
@@ -1591,28 +1562,51 @@ export default function App() {
   const [vista, setVista] = useState("inicio"); // inicio | cronograma | decalajes | informe | profesionales | editor
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  // Sesión / login
+  const [session, setSession] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [cargandoDatos, setCargandoDatos] = useState(false);
   const planillaInputRef = useRef(null);
   const staffInputRef = useRef(null);
 
-  // Cargar BD de profesionales persistida
+  // Comprobar sesión al arrancar y suscribirse a cambios (login/logout)
   useEffect(() => {
+    let sub;
     (async () => {
-      const saved = await idbGet("staff");
-      if (saved && saved.profs) {
-        setProfs(saved.profs); setAlias(saved.alias || []);
-        setStaffSource(saved.source || "guardada en este navegador");
-      }
-      const h = await idbGet("historico");
-      if (h && Array.isArray(h)) setHistorico(rehidratarHistorico(h));
+      const s = await sesionActual();
+      setSession(s);
+      setAuthLoading(false);
+      sub = onCambioSesion((nueva) => setSession(nueva));
     })();
+    return () => { if (sub) sub.unsubscribe(); };
   }, []);
 
-  function rehidratarHistorico(h) {
-    return h.map(r => ({ ...r, fecha: new Date(r.fecha) }));
-  }
-  function serializarHistorico(h) {
-    return h.map(r => ({ ...r, fecha: r.fecha instanceof Date ? r.fecha.toISOString() : r.fecha }));
-  }
+  // Cuando hay sesión, cargar plantilla e histórico desde Supabase
+  useEffect(() => {
+    if (!session) {
+      // al cerrar sesión, limpiar datos en memoria
+      setProfs(null); setAlias(null); setHistorico([]); setStaffSource("");
+      setResultado(null); setVista("inicio");
+      return;
+    }
+    (async () => {
+      setCargandoDatos(true);
+      setError("");
+      try {
+        const p = await cargarProfesionales();
+        if (p && p.length) {
+          setProfs(p);
+          setStaffSource("base compartida · " + p.length + " profesionales");
+        }
+        const h = await cargarHistorico();
+        if (h && h.length) setHistorico(h);
+      } catch (err) {
+        setError("No se pudieron cargar los datos: " + err.message);
+      } finally {
+        setCargandoDatos(false);
+      }
+    })();
+  }, [session]);
 
   const db = useMemo(() => {
     if (!profs) return null;
@@ -1631,10 +1625,12 @@ export default function App() {
       // ¿Trae también profesionales/alias embebidos? (p.ej. el libro v3)
       const p = leerProfesionales(wb);
       const al = leerAlias(wb);
-      if (p && p.length && !profs) {
-        setProfs(p); setAlias(al || []);
-        setStaffSource("incluida en " + file.name);
-        await idbSet("staff", { profs: p, alias: al || [], source: "incluida en " + file.name });
+      if (al && al.length) setAlias(al);
+      // Solo poblar la base compartida si todavía está vacía
+      if (p && p.length && (!profs || profs.length === 0)) {
+        const guardados = await guardarProfesionales(p);
+        setProfs(guardados.length ? guardados : p);
+        setStaffSource("base compartida · cargada de " + file.name);
       }
     } catch (err) {
       setError("No se pudo leer la planilla: " + err.message);
@@ -1650,11 +1646,12 @@ export default function App() {
       const p = leerProfesionales(wb);
       const al = leerAlias(wb);
       if (!p || !p.length) { setError("Ese archivo no contiene la hoja DATOS_PROFESIONALES."); return; }
-      setProfs(p); setAlias(al || []);
-      setStaffSource("cargada de " + file.name);
-      await idbSet("staff", { profs: p, alias: al || [], source: "cargada de " + file.name });
+      if (al && al.length) setAlias(al);
+      const guardados = await guardarProfesionales(p);
+      setProfs(guardados.length ? guardados : p);
+      setStaffSource("base compartida · cargada de " + file.name);
     } catch (err) {
-      setError("No se pudo leer la base de profesionales: " + err.message);
+      setError("No se pudo guardar la base de profesionales: " + err.message);
     } finally { setBusy(false); }
   }
 
@@ -1679,15 +1676,23 @@ export default function App() {
 
   async function guardarEnHistorico() {
     if (!resultado) return;
-    const nuevo = historico.concat(
-      resultado.semanas.flatMap(s => ENGINE.filasHistoricoDeSemana(s.asig))
-    );
-    setHistorico(nuevo);
-    await idbSet("historico", serializarHistorico(nuevo));
+    setError("");
+    const nuevasFilas = resultado.semanas.flatMap(s => ENGINE.filasHistoricoDeSemana(s.asig));
+    try {
+      await añadirAlHistorico(nuevasFilas);
+      setHistorico(historico.concat(nuevasFilas));
+    } catch (err) {
+      setError("No se pudo guardar el histórico: " + err.message);
+    }
   }
   async function limpiarHistorico() {
-    setHistorico([]);
-    await idbSet("historico", []);
+    setError("");
+    try {
+      await vaciarHistorico();
+      setHistorico([]);
+    } catch (err) {
+      setError("No se pudo vaciar el histórico: " + err.message);
+    }
   }
 
   // Descarga el cronograma como .xlsx con los colores del Excel original,
@@ -1711,22 +1716,46 @@ export default function App() {
     }
   }
 
-  // Guarda la plantilla editada: actualiza estado y persiste en el navegador.
+  // Guarda la plantilla editada en la base compartida (Supabase).
   // Como `db` depende de [profs, alias] vía useMemo, la próxima generación usa
   // automáticamente los datos modificados.
   async function saveProfs(nuevosProfs, nuevoSource) {
-    setProfs(nuevosProfs);
-    const src = nuevoSource || staffSource || "editada en la app";
+    const guardados = await guardarProfesionales(nuevosProfs);
+    const finales = guardados.length ? guardados : nuevosProfs.filter(p => p.nombre && p.nombre.trim());
+    setProfs(finales);
+    const src = nuevoSource || "base compartida · " + finales.length + " profesionales";
     setStaffSource(src);
-    await idbSet("staff", { profs: nuevosProfs, alias: alias || [], source: src });
   }
 
   const verEditor = () => setVista("editor");
 
+  async function handleLogout() {
+    await cerrarSesion();
+    // el efecto de [session] limpia los datos en memoria
+  }
+
+  // --- Puerta de acceso: mientras carga la sesión, o si no hay sesión ---
+  if (authLoading) {
+    return (
+      <div className="app">
+        <style>{CSS}</style>
+        <div className="bootscreen">Cargando…</div>
+      </div>
+    );
+  }
+  if (!session) {
+    return (
+      <div className="app">
+        <style>{CSS}</style>
+        <LoginScreen onLogin={iniciarSesion} />
+      </div>
+    );
+  }
+
   return (
     <div className="app">
       <style>{CSS}</style>
-      <Header />
+      <Header email={session?.user?.email} onLogout={handleLogout} />
       <div className="layout">
         <Sidebar
           planillaInfo={planillaInfo} staffSource={staffSource} profs={profs}
@@ -1780,7 +1809,7 @@ export default function App() {
 }
 
 /* ---------- Cabecera ---------- */
-function Header() {
+function Header({ email, onLogout }) {
   return (
     <header className="header">
       <div className="brand">
@@ -1795,7 +1824,75 @@ function Header() {
           <div className="brand-sub">Rotación de enfermería · planificación semanal</div>
         </div>
       </div>
+      {email && (
+        <div className="user-box">
+          <span className="user-email" title={email}>{email}</span>
+          <button className="logout" onClick={onLogout}>Cerrar sesión</button>
+        </div>
+      )}
     </header>
+  );
+}
+
+/* ---------- Pantalla de inicio de sesión ---------- */
+function LoginScreen({ onLogin }) {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function submit() {
+    if (!email.trim() || !password) { setError("Introduce email y contraseña."); return; }
+    setError(""); setBusy(true);
+    try {
+      await onLogin(email.trim(), password);
+      // al iniciar sesión, el cambio de sesión recarga la app automáticamente
+    } catch (err) {
+      const msg = /invalid login credentials/i.test(err.message || "")
+        ? "Email o contraseña incorrectos."
+        : (err.message || "No se pudo iniciar sesión.");
+      setError(msg);
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="login-wrap">
+      <div className="login-card">
+        <div className="login-mark" aria-hidden="true">
+          <svg viewBox="0 0 32 32" width="30" height="30">
+            <rect x="3" y="3" width="26" height="26" rx="7" fill="none" stroke="currentColor" strokeWidth="2.2" />
+            <path d="M16 9v14M9 16h14" stroke="currentColor" strokeWidth="2.6" strokeLinecap="round" />
+          </svg>
+        </div>
+        <h1>Cuadrante UCI</h1>
+        <p className="login-sub">Acceso para coordinadoras de la unidad</p>
+
+        <label className="login-field">
+          <span>Email</span>
+          <input type="email" autoComplete="username" value={email}
+            onChange={e => setEmail(e.target.value)}
+            onKeyDown={e => e.key === "Enter" && submit()} />
+        </label>
+        <label className="login-field">
+          <span>Contraseña</span>
+          <input type="password" autoComplete="current-password" value={password}
+            onChange={e => setPassword(e.target.value)}
+            onKeyDown={e => e.key === "Enter" && submit()} />
+        </label>
+
+        {error && <div className="login-error">{error}</div>}
+
+        <button className="login-btn" disabled={busy} onClick={submit}>
+          {busy ? "Entrando…" : "Entrar"}
+        </button>
+
+        <p className="login-foot">
+          El acceso está restringido a las cuentas autorizadas. Si no puedes entrar,
+          contacta con la persona responsable de la herramienta.
+        </p>
+      </div>
+    </div>
   );
 }
 
@@ -1827,7 +1924,7 @@ function Sidebar(props) {
               <strong>{profs.length} profesionales</strong>
               <span>{staffSource}</span>
             </div>
-          : <p className="hint">Punto de partida: el libro con la hoja DATOS_PROFESIONALES. Luego podrás editar la plantilla en el apartado 4 sin volver a Excel.</p>}
+          : <p className="hint">Base compartida entre coordinadoras. Punto de partida: el libro con la hoja DATOS_PROFESIONALES. Luego se edita en el apartado 4 sin volver a Excel.</p>}
       </Section>
 
       <Section step="3" title="Periodo">
@@ -1865,8 +1962,8 @@ function Sidebar(props) {
       <Section step="" title="Histórico de rotación">
         <p className="hint">
           {historicoLen > 0
-            ? `${historicoLen} asignaciones guardadas. La rotación mensual se basa en este registro.`
-            : "Aún no hay histórico. La rotación entre semanas del mismo lote sí se aplica; guarda el resultado para que afecte a futuros cuadrantes."}
+            ? `${historicoLen} asignaciones en la base compartida. La rotación mensual se basa en este registro.`
+            : "Aún no hay histórico. La rotación entre semanas del mismo lote sí se aplica; guarda el resultado para que afecte a futuros cuadrantes y al resto de coordinadoras."}
         </p>
         <div className="row-btns">
           <button className="minibtn" disabled={!resultado} onClick={guardarEnHistorico}>Guardar resultado</button>
@@ -2679,6 +2776,50 @@ const CSS = `
   box-shadow: 0 8px 28px rgba(20,30,48,.22);
 }
 .export-hint strong { color: #fff; }
+
+/* ---------- Cabecera: usuario y cierre de sesión ---------- */
+.header { justify-content: space-between; }
+.user-box { display: flex; align-items: center; gap: 12px; }
+.user-email { font-size: 12.5px; color: var(--muted); max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.logout {
+  padding: 7px 13px; border: 1px solid var(--line-strong); border-radius: 8px;
+  background: var(--surface); color: var(--ink-soft); font: inherit; font-size: 12.5px; font-weight: 560; cursor: pointer;
+}
+.logout:hover { background: var(--panel); color: var(--ink); }
+
+/* ---------- Pantalla de arranque ---------- */
+.bootscreen { display: grid; place-items: center; height: 100vh; color: var(--muted); font-size: 14px; }
+
+/* ---------- Pantalla de login ---------- */
+.login-wrap { min-height: 100vh; display: grid; place-items: center; padding: 24px; background: var(--paper); }
+.login-card {
+  width: 100%; max-width: 380px; background: var(--surface);
+  border: 1px solid var(--line); border-radius: 16px; padding: 36px 32px;
+  box-shadow: 0 6px 30px rgba(20,30,48,.08); text-align: center;
+}
+.login-mark {
+  width: 52px; height: 52px; margin: 0 auto 16px; border-radius: 13px;
+  display: grid; place-items: center; background: var(--accent-wash); color: var(--accent);
+}
+.login-card h1 { margin: 0 0 4px; font-size: 21px; font-weight: 680; letter-spacing: -.02em; }
+.login-sub { margin: 0 0 26px; font-size: 13px; color: var(--muted); }
+.login-field { display: block; text-align: left; margin-bottom: 14px; }
+.login-field span { display: block; font-size: 12px; font-weight: 540; color: var(--ink-soft); margin-bottom: 5px; }
+.login-field input {
+  width: 100%; padding: 11px 13px; font: inherit; font-size: 14px;
+  border: 1px solid var(--line-strong); border-radius: 9px; background: var(--surface); color: var(--ink);
+}
+.login-field input:focus { outline: 2px solid var(--accent-wash); border-color: var(--accent); }
+.login-error { background: #fbf0ef; border: 1px solid #e8cdca; color: var(--danger); padding: 9px 12px; border-radius: 8px; font-size: 12.5px; margin-bottom: 14px; text-align: left; }
+.login-btn {
+  width: 100%; padding: 12px; margin-top: 4px;
+  background: var(--accent); color: #fff; border: none; border-radius: 9px;
+  font: inherit; font-weight: 650; font-size: 14.5px; cursor: pointer;
+  box-shadow: 0 1px 0 var(--accent-deep); transition: background .15s;
+}
+.login-btn:hover:not(:disabled) { background: var(--accent-deep); }
+.login-btn:disabled { background: var(--line-strong); box-shadow: none; cursor: default; }
+.login-foot { margin: 22px 0 0; font-size: 11.5px; line-height: 1.5; color: var(--muted); }
 
 /* ---------- Responsive ---------- */
 @media (max-width: 860px) {
