@@ -32,6 +32,41 @@ export function onCambioSesion(callback) {
   return data.subscription;
 }
 
+// Cambiar la contraseña del usuario que tiene la sesión iniciada.
+export async function cambiarPassword(nuevaPassword) {
+  const { error } = await supabase.auth.updateUser({ password: nuevaPassword });
+  if (error) throw error;
+}
+
+// Enviar email de recuperación de contraseña a una dirección.
+export async function recuperarPassword(email) {
+  const redirectTo = (typeof window !== "undefined" ? window.location.origin : "") + "/";
+  const { error } = await supabase.auth.resetPasswordForEmail(email, { redirectTo });
+  if (error) throw error;
+}
+
+// Apodo del usuario: se guarda en los metadatos de su cuenta (sin tabla extra).
+export function apodoDeSesion(session) {
+  const m = session && session.user && session.user.user_metadata;
+  return (m && m.apodo) ? m.apodo : "";
+}
+export async function cambiarApodo(nuevoApodo) {
+  const { data, error } = await supabase.auth.updateUser({
+    data: { apodo: String(nuevoApodo || "").trim() },
+  });
+  if (error) throw error;
+  return data;
+}
+
+// ¿La sesión actual viene de un enlace de recuperación de contraseña?
+// Tras pulsar el enlace del email, Supabase deja una sesión de tipo "recovery".
+export function escucharRecuperacion(callback) {
+  const { data } = supabase.auth.onAuthStateChange((event) => {
+    if (event === "PASSWORD_RECOVERY") callback();
+  });
+  return data.subscription;
+}
+
 /* ---------- Profesionales (plantilla compartida) ----------
    La app usa registros con forma { nombre, turno, apodo, criterio,
    suplente, antiguedad }. La tabla usa esas mismas columnas + id.
@@ -48,24 +83,39 @@ export async function cargarProfesionales() {
 // Reemplaza por completo la plantilla: borra todo y vuelve a insertar.
 // Es la operación más simple y robusta para "guardar la plantilla editada".
 export async function guardarProfesionales(profs) {
-  // 1. Borrar todos los registros existentes
-  const del = await supabase.from("profesionales").delete().neq("id", -1);
-  if (del.error) throw del.error;
-  // 2. Insertar los nuevos (si hay)
+  // Preparar y limpiar los registros a insertar
   const limpio = (profs || [])
     .filter(p => p && p.nombre && String(p.nombre).trim())
     .map(p => ({
-      nombre: p.nombre,
-      apodo: p.apodo || "",
+      nombre: String(p.nombre).trim(),
+      apodo: p.apodo ? String(p.apodo).trim() : "",
       turno: p.turno || "TM",
       criterio: p.criterio || "SI",
       suplente: p.suplente || "No",
       antiguedad: p.antiguedad || "< 3 ANY",
     }));
+
+  // 1. Borrar TODOS los registros existentes.
+  //    gte('id', 0) afecta a todas las filas (los id son siempre >= 1).
+  const del = await supabase.from("profesionales").delete().gte("id", 0);
+  if (del.error) throw new Error("No se pudo limpiar la base anterior: " + del.error.message);
+
   if (limpio.length === 0) return [];
-  const { data, error } = await supabase.from("profesionales").insert(limpio).select();
-  if (error) throw error;
-  return data || [];
+
+  // 2. Insertar por lotes (evita problemas con inserciones grandes de una vez).
+  const LOTE = 100;
+  for (let i = 0; i < limpio.length; i += LOTE) {
+    const trozo = limpio.slice(i, i + LOTE);
+    const { error } = await supabase.from("profesionales").insert(trozo);
+    if (error) {
+      throw new Error(
+        `Error al guardar profesionales (lote desde el nº ${i + 1}): ${error.message}`
+      );
+    }
+  }
+
+  // 3. Releer desde la base para devolver lo realmente guardado.
+  return await cargarProfesionales();
 }
 
 /* ---------- Histórico de rotación (compartido) ----------
@@ -132,6 +182,6 @@ export async function añadirAlHistorico(filasApp) {
 }
 
 export async function vaciarHistorico() {
-  const { error } = await supabase.from("historico").delete().neq("id", -1);
+  const { error } = await supabase.from("historico").delete().gte("id", 0);
   if (error) throw error;
 }

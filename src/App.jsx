@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useMemo, useCallback } from "react"
 import * as XLSX from "xlsx";
 import {
   iniciarSesion, cerrarSesion, sesionActual, onCambioSesion,
+  cambiarPassword, recuperarPassword, apodoDeSesion, cambiarApodo, escucharRecuperacion,
   cargarProfesionales, guardarProfesionales,
   cargarHistorico, añadirAlHistorico, vaciarHistorico,
 } from "./supabase.js";
@@ -1566,8 +1567,16 @@ export default function App() {
   const [session, setSession] = useState(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [cargandoDatos, setCargandoDatos] = useState(false);
+  const [menuPerfil, setMenuPerfil] = useState(false);
   const planillaInputRef = useRef(null);
   const staffInputRef = useRef(null);
+
+  // Vuelve a leer la sesión desde Supabase (p.ej. tras cambiar el apodo)
+  async function refrescarSesion() {
+    const s = await sesionActual();
+    // clonar para garantizar nueva referencia y forzar el re-render
+    setSession(s ? { ...s } : null);
+  }
 
   // Comprobar sesión al arrancar y suscribirse a cambios (login/logout)
   useEffect(() => {
@@ -1607,6 +1616,13 @@ export default function App() {
       }
     })();
   }, [session]);
+
+  // Detectar si el usuario ha llegado desde un enlace de recuperación de contraseña
+  const [modoRecuperacion, setModoRecuperacion] = useState(false);
+  useEffect(() => {
+    const sub = escucharRecuperacion(() => setModoRecuperacion(true));
+    return () => { if (sub) sub.unsubscribe(); };
+  }, []);
 
   const db = useMemo(() => {
     if (!profs) return null;
@@ -1730,6 +1746,7 @@ export default function App() {
   const verEditor = () => setVista("editor");
 
   async function handleLogout() {
+    setMenuPerfil(false);
     await cerrarSesion();
     // el efecto de [session] limpia los datos en memoria
   }
@@ -1743,19 +1760,43 @@ export default function App() {
       </div>
     );
   }
+  // Si viene de un enlace de recuperación, pedir nueva contraseña antes de nada
+  if (modoRecuperacion) {
+    return (
+      <div className="app">
+        <style>{CSS}</style>
+        <NuevaPasswordScreen
+          onGuardar={cambiarPassword}
+          onListo={() => setModoRecuperacion(false)}
+        />
+      </div>
+    );
+  }
   if (!session) {
     return (
       <div className="app">
         <style>{CSS}</style>
-        <LoginScreen onLogin={iniciarSesion} />
+        <LoginScreen onLogin={iniciarSesion} onRecuperar={recuperarPassword} />
       </div>
     );
   }
 
+  const apodoUsuario = apodoDeSesion(session);
+
   return (
     <div className="app">
       <style>{CSS}</style>
-      <Header email={session?.user?.email} onLogout={handleLogout} />
+      <Header
+        email={session?.user?.email}
+        apodo={apodoUsuario}
+        abierto={menuPerfil}
+        onToggle={() => setMenuPerfil(v => !v)}
+        onCerrarMenu={() => setMenuPerfil(false)}
+        onLogout={handleLogout}
+        onCambiarApodo={cambiarApodo}
+        onCambiarPassword={cambiarPassword}
+        onSesionActualizada={refrescarSesion}
+      />
       <div className="layout">
         <Sidebar
           planillaInfo={planillaInfo} staffSource={staffSource} profs={profs}
@@ -1808,8 +1849,17 @@ export default function App() {
   );
 }
 
-/* ---------- Cabecera ---------- */
-function Header({ email, onLogout }) {
+/* ---------- Cabecera con menú de perfil ---------- */
+function iniciales(texto) {
+  const t = String(texto || "").trim();
+  if (!t) return "·";
+  const partes = t.split(/[\s@.]+/).filter(Boolean);
+  if (partes.length >= 2) return (partes[0][0] + partes[1][0]).toUpperCase();
+  return t.slice(0, 2).toUpperCase();
+}
+
+function Header({ email, apodo, abierto, onToggle, onCerrarMenu, onLogout, onCambiarApodo, onCambiarPassword, onSesionActualizada }) {
+  const nombreMostrado = apodo || (email ? email.split("@")[0] : "");
   return (
     <header className="header">
       <div className="brand">
@@ -1825,33 +1875,175 @@ function Header({ email, onLogout }) {
         </div>
       </div>
       {email && (
-        <div className="user-box">
-          <span className="user-email" title={email}>{email}</span>
-          <button className="logout" onClick={onLogout}>Cerrar sesión</button>
+        <div className="perfil">
+          <button className="perfil-btn" onClick={onToggle} aria-label="Tu perfil">
+            <span className="avatar">{iniciales(apodo || email)}</span>
+            <span className="perfil-nombre">{nombreMostrado}</span>
+            <svg viewBox="0 0 12 12" width="11" height="11" className="perfil-caret"><path d="M2 4l4 4 4-4" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"/></svg>
+          </button>
+          {abierto && (
+            <ProfileMenu
+              email={email} apodo={apodo}
+              onCerrar={onCerrarMenu} onLogout={onLogout}
+              onCambiarApodo={onCambiarApodo} onCambiarPassword={onCambiarPassword}
+              onSesionActualizada={onSesionActualizada}
+            />
+          )}
         </div>
       )}
     </header>
   );
 }
 
+/* ---------- Menú/panel de perfil ---------- */
+function ProfileMenu({ email, apodo, onCerrar, onLogout, onCambiarApodo, onCambiarPassword, onSesionActualizada }) {
+  const [vista, setVista] = useState("menu"); // menu | apodo | password
+  const ref = useRef(null);
+
+  // Cerrar al hacer clic fuera
+  useEffect(() => {
+    function fuera(e) { if (ref.current && !ref.current.contains(e.target)) onCerrar(); }
+    document.addEventListener("mousedown", fuera);
+    return () => document.removeEventListener("mousedown", fuera);
+  }, [onCerrar]);
+
+  return (
+    <>
+      <div className="perfil-backdrop" />
+      <div className="perfil-menu" ref={ref}>
+        {vista === "menu" && (
+          <>
+            <div className="perfil-head">
+              <span className="avatar grande">{iniciales(apodo || email)}</span>
+              <div className="perfil-info">
+                <strong>{apodo || "Sin apodo"}</strong>
+                <span title={email}>{email}</span>
+              </div>
+            </div>
+            <button className="perfil-item" onClick={() => setVista("apodo")}>
+              <IcoUser /> Cambiar apodo
+            </button>
+            <button className="perfil-item" onClick={() => setVista("password")}>
+              <IcoLock /> Cambiar contraseña
+            </button>
+            <div className="perfil-sep" />
+            <button className="perfil-item salir" onClick={onLogout}>
+              <IcoSalir /> Cerrar sesión
+            </button>
+          </>
+        )}
+        {vista === "apodo" && (
+          <FormApodo apodoActual={apodo} onVolver={() => setVista("menu")}
+            onCambiarApodo={onCambiarApodo} onSesionActualizada={onSesionActualizada} />
+        )}
+        {vista === "password" && (
+          <FormPassword onVolver={() => setVista("menu")} onCambiarPassword={onCambiarPassword} />
+        )}
+      </div>
+    </>
+  );
+}
+
+function FormApodo({ apodoActual, onVolver, onCambiarApodo, onSesionActualizada }) {
+  const [valor, setValor] = useState(apodoActual || "");
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+  async function guardar() {
+    setBusy(true); setMsg("");
+    try {
+      await onCambiarApodo(valor);
+      await onSesionActualizada();
+      setMsg("ok");
+      setTimeout(onVolver, 700);
+    } catch (err) { setMsg(err.message || "No se pudo guardar."); setBusy(false); }
+  }
+  return (
+    <div className="perfil-form">
+      <button className="perfil-volver" onClick={onVolver}>← Volver</button>
+      <h4>Cambiar apodo</h4>
+      <p className="perfil-hint">El apodo se muestra arriba en lugar de tu email.</p>
+      <input className="perfil-input" value={valor} maxLength={24}
+        placeholder="Tu apodo" autoFocus
+        onChange={e => setValor(e.target.value)}
+        onKeyDown={e => e.key === "Enter" && guardar()} />
+      {msg && msg !== "ok" && <div className="perfil-error">{msg}</div>}
+      {msg === "ok" && <div className="perfil-ok">Apodo guardado ✓</div>}
+      <button className="perfil-guardar" disabled={busy} onClick={guardar}>
+        {busy ? "Guardando…" : "Guardar apodo"}
+      </button>
+    </div>
+  );
+}
+
+function FormPassword({ onVolver, onCambiarPassword }) {
+  const [p1, setP1] = useState("");
+  const [p2, setP2] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+  async function guardar() {
+    if (p1.length < 6) { setMsg("La contraseña debe tener al menos 6 caracteres."); return; }
+    if (p1 !== p2) { setMsg("Las dos contraseñas no coinciden."); return; }
+    setBusy(true); setMsg("");
+    try {
+      await onCambiarPassword(p1);
+      setMsg("ok");
+      setTimeout(onVolver, 900);
+    } catch (err) { setMsg(err.message || "No se pudo cambiar."); setBusy(false); }
+  }
+  return (
+    <div className="perfil-form">
+      <button className="perfil-volver" onClick={onVolver}>← Volver</button>
+      <h4>Cambiar contraseña</h4>
+      <input className="perfil-input" type="password" value={p1} placeholder="Nueva contraseña" autoFocus
+        autoComplete="new-password" onChange={e => setP1(e.target.value)} />
+      <input className="perfil-input" type="password" value={p2} placeholder="Repite la contraseña"
+        autoComplete="new-password" onChange={e => setP2(e.target.value)}
+        onKeyDown={e => e.key === "Enter" && guardar()} />
+      {msg && msg !== "ok" && <div className="perfil-error">{msg}</div>}
+      {msg === "ok" && <div className="perfil-ok">Contraseña actualizada ✓</div>}
+      <button className="perfil-guardar" disabled={busy} onClick={guardar}>
+        {busy ? "Guardando…" : "Cambiar contraseña"}
+      </button>
+    </div>
+  );
+}
+
+function IcoUser() { return <svg viewBox="0 0 16 16" width="15" height="15"><circle cx="8" cy="5" r="2.6" fill="none" stroke="currentColor" strokeWidth="1.3"/><path d="M3 13c0-2.5 2.2-4 5-4s5 1.5 5 4" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/></svg>; }
+function IcoLock() { return <svg viewBox="0 0 16 16" width="15" height="15"><rect x="3.5" y="7" width="9" height="6.5" rx="1.2" fill="none" stroke="currentColor" strokeWidth="1.3"/><path d="M5.5 7V5a2.5 2.5 0 015 0v2" fill="none" stroke="currentColor" strokeWidth="1.3"/></svg>; }
+function IcoSalir() { return <svg viewBox="0 0 16 16" width="15" height="15"><path d="M6 3H3.5v10H6M10 5l3 3-3 3M13 8H6.5" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/></svg>; }
+
 /* ---------- Pantalla de inicio de sesión ---------- */
-function LoginScreen({ onLogin }) {
+function LoginScreen({ onLogin, onRecuperar }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [modo, setModo] = useState("login"); // login | recuperar
+  const [aviso, setAviso] = useState("");
 
   async function submit() {
     if (!email.trim() || !password) { setError("Introduce email y contraseña."); return; }
     setError(""); setBusy(true);
     try {
       await onLogin(email.trim(), password);
-      // al iniciar sesión, el cambio de sesión recarga la app automáticamente
     } catch (err) {
       const msg = /invalid login credentials/i.test(err.message || "")
         ? "Email o contraseña incorrectos."
         : (err.message || "No se pudo iniciar sesión.");
       setError(msg);
+      setBusy(false);
+    }
+  }
+
+  async function enviarRecuperacion() {
+    if (!email.trim()) { setError("Escribe tu email para enviarte el enlace."); return; }
+    setError(""); setBusy(true);
+    try {
+      await onRecuperar(email.trim());
+      setAviso("Si ese email tiene cuenta, te hemos enviado un enlace para restablecer la contraseña. Revisa tu correo (y la carpeta de spam).");
+      setBusy(false);
+    } catch (err) {
+      setError(err.message || "No se pudo enviar el correo.");
       setBusy(false);
     }
   }
@@ -1866,31 +2058,125 @@ function LoginScreen({ onLogin }) {
           </svg>
         </div>
         <h1>Cuadrante UCI</h1>
-        <p className="login-sub">Acceso para coordinadoras de la unidad</p>
-
-        <label className="login-field">
-          <span>Email</span>
-          <input type="email" autoComplete="username" value={email}
-            onChange={e => setEmail(e.target.value)}
-            onKeyDown={e => e.key === "Enter" && submit()} />
-        </label>
-        <label className="login-field">
-          <span>Contraseña</span>
-          <input type="password" autoComplete="current-password" value={password}
-            onChange={e => setPassword(e.target.value)}
-            onKeyDown={e => e.key === "Enter" && submit()} />
-        </label>
-
-        {error && <div className="login-error">{error}</div>}
-
-        <button className="login-btn" disabled={busy} onClick={submit}>
-          {busy ? "Entrando…" : "Entrar"}
-        </button>
-
-        <p className="login-foot">
-          El acceso está restringido a las cuentas autorizadas. Si no puedes entrar,
-          contacta con la persona responsable de la herramienta.
+        <p className="login-sub">
+          {modo === "login" ? "Acceso para coordinadoras de la unidad" : "Recuperar contraseña"}
         </p>
+
+        {aviso ? (
+          <>
+            <div className="login-ok">{aviso}</div>
+            <button className="login-btn" onClick={() => { setModo("login"); setAviso(""); }}>
+              Volver al inicio
+            </button>
+          </>
+        ) : (
+          <>
+            <label className="login-field">
+              <span>Email</span>
+              <input type="email" autoComplete="username" value={email}
+                onChange={e => setEmail(e.target.value)}
+                onKeyDown={e => e.key === "Enter" && (modo === "login" ? submit() : enviarRecuperacion())} />
+            </label>
+            {modo === "login" && (
+              <label className="login-field">
+                <span>Contraseña</span>
+                <input type="password" autoComplete="current-password" value={password}
+                  onChange={e => setPassword(e.target.value)}
+                  onKeyDown={e => e.key === "Enter" && submit()} />
+              </label>
+            )}
+
+            {error && <div className="login-error">{error}</div>}
+
+            {modo === "login" ? (
+              <>
+                <button className="login-btn" disabled={busy} onClick={submit}>
+                  {busy ? "Entrando…" : "Entrar"}
+                </button>
+                <button className="login-link" onClick={() => { setModo("recuperar"); setError(""); }}>
+                  ¿Has olvidado la contraseña?
+                </button>
+              </>
+            ) : (
+              <>
+                <button className="login-btn" disabled={busy} onClick={enviarRecuperacion}>
+                  {busy ? "Enviando…" : "Enviarme el enlace"}
+                </button>
+                <button className="login-link" onClick={() => { setModo("login"); setError(""); }}>
+                  ← Volver
+                </button>
+              </>
+            )}
+          </>
+        )}
+
+        {modo === "login" && !aviso && (
+          <p className="login-foot">
+            El acceso está restringido a las cuentas autorizadas. Si no puedes entrar,
+            contacta con la persona responsable de la herramienta.
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ---------- Pantalla de nueva contraseña (tras enlace de recuperación) ---------- */
+function NuevaPasswordScreen({ onGuardar, onListo }) {
+  const [p1, setP1] = useState("");
+  const [p2, setP2] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [hecho, setHecho] = useState(false);
+
+  async function guardar() {
+    if (p1.length < 6) { setError("La contraseña debe tener al menos 6 caracteres."); return; }
+    if (p1 !== p2) { setError("Las dos contraseñas no coinciden."); return; }
+    setError(""); setBusy(true);
+    try {
+      await onGuardar(p1);
+      setHecho(true);
+    } catch (err) {
+      setError(err.message || "No se pudo guardar la contraseña.");
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="login-wrap">
+      <div className="login-card">
+        <div className="login-mark" aria-hidden="true">
+          <svg viewBox="0 0 32 32" width="30" height="30">
+            <rect x="3" y="3" width="26" height="26" rx="7" fill="none" stroke="currentColor" strokeWidth="2.2" />
+            <path d="M16 9v14M9 16h14" stroke="currentColor" strokeWidth="2.6" strokeLinecap="round" />
+          </svg>
+        </div>
+        <h1>Nueva contraseña</h1>
+        {hecho ? (
+          <>
+            <div className="login-ok">Contraseña actualizada correctamente.</div>
+            <button className="login-btn" onClick={onListo}>Entrar</button>
+          </>
+        ) : (
+          <>
+            <p className="login-sub">Introduce tu nueva contraseña.</p>
+            <label className="login-field">
+              <span>Nueva contraseña</span>
+              <input type="password" value={p1} autoComplete="new-password" autoFocus
+                onChange={e => setP1(e.target.value)} />
+            </label>
+            <label className="login-field">
+              <span>Repite la contraseña</span>
+              <input type="password" value={p2} autoComplete="new-password"
+                onChange={e => setP2(e.target.value)}
+                onKeyDown={e => e.key === "Enter" && guardar()} />
+            </label>
+            {error && <div className="login-error">{error}</div>}
+            <button className="login-btn" disabled={busy} onClick={guardar}>
+              {busy ? "Guardando…" : "Guardar contraseña"}
+            </button>
+          </>
+        )}
       </div>
     </div>
   );
@@ -2777,15 +3063,70 @@ const CSS = `
 }
 .export-hint strong { color: #fff; }
 
-/* ---------- Cabecera: usuario y cierre de sesión ---------- */
+/* ---------- Cabecera: menú de perfil ---------- */
 .header { justify-content: space-between; }
-.user-box { display: flex; align-items: center; gap: 12px; }
-.user-email { font-size: 12.5px; color: var(--muted); max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.logout {
-  padding: 7px 13px; border: 1px solid var(--line-strong); border-radius: 8px;
-  background: var(--surface); color: var(--ink-soft); font: inherit; font-size: 12.5px; font-weight: 560; cursor: pointer;
+.perfil { position: relative; }
+.perfil-btn {
+  display: flex; align-items: center; gap: 9px;
+  padding: 6px 10px 6px 6px; border: 1px solid var(--line); border-radius: 24px;
+  background: var(--surface); cursor: pointer; font: inherit; transition: background .12s, border-color .12s;
 }
-.logout:hover { background: var(--panel); color: var(--ink); }
+.perfil-btn:hover { background: var(--panel); border-color: var(--line-strong); }
+.avatar {
+  width: 30px; height: 30px; border-radius: 50%; flex: none;
+  display: grid; place-items: center; font-size: 12px; font-weight: 680;
+  background: var(--accent); color: #fff; letter-spacing: .02em;
+}
+.avatar.grande { width: 40px; height: 40px; font-size: 15px; }
+.perfil-nombre { font-size: 13px; font-weight: 560; color: var(--ink); max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.perfil-caret { color: var(--muted); flex: none; }
+
+.perfil-backdrop { position: fixed; inset: 0; z-index: 40; }
+.perfil-menu {
+  position: absolute; right: 0; top: calc(100% + 10px); z-index: 50;
+  width: 270px; background: var(--surface); border: 1px solid var(--line);
+  border-radius: 14px; box-shadow: 0 10px 34px rgba(20,30,48,.18); padding: 8px;
+}
+.perfil-head { display: flex; align-items: center; gap: 12px; padding: 10px 10px 12px; }
+.perfil-info { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.perfil-info strong { font-size: 14px; font-weight: 640; }
+.perfil-info span { font-size: 11.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.perfil-item {
+  display: flex; align-items: center; gap: 11px; width: 100%;
+  padding: 10px 11px; border: none; background: transparent; border-radius: 9px;
+  font: inherit; font-size: 13.5px; color: var(--ink-soft); cursor: pointer; text-align: left;
+}
+.perfil-item svg { color: var(--muted); flex: none; }
+.perfil-item:hover { background: var(--panel); color: var(--ink); }
+.perfil-item:hover svg { color: var(--accent); }
+.perfil-item.salir { color: var(--danger); }
+.perfil-item.salir svg { color: var(--danger); }
+.perfil-item.salir:hover { background: #fbf1f0; }
+.perfil-sep { height: 1px; background: var(--line); margin: 6px 4px; }
+
+.perfil-form { padding: 8px 10px 12px; }
+.perfil-volver { background: none; border: none; color: var(--accent); font: inherit; font-size: 12.5px; font-weight: 560; cursor: pointer; padding: 4px 0; margin-bottom: 6px; }
+.perfil-form h4 { margin: 2px 0 4px; font-size: 14px; font-weight: 650; }
+.perfil-hint { margin: 0 0 11px; font-size: 11.5px; color: var(--muted); line-height: 1.5; }
+.perfil-input {
+  width: 100%; padding: 9px 11px; margin-bottom: 9px;
+  border: 1px solid var(--line-strong); border-radius: 8px; font: inherit; font-size: 13px;
+  background: var(--surface); color: var(--ink);
+}
+.perfil-input:focus { outline: 2px solid var(--accent-wash); border-color: var(--accent); }
+.perfil-error { background: #fbf0ef; border: 1px solid #e8cdca; color: var(--danger); padding: 7px 10px; border-radius: 7px; font-size: 12px; margin-bottom: 9px; }
+.perfil-ok { background: var(--accent-wash); border: 1px solid #bfe0db; color: var(--accent-deep); padding: 7px 10px; border-radius: 7px; font-size: 12px; margin-bottom: 9px; }
+.perfil-guardar {
+  width: 100%; padding: 10px; border: none; border-radius: 8px;
+  background: var(--accent); color: #fff; font: inherit; font-weight: 620; font-size: 13px; cursor: pointer;
+}
+.perfil-guardar:hover:not(:disabled) { background: var(--accent-deep); }
+.perfil-guardar:disabled { background: var(--line-strong); cursor: default; }
+
+/* login extras */
+.login-link { background: none; border: none; color: var(--accent); font: inherit; font-size: 13px; font-weight: 540; cursor: pointer; margin-top: 14px; padding: 4px; }
+.login-link:hover { color: var(--accent-deep); text-decoration: underline; }
+.login-ok { background: var(--accent-wash); border: 1px solid #bfe0db; color: var(--accent-deep); padding: 12px 14px; border-radius: 9px; font-size: 13px; line-height: 1.5; margin-bottom: 16px; text-align: left; }
 
 /* ---------- Pantalla de arranque ---------- */
 .bootscreen { display: grid; place-items: center; height: 100vh; color: var(--muted); font-size: 14px; }
@@ -2826,6 +3167,17 @@ const CSS = `
   .layout { grid-template-columns: 1fr; }
   .sidebar { position: static; height: auto; border-right: none; border-bottom: 1px solid var(--line); }
   .main { padding: 18px 14px 50px; }
+}
+
+@media (max-width: 560px) {
+  .header { padding: 0 12px; gap: 8px; }
+  .brand-sub { display: none; }              /* el subtítulo largo desaparece en móvil */
+  .brand-mark { width: 34px; height: 34px; }
+  .brand-title { font-size: 15px; }
+  .perfil-nombre { max-width: 90px; }
+  .perfil-menu { width: calc(100vw - 24px); right: -6px; }
+  .tabsbar-right { width: 100%; }
+  .export-hint { width: 240px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
