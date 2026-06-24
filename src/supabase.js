@@ -185,3 +185,31 @@ export async function vaciarHistorico() {
   const { error } = await supabase.from("historico").delete().gte("id", 0);
   if (error) throw error;
 }
+
+/* ---------- Estructura de la unidad (configuración compartida) ----------
+   Se guarda como una fila única (clave fija) en la tabla "config_unidad".
+   El valor es un JSON con la lista de áreas y sus posiciones.
+*/
+const CLAVE_ESTRUCTURA = "estructura_actual";
+
+export async function cargarEstructura() {
+  const { data, error } = await supabase
+    .from("config_unidad")
+    .select("valor")
+    .eq("clave", CLAVE_ESTRUCTURA)
+    .maybeSingle();
+  if (error) throw error;
+  if (!data || !data.valor) return null;
+  try {
+    return typeof data.valor === "string" ? JSON.parse(data.valor) : data.valor;
+  } catch { return null; }
+}
+
+export async function guardarEstructura(config) {
+  const valor = JSON.stringify(config);
+  // upsert: inserta o actualiza la fila de clave fija
+  const { error } = await supabase
+    .from("config_unidad")
+    .upsert({ clave: CLAVE_ESTRUCTURA, valor }, { onConflict: "clave" });
+  if (error) throw error;
+}

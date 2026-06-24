@@ -5,6 +5,7 @@ import {
   cambiarPassword, recuperarPassword, apodoDeSesion, cambiarApodo, escucharRecuperacion,
   cargarProfesionales, guardarProfesionales,
   cargarHistorico, añadirAlHistorico, vaciarHistorico,
+  cargarEstructura, guardarEstructura,
 } from "./supabase.js";
 
 /* ============================================================
@@ -78,51 +79,101 @@ function weekdayMonday(f) {
   return wd === 0 ? 7 : wd;
 }
 
-/* ---------- M02_AreasConfig: áreas, mapeo y permisos ---------- */
+/* ---------- M02_AreasConfig: áreas, mapeo y permisos (CONFIGURABLE) ---------- */
 const AREA = { UCI_A:"UCI A", UCI_B:"UCI B", SEMIS:"SEMIS", REA:"REA", UCCRI:"UCCRI" };
-const NPOS_TOTAL = 15;
 const CRIT = { SI:"SI", NO:"NO", UCI:"UCI", UCCRI:"UCCRI" };
 
-function listaAreasOrdenadas() { return [AREA.UCI_A, AREA.UCI_B, AREA.SEMIS, AREA.REA, AREA.UCCRI]; }
+// Catálogo de áreas posibles de la unidad real. La coordinadora activa/desactiva
+// y ajusta el nº de posiciones cada semana. UCCRI Esquerra y Dreta comparten
+// rotación "UCCRI" (a efectos de rotación mensual da igual el lado).
+const CATALOGO_AREAS = [
+  { id: "UCI_A",     nombre: "CONTROL A",      rotacion: "UCI A",  posDefecto: 4 },
+  { id: "UCI_B",     nombre: "CONTROL B",      rotacion: "UCI B",  posDefecto: 4 },
+  { id: "SEMIS",     nombre: "SEMIS",          rotacion: "SEMIS",  posDefecto: 3 },
+  { id: "REA",       nombre: "REA",            rotacion: "REA",    posDefecto: 2 },
+  { id: "UCCRI_ESQ", nombre: "UCCRI ESQUERRA", rotacion: "UCCRI",  posDefecto: 2 },
+  { id: "UCCRI_DRE", nombre: "UCCRI DRETA",    rotacion: "UCCRI",  posDefecto: 2 },
+];
 
-function posicionesDeArea(area) {
-  switch (area) {
-    case AREA.UCI_A: return 3;
-    case AREA.UCI_B: return 4;
-    case AREA.SEMIS: return 3;
-    case AREA.REA: return 2;
-    case AREA.UCCRI: return 3;
-    default: return 0;
-  }
+function estructuraPorDefecto() {
+  return CATALOGO_AREAS.map(a => ({
+    id: a.id, nombre: a.nombre, rotacion: a.rotacion,
+    posiciones: a.posDefecto, activa: true,
+  }));
 }
-function posGlobalAArea(p) { // -> {area, posLocal}
-  if (p >= 1 && p <= 3) return { area: AREA.UCI_A, posLocal: p };
-  if (p >= 4 && p <= 7) return { area: AREA.UCI_B, posLocal: p - 3 };
-  if (p >= 8 && p <= 10) return { area: AREA.SEMIS, posLocal: p - 7 };
-  if (p >= 11 && p <= 12) return { area: AREA.REA, posLocal: p - 10 };
-  if (p >= 13 && p <= 15) return { area: AREA.UCCRI, posLocal: p - 12 };
-  return { area: "", posLocal: 0 };
-}
-function areaAPosGlobal(area, posLocal) {
-  switch (area) {
-    case AREA.UCI_A: return posLocal;
-    case AREA.UCI_B: return 3 + posLocal;
-    case AREA.SEMIS: return 7 + posLocal;
-    case AREA.REA: return 10 + posLocal;
-    case AREA.UCCRI: return 12 + posLocal;
-    default: return 0;
-  }
-}
-function posGlobalInicioArea(area) { return areaAPosGlobal(area, 1); }
-function posGlobalFinArea(area) { return areaAPosGlobal(area, posicionesDeArea(area)); }
 
-function puedeIrAArea(criterio, area) {
+// Compila una config en un mapa de posiciones globales que usa el motor.
+function compilarEstructura(config) {
+  const activas = (config && config.length ? config : estructuraPorDefecto())
+    .filter(a => a.activa && a.posiciones > 0);
+  const areas = [];
+  let cursor = 1;
+  for (const a of activas) {
+    const ini = cursor, fin = cursor + a.posiciones - 1;
+    areas.push({ id: a.id, nombre: a.nombre, rotacion: a.rotacion,
+      posiciones: a.posiciones, posIni: ini, posFin: fin });
+    cursor = fin + 1;
+  }
+  return { areas, nPosTotal: cursor - 1 };
+}
+
+// --- Estructura ACTIVA (variable de módulo). El motor la fija antes de generar. ---
+let _EST = compilarEstructura(estructuraPorDefecto());
+function fijarEstructura(config) { _EST = compilarEstructura(config); return _EST; }
+function estructuraActiva() { return _EST; }
+function NPOS_TOTAL_actual() { return _EST.nPosTotal; }
+
+// Lista de "áreas" en el sentido antiguo = rotaciones únicas, en orden de recorrido.
+function listaAreasOrdenadas() {
+  const out = [];
+  for (const a of _EST.areas) if (!out.includes(a.rotacion)) out.push(a.rotacion);
+  return out;
+}
+
+// nº de posiciones de una ROTACIÓN (sumando sus áreas: p.ej. UCCRI esq+dre)
+function posicionesDeArea(rotacion) {
+  let n = 0;
+  for (const a of _EST.areas) if (a.rotacion === rotacion) n += a.posiciones;
+  return n;
+}
+
+// Dada una posición global, su rotación y posición local DENTRO de la rotación.
+function posGlobalAArea(p) {
+  // posLocal relativo a la rotación (para que esquerra+dreta numeren correlativo
+  // a efectos internos), y también guardamos el área física.
+  let acumRot = {};
+  for (const a of _EST.areas) {
+    if (p >= a.posIni && p <= a.posFin) {
+      const base = acumRot[a.rotacion] || 0;
+      return { area: a.rotacion, posLocal: base + (p - a.posIni + 1), areaId: a.id, areaNombre: a.nombre, posLocalArea: p - a.posIni + 1 };
+    }
+    acumRot[a.rotacion] = (acumRot[a.rotacion] || 0) + a.posiciones;
+  }
+  return { area: "", posLocal: 0, areaId: "", areaNombre: "", posLocalArea: 0 };
+}
+
+// Primera posición global de una rotación (su primera área activa).
+function posGlobalInicioArea(rotacion) {
+  for (const a of _EST.areas) if (a.rotacion === rotacion) return a.posIni;
+  return 0;
+}
+// Última posición global de una rotación (su última área activa).
+function posGlobalFinArea(rotacion) {
+  let fin = 0;
+  for (const a of _EST.areas) if (a.rotacion === rotacion) fin = a.posFin;
+  return fin;
+}
+function areaAPosGlobal(rotacion, posLocal) {
+  return posGlobalInicioArea(rotacion) + posLocal - 1;
+}
+
+function puedeIrAArea(criterio, rotacion) {
   const c = String(criterio || "").toUpperCase().trim();
   switch (c) {
     case CRIT.SI: return true;
-    case CRIT.NO: return area === AREA.SEMIS || area === AREA.UCCRI;
-    case CRIT.UCI: return area === AREA.UCI_A || area === AREA.UCI_B;
-    case CRIT.UCCRI: return area === AREA.UCCRI;
+    case CRIT.NO: return rotacion === AREA.SEMIS || rotacion === AREA.UCCRI;
+    case CRIT.UCI: return rotacion === AREA.UCI_A || rotacion === AREA.UCI_B;
+    case CRIT.UCCRI: return rotacion === AREA.UCCRI;
     default: return true; // conservador
   }
 }
@@ -134,12 +185,13 @@ function normalizarCriterio(valor) {
 }
 function areaExcedenteRoundRobin(n) {
   const areas = listaAreasOrdenadas();
-  return areas[(n - 1) % 5];
+  if (areas.length === 0) return "";
+  return areas[(n - 1) % areas.length];
 }
-function numeroLocalDePosGlobal(p) { return String(posGlobalAArea(p).posLocal); }
+function numeroLocalDePosGlobal(p) { return String(posGlobalAArea(p).posLocalArea); }
 function nombreAreaCortoDePosGlobal(p) {
-  if (p <= 3) return "UCI_A"; if (p <= 7) return "UCI_B"; if (p <= 10) return "SEMIS";
-  if (p <= 12) return "REA"; if (p <= 15) return "UCCRI"; return "";
+  const r = posGlobalAArea(p);
+  return r.areaId || "";
 }
 
 /* ---------- M01_Extractor: parseo y clasificación de horarios ---------- */
@@ -600,7 +652,7 @@ function nuevaMatriz() {
   for (let d = 0; d < 7; d++) {
     celdas.push([]);
     for (let t = 0; t < 3; t++) {
-      celdas[d].push(new Array(NPOS_TOTAL + 1).fill(""));
+      celdas[d].push(new Array(NPOS_TOTAL_actual() + 1).fill(""));
     }
   }
   return { celdas, excedentes: {} }; // excedentes[d*3+t] = [{nombre, area}]
@@ -636,8 +688,8 @@ function intentarAsignarPos(e, ocDia, ocNoche, db, historico, fechaLunes) {
 }
 
 function asignarEstables(estad, db, historico, fechaLunes) {
-  const ocDia = new Array(NPOS_TOTAL + 1).fill(false);
-  const ocNoche = new Array(NPOS_TOTAL + 1).fill(false);
+  const ocDia = new Array(NPOS_TOTAL_actual() + 1).fill(false);
+  const ocNoche = new Array(NPOS_TOTAL_actual() + 1).fill(false);
   const asignEst = []; // {nombreNorm, posGlobal, bloque}
   const ya = new Array(estad.length).fill(false);
 
@@ -779,7 +831,7 @@ function ajustarTurnosDobles(asig, planilla, db) {
   const semana = extraerSemana(planilla, db, asig.fechaLunes);
   // Paso 1: replicar 12HD de mañana a tarde misma posición
   for (let d = 0; d < 7; d++) {
-    for (let p = 1; p <= NPOS_TOTAL; p++) {
+    for (let p = 1; p <= NPOS_TOTAL_actual(); p++) {
       const nombreM = asig.celdas[d][TURNO_IDX.MANANA][p];
       if (!nombreM) continue;
       const turnoM = turnoEfectivoEnDia(planilla, db, addDays(asig.fechaLunes, d), nombreM);
@@ -802,7 +854,7 @@ function ajustarTurnosDobles(asig, planilla, db) {
 function rellenarTarde7h(asig, semana, db, incluirSuplentes) {
   for (let d = 0; d < 7; d++) {
     const yaUsado = new Set();
-    for (let p = 1; p <= NPOS_TOTAL; p++) {
+    for (let p = 1; p <= NPOS_TOTAL_actual(); p++) {
       const n = asig.celdas[d][TURNO_IDX.TARDE][p];
       if (n) yaUsado.add(normalizarTexto(n));
     }
@@ -818,7 +870,7 @@ function rellenarTarde7h(asig, semana, db, incluirSuplentes) {
     if (candidatos.length === 0) continue;
     candidatos.sort((a, b) => b.score - a.score);
     const used = new Array(candidatos.length).fill(false);
-    for (let p = 1; p <= NPOS_TOTAL; p++) {
+    for (let p = 1; p <= NPOS_TOTAL_actual(); p++) {
       if (asig.celdas[d][TURNO_IDX.TARDE][p]) continue;
       const { area } = posGlobalAArea(p);
       let mejorIdx = -1;
@@ -857,13 +909,13 @@ function ajustarParciales(asig, planilla, db) {
     if (parciales.length === 0) continue;
     parciales.sort((a, b) => b.score - a.score);
     const yaUsado = new Set();
-    for (let p = 1; p <= NPOS_TOTAL; p++) {
+    for (let p = 1; p <= NPOS_TOTAL_actual(); p++) {
       for (let t = 0; t < 3; t++) { const n = asig.celdas[d][t][p]; if (n) yaUsado.add(normalizarTexto(n)); }
     }
     for (const par of parciales) {
       if (yaUsado.has(normalizarTexto(par.nombre))) continue;
       let mejorIdx = -1;
-      for (let p = 1; p <= NPOS_TOTAL; p++) {
+      for (let p = 1; p <= NPOS_TOTAL_actual(); p++) {
         if (asig.celdas[d][par.turnoIdx][p]) continue;
         const { area } = posGlobalAArea(p);
         if (puedeIrAArea(db.criterio(par.nombre), area)) { mejorIdx = p; break; }
@@ -932,7 +984,7 @@ function construirAvisosDecalaje(asig, planilla, db) {
   for (let d = 0; d < 7; d++) {
     const fecha = addDays(asig.fechaLunes, d);
     const usadosTM = new Set(), usadosNT = new Set();
-    for (let p = 1; p <= NPOS_TOTAL; p++) {
+    for (let p = 1; p <= NPOS_TOTAL_actual(); p++) {
       // TM (mañana): ocupante que empieza tarde -> cubierto por alguien que sale de noche (nm)
       const ocM = asig.celdas[d][TURNO_IDX.MANANA][p];
       if (ocM) {
@@ -978,7 +1030,7 @@ function filasHistoricoDeSemana(asig) {
   for (let d = 0; d < 7; d++) {
     const fecha = addDays(asig.fechaLunes, d);
     for (let t = 0; t < 3; t++) {
-      for (let p = 1; p <= NPOS_TOTAL; p++) {
+      for (let p = 1; p <= NPOS_TOTAL_actual(); p++) {
         const nombre = asig.celdas[d][t][p];
         if (!nombre) continue;
         const { area } = posGlobalAArea(p);
@@ -1030,7 +1082,10 @@ function regenerarInformeMensual(historico) {
 }
 
 /* ---------- ORQUESTADOR: genera N semanas con rotación acumulada ---------- */
-function generarCronograma(planilla, db, historicoInicial, fechaLunesInicio, numSemanas) {
+function generarCronograma(planilla, db, historicoInicial, fechaLunesInicio, numSemanas, estructuraConfig) {
+  // Fijar la estructura de la unidad para esta generación (Fase A).
+  // Si no se pasa ninguna, usa la estructura por defecto.
+  fijarEstructura(estructuraConfig || estructuraPorDefecto());
   let historico = (historicoInicial || []).slice();
   const semanas = [];
   for (let s = 0; s < numSemanas; s++) {
@@ -1044,7 +1099,8 @@ function generarCronograma(planilla, db, historicoInicial, fechaLunesInicio, num
     semanas.push({ fechaLunes, asig, semana, estad, avisos });
   }
   const informe = regenerarInformeMensual(historico);
-  return { semanas, historico, informe };
+  // devolver también la estructura compilada para que el render dibuje las áreas reales
+  return { semanas, historico, informe, estructura: estructuraActiva() };
 }
 
 
@@ -1277,13 +1333,6 @@ function _estiloPorTurno(turnoFinal, S) {
 }
 
 /* ---------- Construye la grid de una semana (cuadrante + decalajes) ---------- */
-const _AREAS = [
-  { nombre: "UCI A", sub: "Control A", pIni: 1, pFin: 3 },
-  { nombre: "UCI B", sub: "Control B", pIni: 4, pFin: 7 },
-  { nombre: "SEMIS", sub: "", pIni: 8, pFin: 10 },
-  { nombre: "REA", sub: "", pIni: 11, pFin: 12 },
-  { nombre: "UCCRI", sub: "", pIni: 13, pFin: 15 },
-];
 const _DIAS = ["LUN", "MAR", "MIÉ", "JUE", "VIE", "SÁB", "DOM"];
 const _BLOQUES = [
   { idx: 0, label: "MAÑANA", suf: "MATI", hdr: "matiHdr" },
@@ -1291,7 +1340,7 @@ const _BLOQUES = [
   { idx: 2, label: "NOCHE", suf: "NIT", hdr: "matiHdr" },
 ];
 
-function _gridSemana(sem, db, ENGINE, S) {
+function _gridSemana(sem, db, ENGINE, S, areasLayout) {
   const grid = [];
   const fechas = Array.from({ length: 7 }, (_, i) => ENGINE.addDays(sem.fechaLunes, i));
   // turno por día/nombre para color
@@ -1314,13 +1363,12 @@ function _gridSemana(sem, db, ENGINE, S) {
     grid.push(cab);
 
     // filas por área
-    for (const area of _AREAS) {
+    for (const area of areasLayout) {
       let local = 1;
       for (let p = area.pIni; p <= area.pFin; p++) {
         const row = [];
-        // col A: nombre de área solo en la primera fila; subzona en la segunda
+        // col A: nombre de área solo en la primera fila
         if (p === area.pIni) row.push({ v: area.nombre, s: S.areaName, t: "s" });
-        else if (area.sub && p === area.pIni + 1) row.push({ v: area.sub, s: S.areaName, t: "s" });
         else row.push({ v: "", s: S.areaName });
         // col B: número local
         row.push({ v: local, s: S.areaNum, t: "n" });
@@ -1387,12 +1435,15 @@ function _gridInforme(informe, S) {
 /* ---------- API principal ---------- */
 function exportarCronogramaXLSX(resultado, db, ENGINE) {
   const { styleSheet, styleIdx: S } = _buildStyles();
+  // Áreas reales del cuadrante (estructura dinámica)
+  const est = resultado.estructura || ENGINE.estructuraActiva();
+  const areasLayout = (est.areas || []).map(a => ({ nombre: a.nombre, pIni: a.posIni, pFin: a.posFin }));
 
   // Una hoja por semana + una hoja de informe
   const hojas = [];
   resultado.semanas.forEach((sem, i) => {
     const nombre = "Sem " + ENGINE.fechaCorta(sem.fechaLunes).replace(/[^\w]/g, "");
-    hojas.push({ name: nombre.slice(0, 31), grid: _gridSemana(sem, db, ENGINE, S),
+    hojas.push({ name: nombre.slice(0, 31), grid: _gridSemana(sem, db, ENGINE, S, areasLayout),
       widths: [16, 5, 20, 20, 20, 20, 20, 20, 20] });
   });
   hojas.push({ name: "Informe mensual", grid: _gridInforme(resultado.informe, S),
@@ -1445,7 +1496,8 @@ function exportarCronogramaXLSX(resultado, db, ENGINE) {
 }
 
   return {
-    TURNO, COLOR, AREA, CRIT, NPOS_TOTAL,
+    TURNO, COLOR, AREA, CRIT, NPOS_TOTAL_actual,
+    CATALOGO_AREAS, estructuraPorDefecto, fijarEstructura, estructuraActiva,
     normalizarTexto, colorPorTurno, fechaCorta, mesKey, addDays, weekdayMonday,
     posGlobalAArea, nombreAreaCortoDePosGlobal,
     ProfesionalesDB, obtenerProfesionalesDelDia,
@@ -1558,6 +1610,7 @@ export default function App() {
   const [fechaLunes, setFechaLunes] = useState(isoDate(lunesDeLaSemana(new Date())));
   const [numSemanas, setNumSemanas] = useState(2);
   const [historico, setHistorico] = useState([]);
+  const [estructura, setEstructura] = useState(null); // config de la unidad (Fase A)
   const [resultado, setResultado] = useState(null);
   const [semanaActiva, setSemanaActiva] = useState(0);
   const [vista, setVista] = useState("inicio"); // inicio | cronograma | decalajes | informe | profesionales | editor
@@ -1609,6 +1662,9 @@ export default function App() {
         }
         const h = await cargarHistorico();
         if (h && h.length) setHistorico(h);
+        // Estructura de la unidad: la guardada, o la por defecto
+        const est = await cargarEstructura();
+        setEstructura(est && est.length ? est : ENGINE.estructuraPorDefecto());
       } catch (err) {
         setError("No se pudieron cargar los datos: " + err.message);
       } finally {
@@ -1679,7 +1735,7 @@ export default function App() {
     setTimeout(() => {
       try {
         const lunes = parseISO(fechaLunes);
-        const out = ENGINE.generarCronograma(planilla, db, [], lunes, Math.max(1, Math.min(12, +numSemanas)));
+        const out = ENGINE.generarCronograma(planilla, db, [], lunes, Math.max(1, Math.min(12, +numSemanas)), estructura);
         setResultado(out);
         setSemanaActiva(0);
         setVista("cronograma");
@@ -1744,6 +1800,13 @@ export default function App() {
   }
 
   const verEditor = () => setVista("editor");
+  const verEstructura = () => setVista("estructura");
+
+  // Guarda la estructura de la unidad en la base compartida.
+  async function saveEstructura(nuevaConfig) {
+    await guardarEstructura(nuevaConfig);
+    setEstructura(nuevaConfig);
+  }
 
   async function handleLogout() {
     setMenuPerfil(false);
@@ -1810,12 +1873,24 @@ export default function App() {
           guardarEnHistorico={guardarEnHistorico}
           limpiarHistorico={limpiarHistorico}
           verEditor={verEditor} vistaActiva={vista}
+          verEstructura={verEstructura}
+          estructura={estructura}
         />
         <input ref={planillaInputRef} type="file" accept=".xlsx,.xlsm,.xls" hidden onChange={onPlanillaFile} />
         <input ref={staffInputRef} type="file" accept=".xlsx,.xlsm,.xls" hidden onChange={onStaffFile} />
 
         <main className="main">
           {error && <div className="error">{error}</div>}
+
+          {vista === "estructura" && (
+            <EditorEstructura
+              estructura={estructura || ENGINE.estructuraPorDefecto()}
+              catalogo={ENGINE.CATALOGO_AREAS}
+              porDefecto={ENGINE.estructuraPorDefecto()}
+              saveEstructura={saveEstructura}
+              onCerrar={() => setVista(resultado ? "cronograma" : "inicio")}
+            />
+          )}
 
           {vista === "editor" && (
             <EditorPlantilla
@@ -1826,15 +1901,15 @@ export default function App() {
             />
           )}
 
-          {vista !== "editor" && !resultado && <Welcome planilla={planilla} db={db} />}
+          {vista !== "editor" && vista !== "estructura" && !resultado && <Welcome planilla={planilla} db={db} />}
 
-          {vista !== "editor" && resultado && (
+          {vista !== "editor" && vista !== "estructura" && resultado && (
             <>
               <Tabs vista={vista} setVista={setVista}
                 semanas={resultado.semanas} semanaActiva={semanaActiva} setSemanaActiva={setSemanaActiva}
                 exportarExcel={exportarExcel} />
               {vista === "cronograma" && (
-                <Cronograma semana={resultado.semanas[semanaActiva]} db={db} ENGINE={ENGINE} planilla={planilla} />
+                <Cronograma semana={resultado.semanas[semanaActiva]} db={db} ENGINE={ENGINE} planilla={planilla} estructura={resultado.estructura} />
               )}
               {vista === "decalajes" && (
                 <Decalajes avisos={resultado.semanas[semanaActiva].avisos} db={db} ENGINE={ENGINE} />
@@ -2186,7 +2261,10 @@ function NuevaPasswordScreen({ onGuardar, onListo }) {
 function Sidebar(props) {
   const { planillaInfo, staffSource, profs, fechaLunes, setFechaLunes, numSemanas, setNumSemanas,
     onPlanillaClick, onStaffClick, generar, puedeGenerar, busy, historicoLen,
-    resultado, guardarEnHistorico, limpiarHistorico, verEditor, vistaActiva } = props;
+    resultado, guardarEnHistorico, limpiarHistorico, verEditor, vistaActiva,
+    verEstructura, estructura } = props;
+  const nAreas = estructura ? estructura.filter(a => a.activa && a.posiciones > 0).length : 0;
+  const nPos = estructura ? estructura.filter(a => a.activa).reduce((s, a) => s + (a.posiciones || 0), 0) : 0;
   return (
     <aside className="sidebar">
       <Section step="1" title="Planilla del mes">
@@ -2213,7 +2291,20 @@ function Sidebar(props) {
           : <p className="hint">Base compartida entre coordinadoras. Punto de partida: el libro con la hoja DATOS_PROFESIONALES. Luego se edita en el apartado 4 sin volver a Excel.</p>}
       </Section>
 
-      <Section step="3" title="Periodo">
+      <Section step="3" title="Estructura de la unidad">
+        <button className={"filebtn ghost" + (vistaActiva === "estructura" ? " is-active" : "")}
+          onClick={verEstructura}>
+          {vistaActiva === "estructura" ? "Configurando unidad" : "Configurar unidad"}
+        </button>
+        {estructura
+          ? <div className="filemeta">
+              <strong>{nPos} posiciones · {nAreas} áreas</strong>
+              <span>Camas operativas de esta semana</span>
+            </div>
+          : <p className="hint">Define qué unidades están abiertas y con cuántas posiciones.</p>}
+      </Section>
+
+      <Section step="4" title="Periodo">
         <label className="field">
           <span>Lunes de inicio</span>
           <input type="date" value={fechaLunes}
@@ -2233,7 +2324,7 @@ function Sidebar(props) {
         <p className="hint center">Sube la planilla y la base de profesionales para empezar.</p>
       )}
 
-      <Section step="4" title="Profesionales en plantilla">
+      <Section step="5" title="Profesionales en plantilla">
         <button className={"filebtn ghost" + (vistaActiva === "editor" ? " is-active" : "")}
           onClick={verEditor} disabled={!profs}>
           {vistaActiva === "editor" ? "Editando plantilla" : "Ver y editar plantilla"}
@@ -2347,16 +2438,14 @@ const BLOQUES = [
   { idx: 1, label: "TARDE", suf: "TARDE" },
   { idx: 2, label: "NOCHE", suf: "NIT" },
 ];
-const AREAS_LAYOUT = [
-  { nombre: "UCI A", sub: "Control A", pIni: 1, pFin: 3 },
-  { nombre: "UCI B", sub: "Control B", pIni: 4, pFin: 7 },
-  { nombre: "SEMIS", sub: "", pIni: 8, pFin: 10 },
-  { nombre: "REA", sub: "", pIni: 11, pFin: 12 },
-  { nombre: "UCCRI", sub: "", pIni: 13, pFin: 15 },
-];
 
-function Cronograma({ semana, db, ENGINE, planilla }) {
+function Cronograma({ semana, db, ENGINE, planilla, estructura }) {
   const fechas = useMemo(() => Array.from({ length: 7 }, (_, i) => ENGINE.addDays(semana.fechaLunes, i)), [semana, ENGINE]);
+  // Layout de áreas a partir de la estructura real del cuadrante generado.
+  const areasLayout = useMemo(() => {
+    const est = estructura || ENGINE.estructuraActiva();
+    return (est.areas || []).map(a => ({ nombre: a.nombre, pIni: a.posIni, pFin: a.posFin }));
+  }, [estructura, ENGINE]);
   // Precalcular el turnoFinal de cada profesional por día para decidir color de celda
   const turnoPorDiaNombre = useMemo(() => {
     const m = [];
@@ -2405,7 +2494,7 @@ function Cronograma({ semana, db, ENGINE, planilla }) {
                 </tr>
               </thead>
               <tbody>
-                {AREAS_LAYOUT.map(area => {
+                {areasLayout.map(area => {
                   const rows = [];
                   let local = 1;
                   for (let p = area.pIni; p <= area.pFin; p++) {
@@ -2415,7 +2504,6 @@ function Cronograma({ semana, db, ENGINE, planilla }) {
                         {isFirst && (
                           <td className="area-cell" rowSpan={area.pFin - area.pIni + 1}>
                             <span className="area-name">{area.nombre}</span>
-                            {area.sub && <span className="area-sub">{area.sub}</span>}
                           </td>
                         )}
                         <td className="num-cell">{local}</td>
@@ -2509,7 +2597,124 @@ function Informe({ informe }) {
   );
 }
 
-/* ---------- Editor de plantilla (apartado 4) ----------
+/* ---------- Editor de estructura de la unidad (apartado 3) ----------
+   La coordinadora marca/desmarca qué unidades están abiertas y ajusta
+   el nº de posiciones de cada una. Se guarda en la base compartida.
+*/
+function EditorEstructura({ estructura, catalogo, porDefecto, saveEstructura, onCerrar }) {
+  // Trabajar sobre una copia local indexada por id, completando con el catálogo
+  const inicial = () => catalogo.map(cat => {
+    const guardada = (estructura || []).find(a => a.id === cat.id);
+    return guardada
+      ? { ...cat, posiciones: guardada.posiciones, activa: guardada.activa }
+      : { ...cat, posiciones: cat.posDefecto, activa: false };
+  });
+  const [filas, setFilas] = useState(inicial);
+  const [busy, setBusy] = useState(false);
+  const [dirty, setDirty] = useState(false);
+  const [msg, setMsg] = useState("");
+
+  function setActiva(id, val) {
+    setFilas(prev => prev.map(f => f.id === id ? { ...f, activa: val } : f));
+    setDirty(true); setMsg("");
+  }
+  function setPos(id, val) {
+    const n = Math.max(0, Math.min(12, parseInt(val, 10) || 0));
+    setFilas(prev => prev.map(f => f.id === id ? { ...f, posiciones: n } : f));
+    setDirty(true); setMsg("");
+  }
+  async function guardar() {
+    setBusy(true); setMsg("");
+    try {
+      const config = filas.map(f => ({
+        id: f.id, nombre: f.nombre, rotacion: f.rotacion,
+        posiciones: f.posiciones, activa: f.activa,
+      }));
+      await saveEstructura(config);
+      setDirty(false); setMsg("ok");
+      setTimeout(() => setMsg(""), 2600);
+    } catch (err) {
+      setMsg(err.message || "No se pudo guardar.");
+    } finally { setBusy(false); }
+  }
+  function restaurar() {
+    const def = porDefecto;
+    setFilas(catalogo.map(cat => {
+      const d = def.find(a => a.id === cat.id);
+      return { ...cat, posiciones: d ? d.posiciones : cat.posDefecto, activa: d ? d.activa : false };
+    }));
+    setDirty(true); setMsg("");
+  }
+
+  const totalPos = filas.filter(f => f.activa).reduce((s, f) => s + (f.posiciones || 0), 0);
+
+  // Agrupar visualmente por rotación (UCI, SEMIS, REA, UCCRI)
+  return (
+    <div className="estructura">
+      <div className="editor-head">
+        <div>
+          <h2>Estructura de la unidad</h2>
+          <p className="section-intro">
+            Marca qué unidades están abiertas esta semana y ajusta cuántas posiciones
+            (camas/enfermeras) tiene cada una. Se guarda y se reutiliza la próxima vez;
+            solo tienes que marcar o desmarcar según cómo esté la unidad.
+          </p>
+        </div>
+        <button className="linkbtn" onClick={onCerrar}>← Volver</button>
+      </div>
+
+      <div className="est-card">
+        <div className="est-row est-head-row">
+          <span className="est-c-check">Abierta</span>
+          <span className="est-c-nombre">Unidad</span>
+          <span className="est-c-rot">Cuenta como</span>
+          <span className="est-c-pos">Posiciones</span>
+        </div>
+        {filas.map(f => (
+          <div key={f.id} className={"est-row" + (f.activa ? "" : " inactiva")}>
+            <span className="est-c-check">
+              <button className={"chk " + (f.activa ? "on" : "")}
+                onClick={() => setActiva(f.id, !f.activa)}
+                aria-label={f.activa ? "Cerrar unidad" : "Abrir unidad"}>
+                {f.activa ? "✓" : ""}
+              </button>
+            </span>
+            <span className="est-c-nombre">{f.nombre}</span>
+            <span className="est-c-rot"><span className="rot-tag">{f.rotacion}</span></span>
+            <span className="est-c-pos">
+              <input type="number" min="0" max="12" value={f.posiciones}
+                disabled={!f.activa}
+                onChange={e => setPos(f.id, e.target.value)} />
+            </span>
+          </div>
+        ))}
+        <div className="est-total">
+          <span>Total de posiciones abiertas</span>
+          <strong>{totalPos}</strong>
+        </div>
+      </div>
+
+      {msg && msg !== "ok" && <div className="login-error" style={{ marginTop: 14 }}>{msg}</div>}
+      {msg === "ok" && <div className="saved-note" style={{ marginTop: 14 }}>Estructura guardada. Vuelve a generar el cuadrante para aplicarla.</div>}
+      {dirty && msg !== "ok" && <div className="dirty-note" style={{ marginTop: 14 }}>Tienes cambios sin guardar.</div>}
+
+      <div className="est-actions">
+        <button className="minibtn" onClick={restaurar}>Restaurar por defecto</button>
+        <button className="savebtn" disabled={busy || !dirty} onClick={guardar}>
+          {busy ? "Guardando…" : "Guardar estructura"}
+        </button>
+      </div>
+
+      <p className="foot-hint" style={{ marginTop: 18 }}>
+        UCCRI Esquerra y UCCRI Dreta cuentan ambas como «UCCRI» para la rotación mensual:
+        a efectos de rotación da igual el lado. Puedes abrir solo una, las dos, o ninguna,
+        y poner en cada una el número de enfermeras que corresponda.
+      </p>
+    </div>
+  );
+}
+
+/* ---------- Editor de plantilla (apartado 5) ----------
    Edita la base de profesionales que alimenta el motor. Trabaja sobre
    una copia local; al guardar, persiste y queda disponible para las
    siguientes planillas (el motor relee estos datos en cada generación).
@@ -3161,6 +3366,25 @@ const CSS = `
 .login-btn:hover:not(:disabled) { background: var(--accent-deep); }
 .login-btn:disabled { background: var(--line-strong); box-shadow: none; cursor: default; }
 .login-foot { margin: 22px 0 0; font-size: 11.5px; line-height: 1.5; color: var(--muted); }
+
+/* ---------- Editor de estructura ---------- */
+.estructura { max-width: 720px; }
+.est-card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; box-shadow: var(--shadow); }
+.est-row { display: grid; grid-template-columns: 78px 1fr 110px 110px; align-items: center; gap: 10px; padding: 11px 16px; border-bottom: 1px solid var(--line); }
+.est-row:last-of-type { border-bottom: none; }
+.est-head-row { background: var(--panel); font-size: 11.5px; font-weight: 620; color: var(--ink-soft); letter-spacing: .02em; text-transform: uppercase; }
+.est-head-row span { font-size: 11px; }
+.est-row.inactiva { opacity: .5; }
+.est-c-nombre { font-size: 14px; font-weight: 560; }
+.rot-tag { display: inline-block; padding: 2px 9px; border-radius: 20px; font-size: 11px; font-weight: 600; background: var(--accent-wash); color: var(--accent-deep); }
+.est-c-pos input { width: 70px; padding: 7px 9px; border: 1px solid var(--line-strong); border-radius: 7px; font: inherit; font-size: 13px; text-align: center; background: var(--surface); color: var(--ink); }
+.est-c-pos input:disabled { background: var(--panel); color: var(--line-strong); }
+.est-c-pos input:focus { outline: 2px solid var(--accent-wash); border-color: var(--accent); }
+.chk { width: 28px; height: 28px; border-radius: 7px; border: 1.5px solid var(--line-strong); background: var(--surface); cursor: pointer; font-size: 14px; font-weight: 700; color: #fff; display: grid; place-items: center; transition: all .12s; }
+.chk.on { background: var(--accent); border-color: var(--accent); }
+.est-total { display: flex; align-items: center; justify-content: space-between; padding: 13px 16px; background: var(--panel); font-size: 13px; color: var(--ink-soft); }
+.est-total strong { font-size: 18px; color: var(--ink); }
+.est-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px; }
 
 /* ---------- Responsive ---------- */
 @media (max-width: 860px) {
