@@ -6,6 +6,7 @@ import {
   cargarProfesionales, guardarProfesionales,
   cargarHistorico, añadirAlHistorico, vaciarHistorico,
   cargarEstructura, guardarEstructura,
+  cargarAnotaciones, guardarAnotaciones,
 } from "./supabase.js";
 
 /* ============================================================
@@ -855,6 +856,10 @@ function aplicarEstablesAdiaPorDia(semana, asignEst, asig) {
 }
 
 function rellenarHuecosYExcedentes(semana, asignEst, asig, db) {
+  // Memoria de continuidad intra-semana: posición usada por cada profesional sin
+  // asignación estable, para intentar repetirla los días siguientes (continuidad
+  // asistencial observada en los cuadrantes reales).
+  const posPrevia = new Map();
   for (let d = 0; d < 7; d++) {
     for (const reg of semana[d].regs) {
       const a = buscarAsignEstable(asignEst, reg.nombre);
@@ -868,17 +873,29 @@ function rellenarHuecosYExcedentes(semana, asignEst, asig, db) {
         case TURNO.N12: turnos[0] = TURNO_IDX.NOCHE; break;
         case TURNO.DOBLAJE: turnos[0] = TURNO_IDX.MANANA; turnos[1] = TURNO_IDX.TARDE; break;
       }
-      colocarEnDiaTurno(asig, d, turnos, reg.nombre, db);
+      const usada = colocarEnDiaTurno(asig, d, turnos, reg.nombre, db, posPrevia.get(normalizarTexto(reg.nombre)));
+      if (usada > 0) posPrevia.set(normalizarTexto(reg.nombre), usada);
     }
   }
 }
 
-function colocarEnDiaTurno(asig, d, turnos, nombre, db) {
-  if (turnos[0] < 0) return;
+// Coloca a un profesional en un día/turno. Si se le pasa `posPreferida` (la que
+// usó un día anterior de la misma semana) y sigue libre y es compatible, la reutiliza
+// para mantener continuidad. Devuelve la posición usada (0 si fue a excedente).
+function colocarEnDiaTurno(asig, d, turnos, nombre, db, posPreferida) {
+  if (turnos[0] < 0) return 0;
   const crit = db.criterio(nombre);
   const areas = listaAreasOrdenadas();
   const t = turnos[0];
   let posElegida = 0;
+
+  // 1) Intentar repetir la posición preferida (continuidad intra-semana)
+  if (posPreferida && posPreferida > 0 && asig.celdas[d][t][posPreferida] === "") {
+    const rotPref = posGlobalAArea(posPreferida).area;
+    if (puedeIrAArea(crit, rotPref)) posElegida = posPreferida;
+  }
+
+  // 2) Si no, primer hueco compatible en orden de áreas
   for (let ai = 0; ai < areas.length && posElegida === 0; ai++) {
     const area = areas[ai];
     if (!puedeIrAArea(crit, area)) continue;
@@ -888,6 +905,7 @@ function colocarEnDiaTurno(asig, d, turnos, nombre, db) {
   }
   if (posElegida > 0) {
     for (let k = 0; k < 3; k++) if (turnos[k] >= 0) asig.celdas[d][turnos[k]][posElegida] = nombre;
+    return posElegida;
   } else {
     for (let k = 0; k < 3; k++) {
       if (turnos[k] < 0) continue;
@@ -896,6 +914,7 @@ function colocarEnDiaTurno(asig, d, turnos, nombre, db) {
       const cont = asig.excedentes[idx].length + 1;
       asig.excedentes[idx].push({ nombre, area: areaExcedenteRoundRobin(cont) });
     }
+    return 0;
   }
 }
 
@@ -1148,21 +1167,27 @@ function filasHistoricoDeSemana(asig) {
   return filas;
 }
 
-// Informe mensual: por (mes, prof) área principal y semanas
+// Informe mensual de rotación, separado en DÍA y NOCHE (como ROTACIONS_INF).
+// Para cada (mes, profesional, ámbito día/noche) calcula la unidad principal
+// (la de más semanas distintas) y si ha rotado entre unidades ese mes.
+// El turno M/T cuenta como DÍA; N cuenta como NOCHE.
 function regenerarInformeMensual(historico) {
-  // por (mes||prof||area) -> set de lunes
+  // ámbito: "DIA" si turno M/T, "NIT" si turno N
+  function ambitoDe(turno) { return turno === "N" ? "NIT" : "DIA"; }
+  // (mes||ambito||prof||area) -> set de lunes (semanas distintas en esa unidad)
   const semanasSet = new Map();
   for (const h of historico) {
+    const amb = ambitoDe(h.turno);
     const lun = diaSerial(addDays(h.fecha, -((weekdayMonday(h.fecha)) - 1)));
-    const claveS = h.mes + "||" + h.prof + "||" + h.area;
+    const claveS = h.mes + "||" + amb + "||" + h.prof + "||" + h.area;
     if (!semanasSet.has(claveS)) semanasSet.set(claveS, new Set());
     semanasSet.get(claveS).add(lun);
   }
-  // (mes||prof) -> {area: nSemanas}
+  // (mes||ambito||prof) -> {area: nSemanas}
   const acum = new Map();
   for (const [k, set] of semanasSet) {
-    const [mes, prof, area] = k.split("||");
-    const claveMP = mes + "||" + prof;
+    const [mes, amb, prof, area] = k.split("||");
+    const claveMP = mes + "||" + amb + "||" + prof;
     if (!acum.has(claveMP)) acum.set(claveMP, new Map());
     acum.get(claveMP).set(area, set.size);
   }
@@ -1173,14 +1198,18 @@ function regenerarInformeMensual(historico) {
     let resumen;
     if (areas.size === 1) resumen = mejorArea;
     else {
-      resumen = "Área principal = " + mejorArea;
-      for (const [a, c] of areas) if (a !== mejorArea) resumen += " - " + c + " semanas = " + a;
+      resumen = "Unidad principal = " + mejorArea;
+      for (const [a, c] of areas) if (a !== mejorArea) resumen += " · " + a + " (" + c + " sem.)";
     }
-    const [mes, prof] = k.split("||");
-    filas.push({ mes, profesional: prof, resumen });
+    const [mes, ambito, prof] = k.split("||");
+    filas.push({ mes, ambito, profesional: prof, unidadPrincipal: mejorArea, roto: areas.size > 1, resumen });
   }
-  filas.sort((a, b) => a.mes < b.mes ? -1 : a.mes > b.mes ? 1 :
-    a.profesional.toUpperCase() < b.profesional.toUpperCase() ? -1 : 1);
+  // ordenar por ámbito (DIA antes que NIT), luego mes, luego profesional
+  filas.sort((a, b) => {
+    if (a.ambito !== b.ambito) return a.ambito === "DIA" ? -1 : 1;
+    if (a.mes !== b.mes) return a.mes < b.mes ? -1 : 1;
+    return a.profesional.toUpperCase() < b.profesional.toUpperCase() ? -1 : 1;
+  });
   return filas;
 }
 
@@ -1525,19 +1554,23 @@ function _gridSemana(sem, db, ENGINE, S, areasLayout) {
 }
 
 /* ---------- Hoja de informe mensual ---------- */
-function _gridInforme(informe, S) {
+function _gridInforme(informe, S, ambito) {
   const grid = [];
+  const filas = informe.filter(f => f.ambito === ambito);
   grid.push([
     { v: "Mes", s: S.thGris, t: "s" },
     { v: "Profesional", s: S.thGris, t: "s" },
-    { v: "Resumen de rotación", s: S.thGris, t: "s" },
+    { v: "Unidad / rotación", s: S.thGris, t: "s" },
   ]);
-  for (const f of informe) {
+  for (const f of filas) {
     grid.push([
       { v: f.mes, s: S.tdNormal, t: "s" },
       { v: f.profesional, s: S.tdNormal, t: "s" },
-      { v: f.resumen, s: S.tdNormal, t: "s" },
+      { v: f.resumen + (f.roto ? "  [rota]" : ""), s: S.tdNormal, t: "s" },
     ]);
+  }
+  if (filas.length === 0) {
+    grid.push([{ v: "(sin registros)", s: S.tdNormal, t: "s" }]);
   }
   return grid;
 }
@@ -1556,7 +1589,9 @@ function exportarCronogramaXLSX(resultado, db, ENGINE) {
     hojas.push({ name: nombre.slice(0, 31), grid: _gridSemana(sem, db, ENGINE, S, areasLayout),
       widths: [16, 5, 20, 20, 20, 20, 20, 20, 20] });
   });
-  hojas.push({ name: "Informe mensual", grid: _gridInforme(resultado.informe, S),
+  hojas.push({ name: "Rotació DIA", grid: _gridInforme(resultado.informe, S, "DIA"),
+    widths: [10, 34, 60] });
+  hojas.push({ name: "Rotació NIT", grid: _gridInforme(resultado.informe, S, "NIT"),
     widths: [10, 34, 60] });
 
   // Construir partes del paquete
@@ -2020,7 +2055,8 @@ export default function App() {
                 semanas={resultado.semanas} semanaActiva={semanaActiva} setSemanaActiva={setSemanaActiva}
                 exportarExcel={exportarExcel} />
               {vista === "cronograma" && (
-                <Cronograma semana={resultado.semanas[semanaActiva]} db={db} ENGINE={ENGINE} planilla={planilla} estructura={resultado.estructura} />
+                <Cronograma semana={resultado.semanas[semanaActiva]} db={db} ENGINE={ENGINE} planilla={planilla} estructura={resultado.estructura}
+                  cargarAnotaciones={cargarAnotaciones} guardarAnotaciones={guardarAnotaciones} />
               )}
               {vista === "decalajes" && (
                 <Decalajes avisos={resultado.semanas[semanaActiva].avisos} db={db} ENGINE={ENGINE} />
@@ -2550,8 +2586,39 @@ const BLOQUES = [
   { idx: 2, label: "NOCHE", suf: "NIT" },
 ];
 
-function Cronograma({ semana, db, ENGINE, planilla, estructura }) {
+function Cronograma({ semana, db, ENGINE, planilla, estructura, cargarAnotaciones, guardarAnotaciones }) {
   const fechas = useMemo(() => Array.from({ length: 7 }, (_, i) => ENGINE.addDays(semana.fechaLunes, i)), [semana, ENGINE]);
+  const lunesISO = useMemo(() => isoDate(semana.fechaLunes), [semana]);
+
+  // --- Anotaciones manuales (Fase B3) ---
+  const [anotaciones, setAnotaciones] = useState({});
+  const [editando, setEditando] = useState(null); // {d, t, p} o null
+  const [modoAnotar, setModoAnotar] = useState(false);
+  useEffect(() => {
+    let vivo = true;
+    (async () => {
+      if (!cargarAnotaciones) return;
+      try {
+        const a = await cargarAnotaciones(lunesISO);
+        if (vivo) setAnotaciones(a || {});
+      } catch { if (vivo) setAnotaciones({}); }
+    })();
+    return () => { vivo = false; };
+  }, [lunesISO, cargarAnotaciones]);
+
+  const claveCelda = (d, t, p) => d + "-" + t + "-" + p;
+  async function aplicarAnotacion(d, t, p, texto) {
+    const k = claveCelda(d, t, p);
+    const nuevo = { ...anotaciones };
+    if (texto && texto.trim()) nuevo[k] = texto.trim();
+    else delete nuevo[k];
+    setAnotaciones(nuevo);
+    setEditando(null);
+    if (guardarAnotaciones) {
+      try { await guardarAnotaciones(lunesISO, nuevo); } catch { /* se mantiene en memoria */ }
+    }
+  }
+
   // Layout de áreas a partir de la estructura real del cuadrante generado.
   const areasLayout = useMemo(() => {
     const est = estructura || ENGINE.estructuraActiva();
@@ -2594,16 +2661,30 @@ function Cronograma({ semana, db, ENGINE, planilla, estructura }) {
 
   return (
     <div className="crono-wrap">
-      <div className="crono-legend">
-        <LegendItem color="#A9D08E" label="12 h día" />
-        <LegendItem color="#9DC3E6" label="12 h noche" />
-        <LegendItem color="#F4B084" label="Doblaje" />
-        <LegendItem color="#fff" label="Turno 7 h / parcial" border />
-        <LegendItem color="var(--empty)" label="Sin cubrir" />
-        <span className="legend-item"><span className="badge badge-dbl">DBL</span> Doblaje</span>
-        <span className="legend-item"><span className="badge badge-plus">+</span> Turno extra</span>
-        <span className="legend-item"><span className="badge badge-half">½</span> Media jornada</span>
+      <div className="crono-toolbar">
+        <div className="crono-legend">
+          <LegendItem color="#A9D08E" label="12 h día" />
+          <LegendItem color="#9DC3E6" label="12 h noche" />
+          <LegendItem color="#F4B084" label="Doblaje" />
+          <LegendItem color="#fff" label="Turno 7 h / parcial" border />
+          <LegendItem color="var(--empty)" label="Sin cubrir" />
+          <span className="legend-item"><span className="badge badge-dbl">DBL</span> Doblaje</span>
+          <span className="legend-item"><span className="badge badge-plus">+</span> Extra</span>
+          <span className="legend-item"><span className="badge badge-half">½</span> Media jornada</span>
+        </div>
+        <button className={"anotar-btn" + (modoAnotar ? " on" : "")}
+          onClick={() => { setModoAnotar(v => !v); setEditando(null); }}>
+          {modoAnotar ? "✓ Anotando (clic en una celda)" : "✎ Añadir anotaciones"}
+        </button>
       </div>
+      {modoAnotar && (
+        <div className="anotar-help">
+          Haz clic en cualquier celda para añadir una nota (por ejemplo <strong>COT</strong>,
+          <strong> COF</strong>, o una franja como <strong>8-14h</strong>). Estas anotaciones
+          las pones tú a mano; el sistema no puede deducirlas del Excel. Se guardan y las ven
+          el resto de coordinadoras.
+        </div>
+      )}
       {BLOQUES.map(b => (
         <div key={b.idx} className="bloque">
           <div className="bloque-title" data-suf={b.suf}>
@@ -2642,11 +2723,21 @@ function Cronograma({ semana, db, ENGINE, planilla, estructura }) {
                           const st = cellColor(nombre, d, b.idx);
                           const et = nombre ? etiquetaPorDiaNombre[d].get(ENGINE.normalizarTexto(nombre)) : "";
                           const etTxt = etiquetaCorta(et);
+                          const k = claveCelda(d, b.idx, p);
+                          const nota = anotaciones[k];
+                          const estaEditando = editando && editando.d === d && editando.t === b.idx && editando.p === p;
                           return (
-                            <td key={d} className="data-cell" style={st}
-                              title={nombre ? (nombre + (et ? " · " + et : "")) : "Sin cubrir"}>
+                            <td key={d} className={"data-cell" + (modoAnotar ? " anotable" : "") + (nota ? " con-nota" : "")} style={st}
+                              title={nombre ? (nombre + (et ? " · " + et : "") + (nota ? " · " + nota : "")) : (nota || "Sin cubrir")}
+                              onClick={modoAnotar && !estaEditando ? () => setEditando({ d, t: b.idx, p }) : undefined}>
                               {nombre ? db.apodo(nombre) : ""}
                               {etTxt && <span className={"badge badge-" + (et === "doblaje" ? "dbl" : et === "+" ? "plus" : "half")}>{etTxt}</span>}
+                              {nota && !estaEditando && <span className="nota-cell">{nota}</span>}
+                              {estaEditando && (
+                                <CeldaAnotacion inicial={nota || ""}
+                                  onGuardar={(txt) => aplicarAnotacion(d, b.idx, p, txt)}
+                                  onCancelar={() => setEditando(null)} />
+                              )}
                             </td>
                           );
                         })}
@@ -2664,6 +2755,27 @@ function Cronograma({ semana, db, ENGINE, planilla, estructura }) {
     </div>
   );
 }
+/* Edición en línea de una anotación de celda (Fase B3) */
+function CeldaAnotacion({ inicial, onGuardar, onCancelar }) {
+  const [txt, setTxt] = useState(inicial);
+  const ref = useRef(null);
+  useEffect(() => { if (ref.current) { ref.current.focus(); ref.current.select(); } }, []);
+  return (
+    <div className="nota-edit" onClick={e => e.stopPropagation()}>
+      <input ref={ref} value={txt} maxLength={14} placeholder="COT, 8-14h…"
+        onChange={e => setTxt(e.target.value)}
+        onKeyDown={e => {
+          if (e.key === "Enter") onGuardar(txt);
+          if (e.key === "Escape") onCancelar();
+        }} />
+      <div className="nota-edit-btns">
+        <button className="nota-ok" onClick={() => onGuardar(txt)}>Guardar</button>
+        <button className="nota-x" onClick={onCancelar}>✕</button>
+      </div>
+    </div>
+  );
+}
+
 function LegendItem({ color, label, border }) {
   return (
     <span className="legend-item">
@@ -2714,18 +2826,37 @@ function Decalajes({ avisos, db, ENGINE }) {
 
 /* ---------- Informe mensual ---------- */
 function Informe({ informe }) {
-  if (!informe.length) return <div className="empty-note">Sin datos de informe.</div>;
+  if (!informe.length) return <div className="empty-note">Sin datos de informe. Genera cuadrantes y guárdalos en el histórico para ver la rotación mensual.</div>;
+  const dia = informe.filter(f => f.ambito === "DIA");
+  const nit = informe.filter(f => f.ambito === "NIT");
+  const Tabla = ({ filas }) => (
+    <table className="inf-table">
+      <thead><tr><th>Mes</th><th>Profesional</th><th>Unidad / rotación</th></tr></thead>
+      <tbody>
+        {filas.map((f, i) => (
+          <tr key={i}>
+            <td>{f.mes}</td>
+            <td>{f.profesional}</td>
+            <td>{f.resumen}{f.roto && <span className="roto-tag">rota</span>}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
   return (
     <div className="informe">
-      <p className="section-intro">Área principal de cada profesional por mes y si ha rotado entre unidades.</p>
-      <table className="inf-table">
-        <thead><tr><th>Mes</th><th>Profesional</th><th>Resumen</th></tr></thead>
-        <tbody>
-          {informe.map((f, i) => (
-            <tr key={i}><td>{f.mes}</td><td>{f.profesional}</td><td>{f.resumen}</td></tr>
-          ))}
-        </tbody>
-      </table>
+      <p className="section-intro">
+        Rotación mensual de cada profesional: la unidad principal donde ha estado cada mes,
+        separada en jornada de día y de noche. Si ha pasado por más de una unidad, se marca «rota».
+      </p>
+      <div className="inf-bloque">
+        <h3 className="inf-titulo"><span className="inf-pill dia">DÍA</span> Rotación de jornada de día</h3>
+        {dia.length ? <Tabla filas={dia} /> : <div className="empty-note small">Sin registros de día.</div>}
+      </div>
+      <div className="inf-bloque">
+        <h3 className="inf-titulo"><span className="inf-pill nit">NOCHE</span> Rotación de jornada de noche</h3>
+        {nit.length ? <Tabla filas={nit} /> : <div className="empty-note small">Sin registros de noche.</div>}
+      </div>
     </div>
   );
 }
@@ -3282,6 +3413,28 @@ const CSS = `
 .badge-dbl { background: #d4763a; color: #fff; }
 .badge-plus { background: #3a7a6a; color: #fff; }
 .badge-half { background: #888; color: #fff; }
+
+/* ---------- Anotaciones manuales (B3) ---------- */
+.crono-toolbar { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 12px; }
+.anotar-btn { flex: none; padding: 8px 14px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface); color: var(--ink-soft); font: inherit; font-size: 12.5px; font-weight: 560; cursor: pointer; white-space: nowrap; }
+.anotar-btn:hover { background: var(--panel); }
+.anotar-btn.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+.anotar-help { background: var(--accent-wash); border: 1px solid #bfe0db; border-radius: 8px; padding: 10px 13px; font-size: 12.5px; line-height: 1.55; color: var(--ink-soft); margin-bottom: 14px; }
+.anotar-help strong { color: var(--accent-deep); }
+.data-cell.anotable { cursor: pointer; }
+.data-cell.anotable:hover { outline: 2px solid var(--accent); outline-offset: -2px; }
+.data-cell { /* permitir que el editor de nota se vea fuera de la celda */ }
+td.data-cell:has(.nota-edit) { overflow: visible; }
+.nota-cell { display: block; font-size: 9px; font-weight: 700; color: #b5532a; margin-top: 1px; text-transform: uppercase; letter-spacing: .02em; }
+.data-cell.con-nota { box-shadow: inset 0 -2px 0 #e0a890; }
+.nota-edit { position: absolute; z-index: 30; left: 50%; top: 100%; transform: translateX(-50%); margin-top: 2px; background: var(--surface); border: 1px solid var(--accent); border-radius: 8px; box-shadow: 0 6px 20px rgba(20,30,48,.2); padding: 7px; display: flex; flex-direction: column; gap: 6px; width: 130px; }
+.nota-edit input { width: 100%; padding: 6px 8px; border: 1px solid var(--line-strong); border-radius: 6px; font: inherit; font-size: 12px; }
+.nota-edit input:focus { outline: 2px solid var(--accent-wash); border-color: var(--accent); }
+.nota-edit-btns { display: flex; gap: 5px; }
+.nota-ok { flex: 1; padding: 5px; border: none; border-radius: 6px; background: var(--accent); color: #fff; font: inherit; font-size: 11.5px; font-weight: 600; cursor: pointer; }
+.nota-ok:hover { background: var(--accent-deep); }
+.nota-x { padding: 5px 8px; border: 1px solid var(--line-strong); border-radius: 6px; background: var(--surface); color: var(--muted); font: inherit; font-size: 11.5px; cursor: pointer; }
+.nota-x:hover { background: var(--panel); color: var(--ink); }
 .area-start td { border-top: 2px solid var(--line-strong); }
 
 /* ---------- Decalajes ---------- */
@@ -3301,6 +3454,13 @@ const CSS = `
 
 /* ---------- Informe / Plantilla ---------- */
 .informe, .plantilla { max-width: 940px; }
+.inf-bloque { margin-bottom: 26px; }
+.inf-titulo { display: flex; align-items: center; gap: 10px; font-size: 14px; font-weight: 640; margin: 0 0 12px; color: var(--ink); }
+.inf-pill { display: inline-block; padding: 3px 11px; border-radius: 20px; font-size: 11px; font-weight: 700; letter-spacing: .03em; color: #fff; }
+.inf-pill.dia { background: #d9a441; }
+.inf-pill.nit { background: #5b6bbf; }
+.roto-tag { display: inline-block; margin-left: 8px; padding: 1px 7px; border-radius: 5px; font-size: 10px; font-weight: 650; background: var(--accent-wash); color: var(--accent-deep); vertical-align: middle; }
+.empty-note.small { font-size: 12.5px; padding: 12px; }
 .plantilla-bar { display: flex; align-items: center; gap: 14px; margin-bottom: 14px; }
 .search { flex: 1; max-width: 360px; padding: 9px 13px; border: 1px solid var(--line-strong); border-radius: 8px; font: inherit; font-size: 13px; }
 .search:focus { outline: 2px solid var(--accent-wash); border-color: var(--accent); }

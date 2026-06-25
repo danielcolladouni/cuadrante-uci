@@ -213,3 +213,30 @@ export async function guardarEstructura(config) {
     .upsert({ clave: CLAVE_ESTRUCTURA, valor }, { onConflict: "clave" });
   if (error) throw error;
 }
+
+/* ---------- Anotaciones manuales del cuadrante (Fase B3) ----------
+   La coordinadora añade notas (COT, COF, franjas como 8-14h…) sobre celdas
+   concretas que el sistema no puede deducir del Excel. Se guardan por semana
+   en la misma tabla config_unidad, con clave "anotacion:<lunesISO>".
+   El valor es un objeto { "<dia>-<turnoIdx>-<posGlobal>": "texto" }.
+*/
+export async function cargarAnotaciones(lunesISO) {
+  const { data, error } = await supabase
+    .from("config_unidad")
+    .select("valor")
+    .eq("clave", "anotacion:" + lunesISO)
+    .maybeSingle();
+  if (error) throw error;
+  if (!data || !data.valor) return {};
+  try {
+    return typeof data.valor === "string" ? JSON.parse(data.valor) : data.valor;
+  } catch { return {}; }
+}
+
+export async function guardarAnotaciones(lunesISO, mapa) {
+  const valor = JSON.stringify(mapa || {});
+  const { error } = await supabase
+    .from("config_unidad")
+    .upsert({ clave: "anotacion:" + lunesISO, valor }, { onConflict: "clave" });
+  if (error) throw error;
+}

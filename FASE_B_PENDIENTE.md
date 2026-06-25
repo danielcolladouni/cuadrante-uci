@@ -7,8 +7,13 @@
 ## ESTADO
 - [HECHO] B1 — Clasificación por turno natural + cómputo de horas
 - [HECHO] B2 — Detección y etiquetado del doblaje (badges DBL/+/½ en web y Excel)
-- [PENDIENTE] B3 — Anotaciones manuales sobre el cuadrante (COT/COF/franjas)
-- [PENDIENTE] B4 — Afinar continuidad/rotación + registro mensual estilo ROTACIONS_INF
+- [HECHO] B3 — Anotaciones manuales sobre el cuadrante (COT/COF/franjas)
+          Clic en celda → nota; se guarda por semana en config_unidad (Supabase).
+          Pendiente opcional: incluir las notas también en el Excel exportado.
+- [HECHO] B4 — Informe mensual separado DÍA/NOCHE (estilo ROTACIONS_INF) +
+          continuidad intra-semana reforzada (repetir posición los días que trabaja).
+
+FASE B COMPLETA.
 
 ---
 
