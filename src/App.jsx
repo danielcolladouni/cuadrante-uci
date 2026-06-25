@@ -103,6 +103,26 @@ function estructuraPorDefecto() {
   }));
 }
 
+// Etiqueta fija que sustituye/acompaña al número de una posición concreta,
+// según la convención de la unidad (revisión de carro, cama parada, etc.).
+// areaId = id del catálogo (UCI_A, SEMIS, REA, UCCRI_ESQ, UCCRI_DRE, UCI_B).
+// posLocal = número de posición dentro del área (1..n).
+// Devuelve { texto, reemplazaNumero } o null si la posición no tiene etiqueta.
+function etiquetaFijaPosicion(areaId, posLocal) {
+  // "+ revisió carro" en posiciones concretas (acompaña al número)
+  const revisioCarro = (
+    (areaId === "UCI_A" && posLocal === 2) ||
+    (areaId === "SEMIS" && posLocal === 1) ||
+    (areaId === "REA" && posLocal === 2) ||
+    (areaId === "UCCRI_ESQ" && posLocal === 2) ||
+    (areaId === "UCCRI_DRE" && posLocal === 2)
+  );
+  if (revisioCarro) return { texto: "+ revisió carro", reemplazaNumero: false };
+  // Posición 5 de UCI B: cama de parada / ictus / carro (sustituye al número)
+  if (areaId === "UCI_B" && posLocal === 5) return { texto: "ATURADA+ICTUS+CARRO", reemplazaNumero: true };
+  return null;
+}
+
 // Compila una config en un mapa de posiciones globales que usa el motor.
 function compilarEstructura(config) {
   const activas = (config && config.length ? config : estructuraPorDefecto())
@@ -1213,7 +1233,64 @@ function regenerarInformeMensual(historico) {
   return filas;
 }
 
-/* ---------- ORQUESTADOR: genera N semanas con rotación acumulada ---------- */
+/* ---------- Histórico de rotación mensual (apartado propio) ----------
+   Para cada profesional y mes, calcula la unidad (o unidades) donde ha estado,
+   según el % de DÍAS trabajados en cada unidad:
+   - Si una unidad concentra el 66% o más de los días -> esa unidad sola.
+   - Si ninguna llega al 66% -> las DOS unidades con más % (mayor primero).
+   Se considera la rotación independientemente del turno (día/noche se mezclan,
+   porque lo que importa es la unidad asistencial del mes). UCCRI esq/dre = "UCCRI".
+   Devuelve, por profesional, una lista de { mes, unidades:[...], etiqueta }.
+*/
+function resumenHistoricoRotacion(historico) {
+  const UMBRAL = 0.66;
+  // (prof||mes) -> Map(area -> nº de días distintos)
+  const diasPorArea = new Map();
+  // para contar días distintos por (prof,mes,area) usamos un set de fechaSerial
+  const setDias = new Map(); // clave prof||mes||area -> Set(fechaSerial)
+  for (const h of historico) {
+    const claveSet = h.prof + "||" + h.mes + "||" + h.area;
+    if (!setDias.has(claveSet)) setDias.set(claveSet, new Set());
+    setDias.get(claveSet).add(h.fechaSerial);
+  }
+  for (const [clave, set] of setDias) {
+    const [prof, mes, area] = clave.split("||");
+    const claveMP = prof + "||" + mes;
+    if (!diasPorArea.has(claveMP)) diasPorArea.set(claveMP, new Map());
+    diasPorArea.get(claveMP).set(area, set.size);
+  }
+
+  // Agrupar por profesional
+  const porProf = new Map();
+  for (const [claveMP, areas] of diasPorArea) {
+    const [prof, mes] = claveMP.split("||");
+    // total de días (suma de días por área; un día en 2 áreas cuenta en cada una,
+    // pero para % usamos el total de "presencias-día")
+    let total = 0;
+    for (const [, n] of areas) total += n;
+    // ordenar áreas por nº de días desc
+    const orden = [...areas.entries()].sort((a, b) => b[1] - a[1]);
+    let unidades;
+    const top = orden[0];
+    if (top && total > 0 && top[1] / total >= UMBRAL) {
+      unidades = [top[0]]; // una sola unidad domina
+    } else {
+      // las dos con más días (si solo hay una, esa)
+      unidades = orden.slice(0, 2).map(e => e[0]);
+    }
+    if (!porProf.has(prof)) porProf.set(prof, []);
+    porProf.get(prof).push({ mes, unidades, etiqueta: unidades.join(" + ") });
+  }
+
+  // Convertir a lista ordenada por profesional, con sus meses ordenados
+  const salida = [];
+  for (const [prof, meses] of porProf) {
+    meses.sort((a, b) => a.mes < b.mes ? -1 : a.mes > b.mes ? 1 : 0);
+    salida.push({ profesional: prof, meses });
+  }
+  salida.sort((a, b) => a.profesional.toUpperCase() < b.profesional.toUpperCase() ? -1 : 1);
+  return salida;
+}
 function generarCronograma(planilla, db, historicoInicial, fechaLunesInicio, numSemanas, estructuraConfig) {
   // Fijar la estructura de la unidad para esta generación (Fase A).
   // Si no se pasa ninguna, usa la estructura por defecto.
@@ -1315,6 +1392,8 @@ const FILL = {
   manana: "FFFFE699", tarde: "FFF8CBAD", noche: "FFB4A7D6",
   d12: "FFA9D08E", n12: "FF9DC3E6", doblaje: "FFF4B084", parcial: "FFD9D9D9",
   blanco: "FFFFFFFF", vacio: "FFFF0000",
+  diaBloque: "FFA9D08E",     // verde: cualquier celda de jornada de día
+  nitBloque: "FFD2BEE6",     // morado: cualquier celda de jornada de noche
   cabFecha: "FFC6E0B4",     // cabecera de fechas (verde claro)
   matiHdr: "FF8064A2",      // morado bloque mañana/noche (cabecera)
   tardeHdr: "FFED7D31",     // naranja bloque tarde
@@ -1335,6 +1414,7 @@ function _buildStyles() {
     "none", "gray", FILL.manana, FILL.tarde, FILL.noche, FILL.d12, FILL.n12,
     FILL.doblaje, FILL.parcial, FILL.blanco, FILL.vacio, FILL.cabFecha,
     FILL.matiHdr, FILL.tardeHdr, FILL.areaBg, FILL.decHdr, FILL.decSub, FILL.decOk, FILL.decKo,
+    FILL.diaBloque, FILL.nitBloque,
   ];
   const fillIdx = {};
   fillList.forEach((c, i) => { if (c !== "none" && c !== "gray") fillIdx[c] = i; });
@@ -1388,6 +1468,8 @@ function _buildStyles() {
   addXf("cParcial", { fill: fillIdx[FILL.parcial], border: 1, hAlign: "center" });
   addXf("cBlanco", { fill: fillIdx[FILL.blanco], border: 1, hAlign: "center" });
   addXf("cVacio", { fill: fillIdx[FILL.vacio], border: 1, hAlign: "center" });
+  addXf("cDia", { fill: fillIdx[FILL.diaBloque], border: 1, hAlign: "center" });
+  addXf("cNit", { fill: fillIdx[FILL.nitBloque], border: 1, hAlign: "center" });
   // decalajes
   addXf("decHdr", { font: 2, fill: fillIdx[FILL.decHdr], border: 1, hAlign: "center" });
   addXf("decSub", { font: 1, fill: fillIdx[FILL.decSub], border: 1, hAlign: "center" });
@@ -1500,31 +1582,40 @@ function _gridSemana(sem, db, ENGINE, S, areasLayout) {
     grid.push(cab);
 
     // filas por área
-    for (const area of areasLayout) {
+    areasLayout.forEach((area, areaIdx) => {
       let local = 1;
       for (let p = area.pIni; p <= area.pFin; p++) {
         const row = [];
         // col A: nombre de área solo en la primera fila
         if (p === area.pIni) row.push({ v: area.nombre, s: S.areaName, t: "s" });
         else row.push({ v: "", s: S.areaName });
-        // col B: número local
-        row.push({ v: local, s: S.areaNum, t: "n" });
-        // cols C..I: días
+        // col B: número local o etiqueta fija de la posición
+        const etFija = ENGINE.etiquetaFijaPosicion(area.id, local);
+        if (etFija && etFija.reemplazaNumero) {
+          row.push({ v: etFija.texto, s: S.areaNum, t: "s" });
+        } else if (etFija) {
+          row.push({ v: local + " " + etFija.texto, s: S.areaNum, t: "s" });
+        } else {
+          row.push({ v: local, s: S.areaNum, t: "n" });
+        }
+        // cols C..I: días — color por bloque (día verde, noche morado)
+        const estiloBloque = b.idx === 2 ? S.cNit : S.cDia;
         for (let d = 0; d < 7; d++) {
           const nombre = sem.asig.celdas[d][b.idx][p];
           if (!nombre) {
             row.push({ v: "", s: S.cVacio });
           } else {
-            const tf = turnoMap[d].get(ENGINE.normalizarTexto(nombre));
             const et = etiqMap[d].get(ENGINE.normalizarTexto(nombre));
             const suf = et === "doblaje" ? " (DBL)" : et === "+" ? " (+)" : et === "parcial" ? " (½)" : "";
-            row.push({ v: db.apodo(nombre) + suf, s: _estiloPorTurno(tf, S), t: "s" });
+            row.push({ v: db.apodo(nombre) + suf, s: estiloBloque, t: "s" });
           }
         }
         grid.push(row);
         local++;
       }
-    }
+      // fila en blanco de separación entre unidades (no tras la última)
+      if (areaIdx < areasLayout.length - 1) grid.push([]);
+    });
     // fila en blanco entre bloques
     grid.push([]);
   }
@@ -1580,7 +1671,7 @@ function exportarCronogramaXLSX(resultado, db, ENGINE) {
   const { styleSheet, styleIdx: S } = _buildStyles();
   // Áreas reales del cuadrante (estructura dinámica)
   const est = resultado.estructura || ENGINE.estructuraActiva();
-  const areasLayout = (est.areas || []).map(a => ({ nombre: a.nombre, pIni: a.posIni, pFin: a.posFin }));
+  const areasLayout = (est.areas || []).map(a => ({ id: a.id, nombre: a.nombre, pIni: a.posIni, pFin: a.posFin }));
 
   // Una hoja por semana + una hoja de informe
   const hojas = [];
@@ -1643,6 +1734,7 @@ function exportarCronogramaXLSX(resultado, db, ENGINE) {
   return {
     TURNO, COLOR, AREA, CRIT, NPOS_TOTAL_actual,
     CATALOGO_AREAS, estructuraPorDefecto, fijarEstructura, estructuraActiva,
+    etiquetaFijaPosicion,
     normalizarTexto, colorPorTurno, fechaCorta, mesKey, addDays, weekdayMonday,
     posGlobalAArea, nombreAreaCortoDePosGlobal,
     ProfesionalesDB, obtenerProfesionalesDelDia,
@@ -1650,6 +1742,7 @@ function exportarCronogramaXLSX(resultado, db, ENGINE) {
     construirAsignacionSemanal, generarCronograma,
     ajustarTurnosDobles, ajustarParciales, construirAvisosDecalaje,
     filasHistoricoDeSemana, regenerarInformeMensual, parsearAntiguedad,
+    resumenHistoricoRotacion,
     turnoNaturalCanon, clasificarJornadaNatural, UMBRAL_H,
     exportarCronogramaXLSX,
   };
@@ -1947,6 +2040,7 @@ export default function App() {
 
   const verEditor = () => setVista("editor");
   const verEstructura = () => setVista("estructura");
+  const verHistorico = () => setVista("historico");
 
   // Guarda la estructura de la unidad en la base compartida.
   async function saveEstructura(nuevaConfig) {
@@ -2021,6 +2115,7 @@ export default function App() {
           verEditor={verEditor} vistaActiva={vista}
           verEstructura={verEstructura}
           estructura={estructura}
+          verHistorico={verHistorico}
         />
         <input ref={planillaInputRef} type="file" accept=".xlsx,.xlsm,.xls" hidden onChange={onPlanillaFile} />
         <input ref={staffInputRef} type="file" accept=".xlsx,.xlsm,.xls" hidden onChange={onStaffFile} />
@@ -2038,6 +2133,13 @@ export default function App() {
             />
           )}
 
+          {vista === "historico" && (
+            <HistoricoRotacion
+              historico={historico} ENGINE={ENGINE}
+              onCerrar={() => setVista(resultado ? "cronograma" : "inicio")}
+            />
+          )}
+
           {vista === "editor" && (
             <EditorPlantilla
               profs={profs} saveProfs={saveProfs}
@@ -2047,9 +2149,9 @@ export default function App() {
             />
           )}
 
-          {vista !== "editor" && vista !== "estructura" && !resultado && <Welcome planilla={planilla} db={db} />}
+          {vista !== "editor" && vista !== "estructura" && vista !== "historico" && !resultado && <Welcome planilla={planilla} db={db} />}
 
-          {vista !== "editor" && vista !== "estructura" && resultado && (
+          {vista !== "editor" && vista !== "estructura" && vista !== "historico" && resultado && (
             <>
               <Tabs vista={vista} setVista={setVista}
                 semanas={resultado.semanas} semanaActiva={semanaActiva} setSemanaActiva={setSemanaActiva}
@@ -2061,7 +2163,6 @@ export default function App() {
               {vista === "decalajes" && (
                 <Decalajes avisos={resultado.semanas[semanaActiva].avisos} db={db} ENGINE={ENGINE} />
               )}
-              {vista === "informe" && <Informe informe={resultado.informe} />}
               {vista === "profesionales" && <Profesionales db={db} />}
             </>
           )}
@@ -2409,7 +2510,7 @@ function Sidebar(props) {
   const { planillaInfo, staffSource, profs, fechaLunes, setFechaLunes, numSemanas, setNumSemanas,
     onPlanillaClick, onStaffClick, generar, puedeGenerar, busy, historicoLen,
     resultado, guardarEnHistorico, limpiarHistorico, verEditor, vistaActiva,
-    verEstructura, estructura } = props;
+    verEstructura, estructura, verHistorico } = props;
   const nAreas = estructura ? estructura.filter(a => a.activa && a.posiciones > 0).length : 0;
   const nPos = estructura ? estructura.filter(a => a.activa).reduce((s, a) => s + (a.posiciones || 0), 0) : 0;
   return (
@@ -2484,13 +2585,17 @@ function Sidebar(props) {
       </Section>
 
       <Section step="" title="Histórico de rotación">
+        <button className={"filebtn ghost" + (vistaActiva === "historico" ? " is-active" : "")}
+          onClick={verHistorico}>
+          {vistaActiva === "historico" ? "Viendo histórico" : "Ver histórico de rotación"}
+        </button>
         <p className="hint">
           {historicoLen > 0
-            ? `${historicoLen} asignaciones en la base compartida. La rotación mensual se basa en este registro.`
-            : "Aún no hay histórico. La rotación entre semanas del mismo lote sí se aplica; guarda el resultado para que afecte a futuros cuadrantes y al resto de coordinadoras."}
+            ? "Unidad de cada profesional mes a mes. Guarda los cuadrantes que generes para alimentarlo."
+            : "Aún no hay histórico. Genera un cuadrante y pulsa «Guardar en histórico» para registrar la rotación."}
         </p>
         <div className="row-btns">
-          <button className="minibtn" disabled={!resultado} onClick={guardarEnHistorico}>Guardar resultado</button>
+          <button className="minibtn" disabled={!resultado} onClick={guardarEnHistorico}>Guardar en histórico</button>
           <button className="minibtn danger" disabled={historicoLen === 0} onClick={limpiarHistorico}>Vaciar</button>
         </div>
       </Section>
@@ -2543,7 +2648,7 @@ function Tabs({ vista, setVista, semanas, semanaActiva, setSemanaActiva, exporta
   return (
     <div className="tabsbar">
       <div className="tabs">
-        {[["cronograma","Cuadrante"],["decalajes","Decalajes"],["informe","Informe mensual"],["profesionales","Plantilla"]]
+        {[["cronograma","Cuadrante"],["decalajes","Decalajes"],["profesionales","Plantilla"]]
           .map(([k, l]) => (
           <button key={k} className={"tab " + (vista === k ? "active" : "")} onClick={() => setVista(k)}>{l}</button>
         ))}
@@ -2622,7 +2727,7 @@ function Cronograma({ semana, db, ENGINE, planilla, estructura, cargarAnotacione
   // Layout de áreas a partir de la estructura real del cuadrante generado.
   const areasLayout = useMemo(() => {
     const est = estructura || ENGINE.estructuraActiva();
-    return (est.areas || []).map(a => ({ nombre: a.nombre, pIni: a.posIni, pFin: a.posFin }));
+    return (est.areas || []).map(a => ({ id: a.id, nombre: a.nombre, pIni: a.posIni, pFin: a.posFin }));
   }, [estructura, ENGINE]);
   // Precalcular el turnoFinal y la etiqueta de cada profesional por día
   const turnoPorDiaNombre = useMemo(() => {
@@ -2651,22 +2756,20 @@ function Cronograma({ semana, db, ENGINE, planilla, estructura, cargarAnotacione
     return "";
   }
 
+  // Color por BLOQUE de turno (como los cuadrantes reales de la unidad):
+  // día (mañana/tarde) en verde, noche en morado; sin cubrir en rojo.
   function cellColor(nombre, d, bloqueIdx) {
     if (!nombre) return { background: "var(--empty)", color: "transparent" };
-    const tf = turnoPorDiaNombre[d].get(ENGINE.normalizarTexto(nombre));
-    const blanco = tf === ENGINE.TURNO.MANANA || tf === ENGINE.TURNO.TARDE || tf === ENGINE.TURNO.NOCHE || tf === ENGINE.TURNO.PARCIAL;
-    if (blanco) return { background: "#fff" };
-    return { background: ENGINE.colorPorTurno(tf) };
+    if (bloqueIdx === 2) return { background: "#D2BEE6" }; // NOCHE -> morado
+    return { background: "#A9D08E" };                       // MAÑANA/TARDE -> verde
   }
 
   return (
     <div className="crono-wrap">
       <div className="crono-toolbar">
         <div className="crono-legend">
-          <LegendItem color="#A9D08E" label="12 h día" />
-          <LegendItem color="#9DC3E6" label="12 h noche" />
-          <LegendItem color="#F4B084" label="Doblaje" />
-          <LegendItem color="#fff" label="Turno 7 h / parcial" border />
+          <LegendItem color="#A9D08E" label="Jornada de día" />
+          <LegendItem color="#D2BEE6" label="Jornada de noche" />
           <LegendItem color="var(--empty)" label="Sin cubrir" />
           <span className="legend-item"><span className="badge badge-dbl">DBL</span> Doblaje</span>
           <span className="legend-item"><span className="badge badge-plus">+</span> Extra</span>
@@ -2705,11 +2808,12 @@ function Cronograma({ semana, db, ENGINE, planilla, estructura, cargarAnotacione
                 </tr>
               </thead>
               <tbody>
-                {areasLayout.map(area => {
+                {areasLayout.map((area, areaIdx) => {
                   const rows = [];
                   let local = 1;
                   for (let p = area.pIni; p <= area.pFin; p++) {
                     const isFirst = p === area.pIni;
+                    const etFija = ENGINE.etiquetaFijaPosicion(area.id, local);
                     rows.push(
                       <tr key={p} className={isFirst ? "area-start" : ""}>
                         {isFirst && (
@@ -2717,7 +2821,11 @@ function Cronograma({ semana, db, ENGINE, planilla, estructura, cargarAnotacione
                             <span className="area-name">{area.nombre}</span>
                           </td>
                         )}
-                        <td className="num-cell">{local}</td>
+                        <td className={"num-cell" + (etFija ? " num-label" : "")}>
+                          {etFija && etFija.reemplazaNumero
+                            ? <span className="pos-fija">{etFija.texto}</span>
+                            : <>{local}{etFija && <span className="pos-fija-sub">{etFija.texto}</span>}</>}
+                        </td>
                         {fechas.map((f, d) => {
                           const nombre = semana.asig.celdas[d][b.idx][p];
                           const st = cellColor(nombre, d, b.idx);
@@ -2744,6 +2852,14 @@ function Cronograma({ semana, db, ENGINE, planilla, estructura, cargarAnotacione
                       </tr>
                     );
                     local++;
+                  }
+                  // Fila en blanco de separación entre unidades (no tras la última)
+                  if (areaIdx < areasLayout.length - 1) {
+                    rows.push(
+                      <tr key={"sep-" + area.id} className="sep-row" aria-hidden="true">
+                        <td className="sep-cell" colSpan={2 + 7}></td>
+                      </tr>
+                    );
                   }
                   return rows;
                 })}
@@ -2825,6 +2941,105 @@ function Decalajes({ avisos, db, ENGINE }) {
 }
 
 /* ---------- Informe mensual ---------- */
+/* ---------- Histórico de rotación (apartado propio, vista visual) ---------- */
+const MESES_ES = ["Gener", "Febrer", "Març", "Abril", "Maig", "Juny", "Juliol", "Agost", "Setembre", "Octubre", "Novembre", "Desembre"];
+function nombreMes(mesKey) {
+  const partes = String(mesKey || "").split("-");
+  if (partes.length !== 2) return mesKey;
+  const m = parseInt(partes[1], 10) - 1;
+  return (MESES_ES[m] || mesKey) + " " + partes[0];
+}
+function colorUnidad(u) {
+  switch (u) {
+    case "UCI A": return { bg: "#dce9f7", fg: "#1c4e8a", bd: "#b4cdec" };
+    case "UCI B": return { bg: "#e2dcf3", fg: "#4a328a", bd: "#cabdee" };
+    case "SEMIS": return { bg: "#dcefe0", fg: "#1f6a3a", bd: "#bfe0c8" };
+    case "REA": return { bg: "#fdecd2", fg: "#9a6111", bd: "#f3d9a9" };
+    case "UCCRI": return { bg: "#f7dce6", fg: "#8a2c50", bd: "#eebdce" };
+    default: return { bg: "#e9e9e9", fg: "#555", bd: "#d4d4d4" };
+  }
+}
+function ChipUnidad({ u }) {
+  const c = colorUnidad(u);
+  return <span className="uni-chip" style={{ background: c.bg, color: c.fg, borderColor: c.bd }}>{u}</span>;
+}
+
+function HistoricoRotacion({ historico, ENGINE, onCerrar }) {
+  const datos = useMemo(() => ENGINE.resumenHistoricoRotacion(historico || []), [historico, ENGINE]);
+  const [busca, setBusca] = useState("");
+  const meses = useMemo(() => {
+    const set = new Set();
+    for (const p of datos) for (const m of p.meses) set.add(m.mes);
+    return [...set].sort();
+  }, [datos]);
+  const filtrados = useMemo(() => {
+    const q = busca.trim().toUpperCase();
+    if (!q) return datos;
+    return datos.filter(p => p.profesional.toUpperCase().includes(q));
+  }, [datos, busca]);
+
+  return (
+    <div className="historico">
+      <div className="editor-head">
+        <div>
+          <h2>Histórico de rotación</h2>
+          <p className="section-intro">
+            Unidad donde ha estado cada profesional mes a mes. Cuando ha pasado la mayor parte
+            del mes (66% o más de sus días) en una unidad, aparece solo esa; si ha estado más
+            repartido, aparecen las dos unidades donde más tiempo ha pasado.
+          </p>
+        </div>
+        <button className="linkbtn" onClick={onCerrar}>← Volver</button>
+      </div>
+
+      {datos.length === 0 ? (
+        <div className="empty-note">
+          Todavía no hay histórico. Genera un cuadrante y pulsa «Guardar en histórico»
+          en el panel lateral para empezar a registrar la rotación mensual.
+        </div>
+      ) : (
+        <>
+          <input className="search" placeholder="Buscar profesional…" value={busca}
+            onChange={e => setBusca(e.target.value)} style={{ marginBottom: 16 }} />
+          <div className="hist-grid-wrap">
+            <table className="hist-grid">
+              <thead>
+                <tr>
+                  <th className="hist-prof-h">Profesional</th>
+                  {meses.map(m => <th key={m} className="hist-mes-h">{nombreMes(m)}</th>)}
+                </tr>
+              </thead>
+              <tbody>
+                {filtrados.map(p => {
+                  const porMes = new Map(p.meses.map(m => [m.mes, m.unidades]));
+                  return (
+                    <tr key={p.profesional}>
+                      <td className="hist-prof">{p.profesional}</td>
+                      {meses.map(m => {
+                        const unidades = porMes.get(m);
+                        return (
+                          <td key={m} className="hist-cell">
+                            {unidades
+                              ? <div className="hist-chips">{unidades.map((u, i) => <ChipUnidad key={i} u={u} />)}</div>
+                              : <span className="hist-vacio">·</span>}
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <p className="foot-hint" style={{ marginTop: 16 }}>
+            UCCRI agrupa esquerra y dreta: a efectos de rotación cuentan como una sola unidad.
+          </p>
+        </>
+      )}
+    </div>
+  );
+}
+
 function Informe({ informe }) {
   if (!informe.length) return <div className="empty-note">Sin datos de informe. Genera cuadrantes y guárdalos en el histórico para ver la rotación mensual.</div>;
   const dia = informe.filter(f => f.ambito === "DIA");
@@ -3398,6 +3613,11 @@ const CSS = `
 .area-name { display: block; font-weight: 660; font-size: 12px; color: var(--ink); }
 .area-sub { display: block; font-size: 10px; color: var(--muted); margin-top: 1px; }
 .num-cell { background: var(--panel); text-align: center; width: 26px; font-size: 11px; font-weight: 600; color: var(--muted); font-variant-numeric: tabular-nums; }
+.num-cell.num-label { width: 96px; padding: 2px 5px; line-height: 1.15; }
+.pos-fija { font-size: 8.5px; font-weight: 700; color: var(--ink-soft); text-transform: uppercase; letter-spacing: .01em; display: block; }
+.pos-fija-sub { display: block; font-size: 8px; font-weight: 600; color: #b5853a; margin-top: 1px; }
+.sep-row td { height: 10px; background: var(--paper); border: none; padding: 0; }
+.sep-cell { border: none !important; }
 
 .data-cell {
   padding: 5px 8px; font-size: 12px; font-weight: 530;
@@ -3451,6 +3671,22 @@ td.data-cell:has(.nota-edit) { overflow: visible; }
 .dec-table tr.ok td:last-child { color: var(--accent-deep); font-weight: 560; }
 .dec-table tr.ko { background: #fcf3f2; }
 .dec-table tr.ko td:last-child { color: var(--danger); font-weight: 560; }
+
+/* ---------- Histórico de rotación ---------- */
+.historico { max-width: 1100px; }
+.hist-grid-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow); }
+.hist-grid { border-collapse: collapse; width: 100%; }
+.hist-grid th, .hist-grid td { border-bottom: 1px solid var(--line); border-right: 1px solid var(--line); }
+.hist-grid th:last-child, .hist-grid td:last-child { border-right: none; }
+.hist-prof-h { position: sticky; left: 0; z-index: 2; background: var(--panel); text-align: left; padding: 11px 14px; font-size: 11.5px; font-weight: 620; color: var(--ink-soft); text-transform: uppercase; letter-spacing: .02em; min-width: 180px; }
+.hist-mes-h { background: var(--panel); padding: 11px 12px; font-size: 12px; font-weight: 620; color: var(--ink); white-space: nowrap; min-width: 130px; }
+.hist-prof { position: sticky; left: 0; z-index: 1; background: var(--surface); padding: 10px 14px; font-size: 13px; font-weight: 540; white-space: nowrap; }
+.hist-cell { padding: 8px 12px; vertical-align: middle; }
+.hist-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.uni-chip { display: inline-block; padding: 3px 10px; border-radius: 20px; font-size: 11.5px; font-weight: 620; border: 1px solid; white-space: nowrap; }
+.hist-vacio { color: var(--line-strong); font-size: 16px; }
+.hist-grid tbody tr:hover .hist-prof { background: var(--panel); }
+.hist-grid tbody tr:last-child td { border-bottom: none; }
 
 /* ---------- Informe / Plantilla ---------- */
 .informe, .plantilla { max-width: 940px; }
