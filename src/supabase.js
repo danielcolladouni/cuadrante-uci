@@ -186,6 +186,14 @@ export async function vaciarHistorico() {
   if (error) throw error;
 }
 
+// Borra del histórico las filas de los meses indicados (p.ej. ["2025-11"]).
+// Se usa al regenerar un mes ya guardado, para reemplazarlo sin duplicar.
+export async function borrarHistoricoDeMeses(meses) {
+  if (!meses || meses.length === 0) return;
+  const { error } = await supabase.from("historico").delete().in("mes", meses);
+  if (error) throw error;
+}
+
 /* ---------- Estructura de la unidad (configuración compartida) ----------
    Se guarda como una fila única (clave fija) en la tabla "config_unidad".
    El valor es un JSON con la lista de áreas y sus posiciones.

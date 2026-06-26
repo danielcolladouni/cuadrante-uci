@@ -4,7 +4,7 @@ import {
   iniciarSesion, cerrarSesion, sesionActual, onCambioSesion,
   cambiarPassword, recuperarPassword, apodoDeSesion, cambiarApodo, escucharRecuperacion,
   cargarProfesionales, guardarProfesionales,
-  cargarHistorico, añadirAlHistorico, vaciarHistorico,
+  cargarHistorico, añadirAlHistorico, vaciarHistorico, borrarHistoricoDeMeses,
   cargarEstructura, guardarEstructura,
   cargarAnotaciones, guardarAnotaciones,
   cargarAlias, guardarAliasTodos,
@@ -2375,7 +2375,18 @@ export default function App() {
     setTimeout(() => {
       try {
         const lunes = parseISO(fechaLunes);
-        const out = ENGINE.generarCronograma(planilla, db, [], lunes, Math.max(1, Math.min(12, +numSemanas)), estructura);
+        const ns = Math.max(1, Math.min(12, +numSemanas));
+        // Histórico previo (de Supabase) para que la rotación vea los meses anteriores.
+        // Se excluyen los meses que se van a (re)generar ahora, para no contarlos dos
+        // veces si ya estaban guardados (p.ej. al regenerar un mes corregido).
+        const mesesAGenerar = new Set();
+        for (let s = 0; s < ns; s++) {
+          const l = new Date(lunes); l.setDate(l.getDate() + s * 7);
+          mesesAGenerar.add(l.getFullYear() + "-" + String(l.getMonth() + 1).padStart(2, "0"));
+        }
+        const histPrevio = (Array.isArray(historico) ? historico : [])
+          .filter(h => !mesesAGenerar.has(h.mes));
+        const out = ENGINE.generarCronograma(planilla, db, histPrevio, lunes, ns, estructura);
         setResultado(out);
         setSemanaActiva(0);
         setVista("cronograma");
@@ -2418,9 +2429,18 @@ export default function App() {
     if (!resultado) return;
     setError("");
     const nuevasFilas = resultado.semanas.flatMap(s => ENGINE.filasHistoricoDeSemana(s.asig));
+    // Meses que abarca lo que se va a guardar
+    const meses = new Set(nuevasFilas.map(f => f.mes));
     try {
+      // Si ya había filas guardadas de esos meses (p.ej. regeneración), se borran
+      // primero para que el guardado las reemplace y no se dupliquen.
+      const yaDeEsosMeses = (historico || []).some(h => meses.has(h.mes));
+      if (yaDeEsosMeses) {
+        await borrarHistoricoDeMeses([...meses]);
+      }
       await añadirAlHistorico(nuevasFilas);
-      setHistorico(historico.concat(nuevasFilas));
+      const historicoLimpio = (historico || []).filter(h => !meses.has(h.mes));
+      setHistorico(historicoLimpio.concat(nuevasFilas));
     } catch (err) {
       setError("No se pudo guardar el histórico: " + err.message);
     }
