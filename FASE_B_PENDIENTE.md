@@ -106,3 +106,71 @@ De los 6 meses de cronogramas reales (`GUARDATS_PLANINGS_INF_2026`) se observó:
   marcables que persisten para la siguiente vez (la coordinadora marca/desmarca).
 - UCCRI puede tener 1 o 2 sub-unidades abiertas (esquerra/dreta) con nº variable de
   enfermeras cada una; a efectos de rotación todo es "UCCRI".
+
+---
+
+# MEJORAS POSTERIORES (sesiones tras Fase B)
+
+## HECHO en la última sesión
+- **Histórico de rotación en apartado propio** (sidebar "Histórico de rotación"),
+  vista visual con chips de color por unidad, regla del 66% (≥66% días en una
+  unidad → solo esa; si no, las DOS con más días). Quitado de la generación de
+  cuadrantes y eliminada la pestaña "Informe mensual".
+- **Colores nuevos**: TODOS los de 12h (día y noche) y doblaje → LILA (#D2BEE6).
+  Los de 7h, 10h noche y parcial → BLANCO. Sin cubrir → rojo. En web y Excel.
+  (El usuario pidió explícitamente que 12h día también sea lila, NO verde.)
+- **Filas en blanco entre unidades** y **etiquetas fijas de posición**:
+  "+ revisió carro" en UCI_A pos2, SEMIS pos1, REA pos2, UCCRI_ESQ pos2,
+  UCCRI_DRE pos2; "ATURADA+ICTUS+CARRO" reemplaza el número en UCI_B pos5.
+
+## PENDIENTE — ROTACIÓN OBLIGATORIA (lo más importante a terminar)
+
+### Reglas acordadas con Danié
+1. Solo rotan los profesionales con **Suplente = No**. Los Suplente=Si NO rotan
+   (dan flexibilidad para tapar huecos).
+2. Cada fijo rota SOLO por las unidades que su **criterio** permite, de entre las
+   ABIERTAS en la estructura del mes:
+   - SI → UCI A, UCI B, SEMIS, REA, UCCRI
+   - NO → SEMIS, UCCRI
+   - UCI → UCI A, UCI B
+   - UCCRI → UCCRI (única → se queda siempre)
+3. **No repite unidad hasta pasar por todas las suyas**; al completar el ciclo, reinicia.
+4. La rotación de NOCHE es el mismo concepto que la de día (mismas unidades).
+5. El orden del ciclo es libre (el que mejor cubra).
+6. Si hay que dejar ubicaciones SIN CUBRIR, el orden de sacrificio es:
+   **UCI B pos5 → UCI B pos4** (máx 3 huecos en UCI B) → **UCI A pos3** →
+   **SEMIS pos3** → y por último **UCCRI**.
+7. El histórico se puede reiniciar las veces necesarias hasta que funcione.
+
+### Estado actual del código (a medio camino)
+- Implementadas y EXPORTADAS para test: `unidadRotacionObligatoria(historico,
+  nombre, criterio, esSuplente, fechaLunes)`, `unidadesCandidatasProf(criterio)`,
+  `historialMensualProf`, `unidadesAbiertasRotacion`. La función AISLADA funciona
+  perfecta en todos los casos (probado: tras UCI A va a UCI B; ciclo completo
+  reinicia; criterio UCI alterna A↔B; UCCRI se queda; suplente no rota).
+- Integrada en `intentarAsignarPos` (asignación estable) y en
+  `colocarEnDiaTurno`/`rellenarHuecosYExcedentes` (relleno de huecos), pasando
+  historico+fechaLunes. Con esto, los que cambian de unidad pasaron de 19 a 39.
+
+### EL PROBLEMA que falta resolver
+- Todavía ~33 de ~72 fijos REPITEN unidad. Causa raíz: **problema de capacidad**.
+  Si muchos estaban en UCI A en octubre, en noviembre TODOS calculan la misma
+  "siguiente unidad" y saturan unidades pequeñas (SEMIS=3, REA=2). Los que no
+  caben se quedan donde estaban.
+- Los que repiten se concentran en SEMIS y REA (las pequeñas).
+
+### LA SOLUCIÓN a construir (próxima sesión)
+- Hace falta un **reparto inteligente / asignación global por mes**: en vez de que
+  cada profesional calcule su unidad siguiente independientemente, repartir las
+  PLAZAS de cada unidad entre los candidatos que deben rotar, priorizando a quien
+  lleva más meses sin pisar esa unidad. Es un problema de asignación (tipo
+  emparejamiento), no un retoque local.
+- **PREGUNTA ABIERTA pendiente de responder por Danié**: cuando físicamente no
+  caben todos los que deben rotar a una unidad pequeña, ¿Opción A (best-effort:
+  repartir lo mejor posible y aceptar que algunos repitan ese mes, garantizando
+  que con el tiempo todos roten) u Opción B (más agresivo, dejar a más gente en
+  excedente para forzar que quepan los que rotan)? Claude recomienda la A.
+
+### Backup
+- Hay backup en src/App.jsx.bak (de antes de tocar la rotación). Quitar antes de
+  empaquetar la versión final.

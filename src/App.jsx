@@ -209,6 +209,34 @@ function areaExcedenteRoundRobin(n) {
   if (areas.length === 0) return "";
   return areas[(n - 1) % areas.length];
 }
+// Orden de reparto de EXCEDENTES (sobra gente): UCCRI → REA → SEMIS → UCI A → UCI B.
+// Solo unidades abiertas. (Distinto del orden de sacrificio de huecos.)
+function ordenExcedentes() {
+  const pref = ["UCCRI", "REA", "SEMIS", "UCI A", "UCI B"];
+  const abiertas = unidadesAbiertasRotacion();
+  return pref.filter(u => abiertas.includes(u));
+}
+// Asigna a una lista de excedentes su unidad ciclando el orden, respetando criterio.
+// excedentes: [{nombre, criterio}]. Devuelve [{nombre, area}].
+function repartirExcedentes(lista, db) {
+  const orden = ordenExcedentes();
+  const out = [];
+  const contadorPorUnidad = {};
+  let idx = 0;
+  for (const ex of lista) {
+    const crit = db.criterio(ex.nombre);
+    // buscar la siguiente unidad del ciclo a la que este profesional pueda ir
+    let asignada = "";
+    for (let intento = 0; intento < orden.length; intento++) {
+      const u = orden[(idx + intento) % orden.length];
+      if (puedeIrAArea(crit, u)) { asignada = u; idx = (idx + intento + 1) % orden.length; break; }
+    }
+    if (!asignada) asignada = orden[0] || "";
+    contadorPorUnidad[asignada] = (contadorPorUnidad[asignada] || 0) + 1;
+    out.push({ nombre: ex.nombre, area: asignada, ordenEnUnidad: contadorPorUnidad[asignada] });
+  }
+  return out;
+}
 function numeroLocalDePosGlobal(p) { return String(posGlobalAArea(p).posLocalArea); }
 function nombreAreaCortoDePosGlobal(p) {
   const r = posGlobalAArea(p);
@@ -758,6 +786,165 @@ function unidadDelMesActual(historico, nombreProf, fechaLunes) {
   return mejorArea;
 }
 
+/* ---------- ROTACIÓN OBLIGATORIA MENSUAL ----------
+   Solo rota Suplente=No; cada uno por las unidades que su criterio permite
+   (de las abiertas); no repite hasta pasar por todas; al completar, reinicia.
+*/
+// Unidades de rotación abiertas en la estructura activa (UCCRI cuenta una vez)
+function unidadesAbiertasRotacion() {
+  const out = [];
+  for (const a of _EST.areas) if (!out.includes(a.rotacion)) out.push(a.rotacion);
+  return out;
+}
+function unidadesCandidatasProf(criterio) {
+  return unidadesAbiertasRotacion().filter(u => puedeIrAArea(criterio, u));
+}
+// Historial mensual (mes -> unidad dominante) de un profesional
+function historialMensualProf(historico, profNorm, mesActual) {
+  const porMes = new Map();
+  for (const h of historico) {
+    if (h.profNorm !== profNorm) continue;
+    if (h.mes >= mesActual) continue; // solo meses anteriores
+    if (!porMes.has(h.mes)) porMes.set(h.mes, new Map());
+    const m = porMes.get(h.mes);
+    m.set(h.area, (m.get(h.area) || 0) + 1);
+  }
+  const meses = [...porMes.keys()].sort();
+  const salida = [];
+  for (const mes of meses) {
+    const m = porMes.get(mes);
+    let mejor = "", cnt = -1;
+    for (const [u, c] of m) if (c > cnt) { cnt = c; mejor = u; }
+    salida.push({ mes, unidad: mejor });
+  }
+  return salida;
+}
+// Unidad que debe ocupar este mes para cumplir la rotación obligatoria.
+// Devuelve "" si no se fuerza (suplente o sin candidatas).
+function unidadRotacionObligatoria(historico, nombreProf, criterio, esSuplente, fechaLunes) {
+  if (esSuplente) return "";
+  const candidatas = unidadesCandidatasProf(criterio);
+  if (candidatas.length === 0) return "";
+  if (candidatas.length === 1) return candidatas[0];
+
+  const mesActual = mesKey(fechaLunes);
+  const hist = historialMensualProf(historico, normalizarTexto(nombreProf), mesActual);
+
+  // ¿Ya hay asignación de unidad ESTE mes en semanas anteriores? Mantenerla
+  // (la rotación es mensual; dentro del mes no se cambia de unidad).
+  const yaEsteMes = unidadDelMesActual(historico, nombreProf, fechaLunes);
+  if (yaEsteMes && candidatas.includes(yaEsteMes)) return yaEsteMes;
+
+  // Reconstruir el ciclo actual desde el final del historial
+  const visitadas = new Set();
+  for (let i = hist.length - 1; i >= 0; i--) {
+    const u = hist[i].unidad;
+    if (!candidatas.includes(u)) continue;
+    if (visitadas.size >= candidatas.length) break;
+    if (visitadas.has(u)) break;
+    visitadas.add(u);
+  }
+  if (visitadas.size >= candidatas.length) visitadas.clear(); // ciclo completo -> reinicia
+
+  const ultima = hist.length ? hist[hist.length - 1].unidad : "";
+  let pendientes = candidatas.filter(u => !visitadas.has(u) && u !== ultima);
+  if (pendientes.length === 0) pendientes = candidatas.filter(u => !visitadas.has(u));
+  if (pendientes.length === 0) pendientes = candidatas.filter(u => u !== ultima);
+  if (pendientes.length === 0) pendientes = candidatas.slice();
+  return pendientes[0];
+}
+
+/* ---------- REPARTO INTELIGENTE de rotación (global por mes y bloque) ----------
+   En vez de que cada profesional calcule su unidad por separado (lo que satura
+   las unidades pequeñas), se reparten las PLAZAS de cada unidad entre todos los
+   que deben rotar, minimizando el nº de los que repiten. Día y noche se reparten
+   por separado (ocupan mapas de plazas distintos).
+*/
+// Cuántos meses hace que el profesional no pisa cada unidad candidata
+// (mayor = más urgente). Si nunca la pisó -> Infinity.
+function urgenciaPorUnidadRot(hist, candidatas) {
+  const urg = {};
+  for (const u of candidatas) urg[u] = Infinity;
+  for (let i = hist.length - 1, dist = 1; i >= 0; i--, dist++) {
+    const u = hist[i].unidad;
+    if (u in urg && urg[u] === Infinity) urg[u] = dist;
+  }
+  return urg;
+}
+// Reparte un conjunto de profesionales (de un bloque) entre las plazas disponibles.
+// capacidad: {unidad: nºplazas}. Devuelve Map(profNorm -> unidad).
+function repartirRotacionBloque(profesionales, capacidad, historico, mesActual) {
+  const asign = new Map();
+  const restante = { ...capacidad };
+  const datos = profesionales.map(p => {
+    const cand = Object.keys(capacidad).filter(u => puedeIrAArea(p.criterio, u) && capacidad[u] > 0);
+    const hist = historialMensualProf(historico, p.profNorm, mesActual);
+    const ultima = hist.length ? hist[hist.length - 1].unidad : "";
+    const visit = new Set();
+    for (let i = hist.length - 1; i >= 0; i--) {
+      const u = hist[i].unidad;
+      if (!cand.includes(u)) continue;
+      if (visit.size >= cand.length) break;
+      if (visit.has(u)) break;
+      visit.add(u);
+    }
+    if (visit.size >= cand.length) visit.clear();
+    const urg = urgenciaPorUnidadRot(hist, cand);
+    return { ...p, cand, ultima, urg, pendientes: cand.filter(u => !visit.has(u)) };
+  });
+  // Los más restringidos (menos unidades posibles) primero
+  datos.sort((a, b) => a.cand.length - b.cand.length);
+
+  // Fase 1: dar una unidad PENDIENTE (no visitada) y distinta de la última
+  for (const d of datos) {
+    const op = d.pendientes.filter(u => u !== d.ultima && restante[u] > 0)
+      .sort((x, y) => d.urg[y] - d.urg[x]);
+    if (op.length) { asign.set(d.profNorm, op[0]); restante[op[0]]--; }
+  }
+  // Fase 2: cualquier candidata distinta de la última con hueco
+  for (const d of datos) {
+    if (asign.has(d.profNorm)) continue;
+    const op = d.cand.filter(u => u !== d.ultima && restante[u] > 0)
+      .sort((x, y) => d.urg[y] - d.urg[x]);
+    if (op.length) { asign.set(d.profNorm, op[0]); restante[op[0]]--; }
+  }
+  // Fase 3: permitir repetir (única forma de no dejar hueco)
+  for (const d of datos) {
+    if (asign.has(d.profNorm)) continue;
+    const op = d.cand.filter(u => restante[u] > 0).sort((x, y) => d.urg[y] - d.urg[x]);
+    if (op.length) { asign.set(d.profNorm, op[0]); restante[op[0]]--; }
+  }
+  return asign;
+}
+// Capacidad (plazas por unidad) de un bloque. esNoche define qué posiciones cuentan.
+function capacidadPorUnidad() {
+  const cap = {};
+  for (const u of unidadesAbiertasRotacion()) cap[u] = posicionesDeArea(u);
+  return cap;
+}
+// Calcula el reparto del mes para día y noche. Devuelve Map(profNorm -> unidad).
+// Solo incluye fijos (Suplente=No) con bloque dominante claro.
+function calcularRepartoMes(estad, db, historico, fechaLunes) {
+  const mesActual = mesKey(fechaLunes);
+  // Si ya hay unidad asignada este mes (semanas previas), respetarla luego en
+  // intentarAsignarPos vía unidadDelMesActual; aquí repartimos a todos los fijos.
+  const dia = [], noche = [];
+  for (const e of estad) {
+    if (db.esSuplente(e.nombre)) continue;
+    const p = { nombre: e.nombre, profNorm: normalizarTexto(e.nombre), criterio: db.criterio(e.nombre) };
+    if (esBloqueNoche(e.bloqueDominante)) noche.push(p); else dia.push(p);
+  }
+  const capDia = capacidadPorUnidad();
+  const capNoche = capacidadPorUnidad();
+  const repDia = repartirRotacionBloque(dia, capDia, historico, mesActual);
+  const repNoche = repartirRotacionBloque(noche, capNoche, historico, mesActual);
+  const total = new Map();
+  for (const [k, v] of repDia) total.set("D|" + k, v);
+  for (const [k, v] of repNoche) total.set("N|" + k, v);
+  return total;
+}
+
+
 /* ---------- M05: MOTOR de asignación ---------- */
 function esBloque7h(b) { return b === "M" || b === "T" || b === "N"; }
 function esBloqueNoche(b) { return b === "N" || b === "N12"; }
@@ -783,14 +970,25 @@ function nuevaMatriz() {
 }
 
 // Intenta asignar posición fija a un profesional (con rotación). Devuelve {pos}
-function intentarAsignarPos(e, ocDia, ocNoche, db, historico, fechaLunes) {
+function intentarAsignarPos(e, ocDia, ocNoche, db, historico, fechaLunes, reparto) {
   const nombre = e.nombre;
   const crit = db.criterio(nombre);
+  const esSupl = db.esSuplente(nombre);
   const bloque = e.bloqueDominante;
   const areas = listaAreasOrdenadas();
   let posElegida = 0;
-  const unidadMes = unidadDelMesActual(historico, nombre, fechaLunes);
 
+  // Unidad asignada por el REPARTO GLOBAL del mes (minimiza repeticiones). Si no
+  // está en el reparto (p.ej. suplente), cae a la rotación individual.
+  const claveRep = (esBloqueNoche(bloque) ? "N|" : "D|") + normalizarTexto(nombre);
+  let unidadRot = reparto && reparto.get(claveRep);
+  if (!unidadRot) unidadRot = unidadRotacionObligatoria(historico, nombre, crit, esSupl, fechaLunes);
+  // Continuidad dentro del mes (si ya tenía unidad asignada en semanas previas).
+  const yaMes = unidadDelMesActual(historico, nombre, fechaLunes);
+  const unidadMes = (yaMes && puedeIrAArea(crit, yaMes)) ? yaMes : unidadRot;
+
+  // Pasada 0 y 1: forzar la unidad asignada. Pasada 2: cualquiera compatible
+  // (fallback total, solo si no cupo en su unidad — p.ej. unidad llena).
   for (let pasada = 0; pasada <= 2 && posElegida === 0; pasada++) {
     for (let ai = 0; ai < areas.length && posElegida === 0; ai++) {
       const area = areas[ai];
@@ -817,13 +1015,16 @@ function asignarEstables(estad, db, historico, fechaLunes) {
   const asignEst = []; // {nombreNorm, posGlobal, bloque}
   const ya = new Array(estad.length).fill(false);
 
+  // Reparto inteligente de rotación del mes (una unidad por fijo, minimizando repeticiones)
+  const reparto = calcularRepartoMes(estad, db, historico, fechaLunes);
+
   const pushAsign = (e, pos) => asignEst.push({ nombreNorm: normalizarTexto(e.nombre), posGlobal: pos, bloque: e.bloqueDominante });
 
   // Pasada 1: 12HD y 12HN no-suplentes
   for (let i = 0; i < estad.length; i++) {
     if (!ya[i] && !db.esSuplente(estad[i].nombre)) {
       if (estad[i].bloqueDominante === "D12" || estad[i].bloqueDominante === "N12") {
-        const pos = intentarAsignarPos(estad[i], ocDia, ocNoche, db, historico, fechaLunes);
+        const pos = intentarAsignarPos(estad[i], ocDia, ocNoche, db, historico, fechaLunes, reparto);
         pushAsign(estad[i], pos); ya[i] = true;
       }
     }
@@ -832,7 +1033,7 @@ function asignarEstables(estad, db, historico, fechaLunes) {
   for (let i = 0; i < estad.length; i++) {
     if (!ya[i] && !db.esSuplente(estad[i].nombre)) {
       if (esBloque7h(estad[i].bloqueDominante) && diasEnBloqueDominante(estad[i]) >= 5) {
-        const pos = intentarAsignarPos(estad[i], ocDia, ocNoche, db, historico, fechaLunes);
+        const pos = intentarAsignarPos(estad[i], ocDia, ocNoche, db, historico, fechaLunes, reparto);
         pushAsign(estad[i], pos); ya[i] = true;
       }
     }
@@ -840,11 +1041,11 @@ function asignarEstables(estad, db, historico, fechaLunes) {
   // Pasada 2: resto de no-suplentes
   for (let i = 0; i < estad.length; i++) {
     if (!ya[i] && !db.esSuplente(estad[i].nombre)) {
-      const pos = intentarAsignarPos(estad[i], ocDia, ocNoche, db, historico, fechaLunes);
+      const pos = intentarAsignarPos(estad[i], ocDia, ocNoche, db, historico, fechaLunes, reparto);
       pushAsign(estad[i], pos); ya[i] = true;
     }
   }
-  return asignEst;
+  return { asignEst, reparto };
 }
 
 function buscarAsignEstable(asignEst, nombre) {
@@ -875,47 +1076,89 @@ function aplicarEstablesAdiaPorDia(semana, asignEst, asig) {
   }
 }
 
-function rellenarHuecosYExcedentes(semana, asignEst, asig, db) {
+function rellenarHuecosYExcedentes(semana, asignEst, asig, db, historico, fechaLunes, reparto) {
   // Memoria de continuidad intra-semana: posición usada por cada profesional sin
-  // asignación estable, para intentar repetirla los días siguientes (continuidad
-  // asistencial observada en los cuadrantes reales).
+  // asignación estable, para intentar repetirla los días siguientes.
   const posPrevia = new Map();
+  // Cache de la unidad de rotación por profesional. Usa el REPARTO global si el
+  // profesional está en él; si no, la rotación individual.
+  const rotCache = new Map();
+  const unidadRotDe = (nombre, bloque) => {
+    const k = (esBloqueNoche(bloque) ? "N|" : "D|") + normalizarTexto(nombre);
+    if (rotCache.has(k)) return rotCache.get(k);
+    let u = reparto && reparto.get(k);
+    if (!u) u = unidadRotacionObligatoria(historico, nombre, db.criterio(nombre), db.esSuplente(nombre), fechaLunes);
+    rotCache.set(k, u);
+    return u;
+  };
   for (let d = 0; d < 7; d++) {
-    for (const reg of semana[d].regs) {
+    // Orden de colocación: primero los FIJOS (Suplente=No) por antigüedad DESC,
+    // luego los SUPLENTES. Así los fijos reclaman posición antes y, cuando sobra
+    // gente, los primeros en quedar en excedente son los suplentes; entre fijos,
+    // los de MENOR antigüedad caen antes a excedente.
+    const regsOrden = semana[d].regs.slice().sort((a, b) => {
+      const sa = db.esSuplente(a.nombre) ? 1 : 0, sb = db.esSuplente(b.nombre) ? 1 : 0;
+      if (sa !== sb) return sa - sb;                       // fijos primero
+      return db.antiguedad(b.nombre) - db.antiguedad(a.nombre); // más antiguos primero
+    });
+    for (const reg of regsOrden) {
       const a = buscarAsignEstable(asignEst, reg.nombre);
       if (a && a.posGlobal > 0) continue;
       const turnos = [-1, -1, -1];
+      let bloque = "M";
       switch (reg.turnoFinal) {
-        case TURNO.MANANA: turnos[0] = TURNO_IDX.MANANA; break;
-        case TURNO.TARDE: turnos[0] = TURNO_IDX.TARDE; break;
-        case TURNO.NOCHE: turnos[0] = TURNO_IDX.NOCHE; break;
-        case TURNO.D12: turnos[0] = TURNO_IDX.MANANA; turnos[1] = TURNO_IDX.TARDE; break;
-        case TURNO.N12: turnos[0] = TURNO_IDX.NOCHE; break;
-        case TURNO.DOBLAJE: turnos[0] = TURNO_IDX.MANANA; turnos[1] = TURNO_IDX.TARDE; break;
+        case TURNO.MANANA: turnos[0] = TURNO_IDX.MANANA; bloque = "M"; break;
+        case TURNO.TARDE: turnos[0] = TURNO_IDX.TARDE; bloque = "T"; break;
+        case TURNO.NOCHE: turnos[0] = TURNO_IDX.NOCHE; bloque = "N"; break;
+        case TURNO.D12: turnos[0] = TURNO_IDX.MANANA; turnos[1] = TURNO_IDX.TARDE; bloque = "D12"; break;
+        case TURNO.N12: turnos[0] = TURNO_IDX.NOCHE; bloque = "N12"; break;
+        case TURNO.DOBLAJE: turnos[0] = TURNO_IDX.MANANA; turnos[1] = TURNO_IDX.TARDE; bloque = "M"; break;
       }
-      const usada = colocarEnDiaTurno(asig, d, turnos, reg.nombre, db, posPrevia.get(normalizarTexto(reg.nombre)));
+      const usada = colocarEnDiaTurno(asig, d, turnos, reg.nombre, db,
+        posPrevia.get(normalizarTexto(reg.nombre)), unidadRotDe(reg.nombre, bloque));
       if (usada > 0) posPrevia.set(normalizarTexto(reg.nombre), usada);
     }
   }
+  // Post-pass: asignar a cada excedente su unidad (UCCRI→REA→SEMIS→UCI A→UCI B),
+  // respetando criterio. Se hace por cada día/turno con su propia secuencia.
+  for (const idx in asig.excedentes) {
+    const lista = asig.excedentes[idx];
+    if (!lista || lista.length === 0) continue;
+    asig.excedentes[idx] = repartirExcedentes(lista, db);
+  }
 }
 
-// Coloca a un profesional en un día/turno. Si se le pasa `posPreferida` (la que
-// usó un día anterior de la misma semana) y sigue libre y es compatible, la reutiliza
-// para mantener continuidad. Devuelve la posición usada (0 si fue a excedente).
-function colocarEnDiaTurno(asig, d, turnos, nombre, db, posPreferida) {
+// Coloca a un profesional en un día/turno. Prioridades:
+//  1) su unidad de ROTACIÓN obligatoria (si la tiene y hay hueco compatible)
+//  2) la posición que usó otros días de la semana (continuidad intra-semana)
+//  3) primer hueco compatible
+// Devuelve la posición usada (0 si fue a excedente).
+function colocarEnDiaTurno(asig, d, turnos, nombre, db, posPreferida, unidadRot) {
   if (turnos[0] < 0) return 0;
   const crit = db.criterio(nombre);
   const areas = listaAreasOrdenadas();
   const t = turnos[0];
   let posElegida = 0;
 
-  // 1) Intentar repetir la posición preferida (continuidad intra-semana)
-  if (posPreferida && posPreferida > 0 && asig.celdas[d][t][posPreferida] === "") {
+  // 1) Unidad de rotación obligatoria: buscar hueco dentro de esa unidad
+  if (unidadRot && puedeIrAArea(crit, unidadRot)) {
+    // primero, si la posición preferida cae dentro de la unidad de rotación, reusarla
+    if (posPreferida && posPreferida > 0 && asig.celdas[d][t][posPreferida] === "" &&
+        posGlobalAArea(posPreferida).area === unidadRot) {
+      posElegida = posPreferida;
+    }
+    for (let p = posGlobalInicioArea(unidadRot); posElegida === 0 && p <= posGlobalFinArea(unidadRot); p++) {
+      if (asig.celdas[d][t][p] === "") posElegida = p;
+    }
+  }
+
+  // 2) Continuidad: repetir la posición preferida si sigue libre y compatible
+  if (posElegida === 0 && posPreferida && posPreferida > 0 && asig.celdas[d][t][posPreferida] === "") {
     const rotPref = posGlobalAArea(posPreferida).area;
     if (puedeIrAArea(crit, rotPref)) posElegida = posPreferida;
   }
 
-  // 2) Si no, primer hueco compatible en orden de áreas
+  // 3) Primer hueco compatible en orden de áreas
   for (let ai = 0; ai < areas.length && posElegida === 0; ai++) {
     const area = areas[ai];
     if (!puedeIrAArea(crit, area)) continue;
@@ -927,12 +1170,12 @@ function colocarEnDiaTurno(asig, d, turnos, nombre, db, posPreferida) {
     for (let k = 0; k < 3; k++) if (turnos[k] >= 0) asig.celdas[d][turnos[k]][posElegida] = nombre;
     return posElegida;
   } else {
+    // No cupo: a excedente. El área se asigna después con el orden correcto.
     for (let k = 0; k < 3; k++) {
       if (turnos[k] < 0) continue;
       const idx = d * 3 + turnos[k];
       if (!asig.excedentes[idx]) asig.excedentes[idx] = [];
-      const cont = asig.excedentes[idx].length + 1;
-      asig.excedentes[idx].push({ nombre, area: areaExcedenteRoundRobin(cont) });
+      asig.excedentes[idx].push({ nombre, area: "" });
     }
     return 0;
   }
@@ -943,9 +1186,9 @@ function construirAsignacionSemanal(planilla, db, historico, fechaLunes) {
   asig.fechaLunes = fechaLunes;
   const semana = extraerSemana(planilla, db, fechaLunes);
   const estad = calcularEstadisticasSemana(semana, db);
-  const asignEst = asignarEstables(estad, db, historico, fechaLunes);
+  const { asignEst, reparto } = asignarEstables(estad, db, historico, fechaLunes);
   aplicarEstablesAdiaPorDia(semana, asignEst, asig);
-  rellenarHuecosYExcedentes(semana, asignEst, asig, db);
+  rellenarHuecosYExcedentes(semana, asignEst, asig, db, historico, fechaLunes, reparto);
   return { asig, semana, estad };
 }
 
@@ -1180,6 +1423,17 @@ function filasHistoricoDeSemana(asig) {
           fechaSerial: diaSerial(fecha), fecha, mes: mesKey(fecha),
           profNorm: normalizarTexto(nombre), prof: nombre,
           dia: d, turno: letra[t], posGlobal: p, area,
+        });
+      }
+      // Excedentes de este día/turno: también cuentan para el histórico (su unidad
+      // es la que se les asignó como posición extra). posGlobal 0 = sin posición fija.
+      const lista = asig.excedentes[d * 3 + t] || [];
+      for (const ex of lista) {
+        if (!ex.nombre) continue;
+        filas.push({
+          fechaSerial: diaSerial(fecha), fecha, mes: mesKey(fecha),
+          profNorm: normalizarTexto(ex.nombre), prof: ex.nombre,
+          dia: d, turno: letra[t], posGlobal: 0, area: ex.area || "",
         });
       }
     }
@@ -1598,20 +1852,44 @@ function _gridSemana(sem, db, ENGINE, S, areasLayout) {
         } else {
           row.push({ v: local, s: S.areaNum, t: "n" });
         }
-        // cols C..I: días — color por bloque (día verde, noche morado)
-        const estiloBloque = b.idx === 2 ? S.cNit : S.cDia;
+        // cols C..I: color según el TIPO de jornada del profesional ese día
+        // (12h día verde, 12h noche lila, 7h/10h/parcial blanco)
         for (let d = 0; d < 7; d++) {
           const nombre = sem.asig.celdas[d][b.idx][p];
           if (!nombre) {
             row.push({ v: "", s: S.cVacio });
           } else {
+            const tf = turnoMap[d].get(ENGINE.normalizarTexto(nombre));
             const et = etiqMap[d].get(ENGINE.normalizarTexto(nombre));
             const suf = et === "doblaje" ? " (DBL)" : et === "+" ? " (+)" : et === "parcial" ? " (½)" : "";
-            row.push({ v: db.apodo(nombre) + suf, s: estiloBloque, t: "s" });
+            let estilo;
+            if (tf === ENGINE.TURNO.D12 || tf === ENGINE.TURNO.N12 || tf === ENGINE.TURNO.DOBLAJE) estilo = S.cNit; // 12h día/noche/doblaje -> lila
+            else estilo = S.cBlanco;                                  // 7h, 10h, parcial -> blanco
+            row.push({ v: db.apodo(nombre) + suf, s: estilo, t: "s" });
           }
         }
         grid.push(row);
         local++;
+      }
+      // Filas de EXCEDENTES de esta rotación (solo en la última área de la rotación,
+      // para no duplicar UCCRI esq/dre). Posiciones extra sin número.
+      const esUltimaDeRot = !areasLayout.slice(areaIdx + 1).some(a => a.rotacion === area.rotacion);
+      if (esUltimaDeRot) {
+        let maxExced = 0;
+        for (let d = 0; d < 7; d++) {
+          const lista = (sem.asig.excedentes[d * 3 + b.idx] || []).filter(e => e.area === area.rotacion);
+          if (lista.length > maxExced) maxExced = lista.length;
+        }
+        for (let e = 0; e < maxExced; e++) {
+          const row = [{ v: "", s: S.areaName }, { v: "+", s: S.areaNum, t: "s" }];
+          for (let d = 0; d < 7; d++) {
+            const lista = (sem.asig.excedentes[d * 3 + b.idx] || []).filter(x => x.area === area.rotacion);
+            const ex = lista[e];
+            if (ex) row.push({ v: db.apodo(ex.nombre), s: S.cBlanco, t: "s" });
+            else row.push({ v: "", s: S.cVacio });
+          }
+          grid.push(row);
+        }
       }
       // fila en blanco de separación entre unidades (no tras la última)
       if (areaIdx < areasLayout.length - 1) grid.push([]);
@@ -1671,7 +1949,7 @@ function exportarCronogramaXLSX(resultado, db, ENGINE) {
   const { styleSheet, styleIdx: S } = _buildStyles();
   // Áreas reales del cuadrante (estructura dinámica)
   const est = resultado.estructura || ENGINE.estructuraActiva();
-  const areasLayout = (est.areas || []).map(a => ({ id: a.id, nombre: a.nombre, pIni: a.posIni, pFin: a.posFin }));
+  const areasLayout = (est.areas || []).map(a => ({ id: a.id, nombre: a.nombre, rotacion: a.rotacion, pIni: a.posIni, pFin: a.posFin }));
 
   // Una hoja por semana + una hoja de informe
   const hojas = [];
@@ -1742,7 +2020,7 @@ function exportarCronogramaXLSX(resultado, db, ENGINE) {
     construirAsignacionSemanal, generarCronograma,
     ajustarTurnosDobles, ajustarParciales, construirAvisosDecalaje,
     filasHistoricoDeSemana, regenerarInformeMensual, parsearAntiguedad,
-    resumenHistoricoRotacion,
+    resumenHistoricoRotacion, unidadRotacionObligatoria, unidadesCandidatasProf,
     turnoNaturalCanon, clasificarJornadaNatural, UMBRAL_H,
     exportarCronogramaXLSX,
   };
@@ -2727,7 +3005,7 @@ function Cronograma({ semana, db, ENGINE, planilla, estructura, cargarAnotacione
   // Layout de áreas a partir de la estructura real del cuadrante generado.
   const areasLayout = useMemo(() => {
     const est = estructura || ENGINE.estructuraActiva();
-    return (est.areas || []).map(a => ({ id: a.id, nombre: a.nombre, pIni: a.posIni, pFin: a.posFin }));
+    return (est.areas || []).map(a => ({ id: a.id, nombre: a.nombre, rotacion: a.rotacion, pIni: a.posIni, pFin: a.posFin }));
   }, [estructura, ENGINE]);
   // Precalcular el turnoFinal y la etiqueta de cada profesional por día
   const turnoPorDiaNombre = useMemo(() => {
@@ -2756,20 +3034,24 @@ function Cronograma({ semana, db, ENGINE, planilla, estructura, cargarAnotacione
     return "";
   }
 
-  // Color por BLOQUE de turno (como los cuadrantes reales de la unidad):
-  // día (mañana/tarde) en verde, noche en morado; sin cubrir en rojo.
+  // Color según el TIPO de jornada del profesional ese día:
+  //  - 12h (día o noche) y doblaje -> lila
+  //  - 7h (mañana/tarde), 10h noche y parcial -> BLANCO
+  //  - sin cubrir -> rojo
   function cellColor(nombre, d, bloqueIdx) {
     if (!nombre) return { background: "var(--empty)", color: "transparent" };
-    if (bloqueIdx === 2) return { background: "#D2BEE6" }; // NOCHE -> morado
-    return { background: "#A9D08E" };                       // MAÑANA/TARDE -> verde
+    const tf = turnoPorDiaNombre[d].get(ENGINE.normalizarTexto(nombre));
+    const esDoce = tf === ENGINE.TURNO.D12 || tf === ENGINE.TURNO.N12 || tf === ENGINE.TURNO.DOBLAJE;
+    if (esDoce) return { background: "#D2BEE6" };   // 12h día/noche y doblaje -> lila
+    return { background: "#FFFFFF" };               // 7h, 10h noche, parcial -> blanco
   }
 
   return (
     <div className="crono-wrap">
       <div className="crono-toolbar">
         <div className="crono-legend">
-          <LegendItem color="#A9D08E" label="Jornada de día" />
-          <LegendItem color="#D2BEE6" label="Jornada de noche" />
+          <LegendItem color="#D2BEE6" label="12 h (día o noche)" />
+          <LegendItem color="#fff" label="7 h / 10 h / parcial" border />
           <LegendItem color="var(--empty)" label="Sin cubrir" />
           <span className="legend-item"><span className="badge badge-dbl">DBL</span> Doblaje</span>
           <span className="legend-item"><span className="badge badge-plus">+</span> Extra</span>
@@ -2811,13 +3093,25 @@ function Cronograma({ semana, db, ENGINE, planilla, estructura, cargarAnotacione
                 {areasLayout.map((area, areaIdx) => {
                   const rows = [];
                   let local = 1;
+                  // ¿Es esta la última área de su rotación? (para no duplicar excedentes
+                  // de UCCRI cuando hay esquerra y dreta, ambas rotación "UCCRI").
+                  const esUltimaDeRotacion = !areasLayout.slice(areaIdx + 1).some(a => a.rotacion === area.rotacion);
+                  // Excedentes de esta ROTACIÓN: máximo en los 7 días (para el rowSpan).
+                  let maxExced = 0;
+                  if (esUltimaDeRotacion) {
+                    for (let d = 0; d < 7; d++) {
+                      const lista = (semana.asig.excedentes[d * 3 + b.idx] || []).filter(e => e.area === area.rotacion);
+                      if (lista.length > maxExced) maxExced = lista.length;
+                    }
+                  }
+                  const filasArea = (area.pFin - area.pIni + 1) + maxExced;
                   for (let p = area.pIni; p <= area.pFin; p++) {
                     const isFirst = p === area.pIni;
                     const etFija = ENGINE.etiquetaFijaPosicion(area.id, local);
                     rows.push(
                       <tr key={p} className={isFirst ? "area-start" : ""}>
                         {isFirst && (
-                          <td className="area-cell" rowSpan={area.pFin - area.pIni + 1}>
+                          <td className="area-cell" rowSpan={filasArea}>
                             <span className="area-name">{area.nombre}</span>
                           </td>
                         )}
@@ -2852,6 +3146,24 @@ function Cronograma({ semana, db, ENGINE, planilla, estructura, cargarAnotacione
                       </tr>
                     );
                     local++;
+                  }
+                  // Filas de EXCEDENTES de esta unidad (posiciones extra sin número).
+                  for (let e = 0; e < maxExced; e++) {
+                    rows.push(
+                      <tr key={"exc-" + area.id + "-" + e} className="exc-row">
+                        <td className="num-cell exc-num" title="Excedente">+</td>
+                        {fechas.map((f, d) => {
+                          const lista = (semana.asig.excedentes[d * 3 + b.idx] || []).filter(x => x.area === area.rotacion);
+                          const ex = lista[e];
+                          return (
+                            <td key={d} className="data-cell exc-cell"
+                              title={ex ? ex.nombre + " · excedente" : ""}>
+                              {ex ? db.apodo(ex.nombre) : ""}
+                            </td>
+                          );
+                        })}
+                      </tr>
+                    );
                   }
                   // Fila en blanco de separación entre unidades (no tras la última)
                   if (areaIdx < areasLayout.length - 1) {
@@ -3617,6 +3929,9 @@ const CSS = `
 .pos-fija { font-size: 8.5px; font-weight: 700; color: var(--ink-soft); text-transform: uppercase; letter-spacing: .01em; display: block; }
 .pos-fija-sub { display: block; font-size: 8px; font-weight: 600; color: #b5853a; margin-top: 1px; }
 .sep-row td { height: 10px; background: var(--paper); border: none; padding: 0; }
+.exc-row .exc-num { background: #f3eef8; color: #8a6db8; font-weight: 700; }
+.exc-cell { background: #faf7fd; font-style: italic; color: var(--ink-soft); }
+.exc-cell:empty { background: var(--paper); }
 .sep-cell { border: none !important; }
 
 .data-cell {
