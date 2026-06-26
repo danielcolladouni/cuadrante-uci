@@ -174,3 +174,46 @@ De los 6 meses de cronogramas reales (`GUARDATS_PLANINGS_INF_2026`) se observó:
 ### Backup
 - Hay backup en src/App.jsx.bak (de antes de tocar la rotación). Quitar antes de
   empaquetar la versión final.
+
+---
+
+# SESIÓN: Mejoras de excedentes, rotación y vinculación (COMPLETADO)
+
+## HECHO Y VERIFICADO
+1. **Celdas de excedente vacías → BLANCO** (no rojo). El rojo es solo para
+   posiciones reales sin cubrir; los excedentes no son ubicaciones reales.
+   Aplicado en web (.exc-cell:empty) y Excel (S.cBlanco).
+2. **Orden de llenado de excedentes EQUILIBRADO**: el ciclo
+   UCCRI→REA→SEMIS→UCI A→UCI B ahora reparte de forma pareja (una vuelta completa
+   antes de poner un segundo en ninguna unidad), respetando criterios. Reescrito
+   `repartirExcedentes` con enfoque "menos cargada primero". Antes amontonaba en UCCRI.
+3. **Rotación MÁXIMO 2 meses seguidos (regla DURA)**: en `repartirRotacionBloque` y
+   en `unidadRotacionObligatoria` se calcula la unidad "prohibida" (la que sería el
+   3er mes consecutivo) y nunca se asigna. Si por capacidad alguien no cabe en otra
+   unidad, queda sin asignar y fluye a excedente en su unidad de rotación (que sí
+   cumple la regla), en vez de forzar el 3er mes. Verificado con los 3 meses reales:
+   ningún fijo con varias unidades repite 3 meses. (Suplentes y criterio único pueden
+   repetir, es correcto.)
+4. **Modal de vinculación de profesionales no reconocidos**: al generar, si hay
+   nombres en la planilla que no se vinculan con la BD, aparece la vista "vincular"
+   (componente `VincularProfesionales`) ANTES de terminar. Por cada nombre se puede
+   "Vincular a existente" (crea alias) o "Añadir como nuevo" (a la BD). Tras aplicar,
+   continúa la generación. Funciones motor: `db.estaEnBD()`,
+   `extraerNombresSinVincular()`. Alias se guardan en config_unidad
+   (clave "alias_profesionales") vía `cargarAlias`/`guardarAliasTodos`; se cargan al
+   inicio y se MEZCLAN (no reemplazan) cuando se sube una planilla con alias
+   embebidos (`mezclarAlias`).
+
+## Datos de prueba creados
+- testdata_octubre.json, testdata_noviembre.json, testdata_diciembre.json
+  (convertidos de las 3 planillas reales del proyecto). Permiten probar rotación
+  real de 3 meses encadenando el histórico.
+
+## Persistencia
+- NO requiere SQL nuevo en Supabase: los alias reutilizan la tabla config_unidad.
+
+## Nota sobre un caso límite (no es bug)
+- Profesionales SIN posición estable (p.ej. de noche que tapan huecos) pueden
+  aparecer dispersos por varias unidades el mismo mes; su "unidad dominante" del
+  66% puede coincidir 2-3 meses por azar aunque realmente rotan. No se fuerza más
+  porque distorsionaría el reparto del resto.

@@ -7,6 +7,7 @@ import {
   cargarHistorico, añadirAlHistorico, vaciarHistorico,
   cargarEstructura, guardarEstructura,
   cargarAnotaciones, guardarAnotaciones,
+  cargarAlias, guardarAliasTodos,
 } from "./supabase.js";
 
 /* ============================================================
@@ -216,24 +217,26 @@ function ordenExcedentes() {
   const abiertas = unidadesAbiertasRotacion();
   return pref.filter(u => abiertas.includes(u));
 }
-// Asigna a una lista de excedentes su unidad ciclando el orden, respetando criterio.
-// excedentes: [{nombre, criterio}]. Devuelve [{nombre, area}].
+// Asigna a una lista de excedentes su unidad siguiendo el ciclo
+// UCCRI → REA → SEMIS → UCI A → UCI B, repartiendo de forma EQUILIBRADA: cada
+// nuevo excedente va a la unidad (en orden de ciclo) que pueda y que menos
+// excedentes tenga hasta ahora, de modo que se complete una vuelta del ciclo
+// antes de poner un segundo en ninguna unidad. Respeta el criterio de acceso.
+// excedentes: [{nombre}]. Devuelve [{nombre, area, ordenEnUnidad}].
 function repartirExcedentes(lista, db) {
   const orden = ordenExcedentes();
   const out = [];
-  const contadorPorUnidad = {};
-  let idx = 0;
+  const cont = {};
+  for (const u of orden) cont[u] = 0;
   for (const ex of lista) {
     const crit = db.criterio(ex.nombre);
-    // buscar la siguiente unidad del ciclo a la que este profesional pueda ir
-    let asignada = "";
-    for (let intento = 0; intento < orden.length; intento++) {
-      const u = orden[(idx + intento) % orden.length];
-      if (puedeIrAArea(crit, u)) { asignada = u; idx = (idx + intento + 1) % orden.length; break; }
-    }
-    if (!asignada) asignada = orden[0] || "";
-    contadorPorUnidad[asignada] = (contadorPorUnidad[asignada] || 0) + 1;
-    out.push({ nombre: ex.nombre, area: asignada, ordenEnUnidad: contadorPorUnidad[asignada] });
+    const posibles = orden.filter(u => puedeIrAArea(crit, u));
+    if (posibles.length === 0) { out.push({ nombre: ex.nombre, area: orden[0] || "", ordenEnUnidad: 1 }); continue; }
+    // elegir la unidad posible con menos excedentes; empate -> primera en el ciclo
+    let mejor = posibles[0];
+    for (const u of posibles) if (cont[u] < cont[mejor]) mejor = u;
+    cont[mejor]++;
+    out.push({ nombre: ex.nombre, area: mejor, ordenEnUnidad: cont[mejor] });
   }
   return out;
 }
@@ -541,15 +544,58 @@ class ProfesionalesDB {
     }
     return "";
   }
+  // ¿Este nombre (ya resuelto) corresponde a un profesional real de la BD?
+  estaEnBD(nombre) {
+    return this.byNorm.has(normalizarTexto(nombre));
+  }
 }
 
-/* ---------------------------------------------------------------
-   Extractor — ObtenerProfesionalesDelDia (M01)
-   planilla: matriz 2D (filas x cols, 1-indexed lógico) tal como
-   viene de la hoja. Aquí se pasa como array de filas; cada fila
-   es array de celdas (index 0 = col A).
-   Devuelve [{nombre, categoria, turnoFinal, horario, reclasificado}]
-   --------------------------------------------------------------- */
+/* Recorre la planilla en el rango de semanas a generar y devuelve los nombres
+   que NO se vinculan con la base de datos (para que el usuario los vincule o
+   añada). Devuelve [{ raw, norm, veces, ejemploHorario }] ordenado por frecuencia. */
+function extraerNombresSinVincular(planilla, db, fechaLunesInicio, numSemanas) {
+  const sinVincular = new Map(); // norm -> {raw, veces, ejemploHorario}
+  for (let s = 0; s < numSemanas; s++) {
+    const lunes = addDays(fechaLunesInicio, s * 7);
+    for (let d = 0; d < 7; d++) {
+      const fecha = addDays(lunes, d);
+      const colDia = weekdayMonday(fecha) + 2;
+      const fechaSerial = diaSerial(fecha);
+      let seccion = "";
+      for (let i = 0; i < planilla.length; i++) {
+        const fila = planilla[i] || [];
+        const cel = (c) => fila[c - 1];
+        const dval = cel(4);
+        if (typeof dval === "string") {
+          const u = dval.toUpperCase();
+          if (u.indexOf("TURNO DE MAÑANA") >= 0) seccion = "MAÑANA";
+          else if (u.indexOf("TURNO DE TARDE") >= 0) seccion = "TARDE";
+          else if (u.indexOf("TURNO DE NOCHE") >= 0) seccion = "NOCHE";
+        }
+        const cat = cel(1) == null ? "" : String(cel(1));
+        if (cat.substring(0, 3) !== "INF" || cat === "COOR_INF") continue;
+        const kSerial = toSerial(cel(11));
+        if (kSerial == null || fechaSerial < kSerial || fechaSerial > kSerial + 6) continue;
+        const celda = cel(colDia);
+        if (typeof celda !== "string" || celda.trim().length === 0) continue;
+        for (const rawLin of celda.split("\n")) {
+          const lin = rawLin.trim();
+          if (!lin) continue;
+          const { horario, nombre: nombreRaw } = parsearLineaPlanilla(lin);
+          if (!nombreRaw) continue;
+          const resuelto = db.resolverNombre(nombreRaw);
+          if (db.estaEnBD(resuelto)) continue; // vinculado, ok
+          const norm = normalizarTexto(nombreRaw);
+          if (!sinVincular.has(norm)) sinVincular.set(norm, { raw: nombreRaw, veces: 0, ejemploHorario: horario });
+          sinVincular.get(norm).veces++;
+        }
+      }
+    }
+  }
+  const out = [...sinVincular.values()];
+  out.sort((a, b) => b.veces - a.veces);
+  return out;
+}
 function obtenerProfesionalesDelDia(planilla, db, fechaObj) {
   const ultimaFila = planilla.length;
   const colDia = weekdayMonday(fechaObj) + 2; // 1-indexed col (C=3..I=9)
@@ -847,9 +893,13 @@ function unidadRotacionObligatoria(historico, nombreProf, criterio, esSuplente, 
   if (visitadas.size >= candidatas.length) visitadas.clear(); // ciclo completo -> reinicia
 
   const ultima = hist.length ? hist[hist.length - 1].unidad : "";
-  let pendientes = candidatas.filter(u => !visitadas.has(u) && u !== ultima);
-  if (pendientes.length === 0) pendientes = candidatas.filter(u => !visitadas.has(u));
-  if (pendientes.length === 0) pendientes = candidatas.filter(u => u !== ultima);
+  const penultima = hist.length >= 2 ? hist[hist.length - 2].unidad : "";
+  // Regla dura: no 3 meses seguidos en la misma unidad.
+  const prohibida = (ultima && ultima === penultima) ? ultima : "";
+  let pendientes = candidatas.filter(u => !visitadas.has(u) && u !== ultima && u !== prohibida);
+  if (pendientes.length === 0) pendientes = candidatas.filter(u => !visitadas.has(u) && u !== prohibida);
+  if (pendientes.length === 0) pendientes = candidatas.filter(u => u !== ultima && u !== prohibida);
+  if (pendientes.length === 0) pendientes = candidatas.filter(u => u !== prohibida);
   if (pendientes.length === 0) pendientes = candidatas.slice();
   return pendientes[0];
 }
@@ -880,6 +930,10 @@ function repartirRotacionBloque(profesionales, capacidad, historico, mesActual) 
     const cand = Object.keys(capacidad).filter(u => puedeIrAArea(p.criterio, u) && capacidad[u] > 0);
     const hist = historialMensualProf(historico, p.profNorm, mesActual);
     const ultima = hist.length ? hist[hist.length - 1].unidad : "";
+    const penultima = hist.length >= 2 ? hist[hist.length - 2].unidad : "";
+    // REGLA DURA máx. 2 meses seguidos: si los DOS últimos meses fueron la misma
+    // unidad, esa unidad queda PROHIBIDA este mes (sería el 3º consecutivo).
+    const prohibida = (ultima && ultima === penultima) ? ultima : "";
     const visit = new Set();
     for (let i = hist.length - 1; i >= 0; i--) {
       const u = hist[i].unidad;
@@ -890,30 +944,34 @@ function repartirRotacionBloque(profesionales, capacidad, historico, mesActual) 
     }
     if (visit.size >= cand.length) visit.clear();
     const urg = urgenciaPorUnidadRot(hist, cand);
-    return { ...p, cand, ultima, urg, pendientes: cand.filter(u => !visit.has(u)) };
+    return { ...p, cand, ultima, prohibida, urg, pendientes: cand.filter(u => !visit.has(u)) };
   });
   // Los más restringidos (menos unidades posibles) primero
   datos.sort((a, b) => a.cand.length - b.cand.length);
 
-  // Fase 1: dar una unidad PENDIENTE (no visitada) y distinta de la última
+  // Fase 1: unidad PENDIENTE (no visitada), distinta de la última y NO prohibida
   for (const d of datos) {
-    const op = d.pendientes.filter(u => u !== d.ultima && restante[u] > 0)
+    const op = d.pendientes.filter(u => u !== d.ultima && u !== d.prohibida && restante[u] > 0)
       .sort((x, y) => d.urg[y] - d.urg[x]);
     if (op.length) { asign.set(d.profNorm, op[0]); restante[op[0]]--; }
   }
-  // Fase 2: cualquier candidata distinta de la última con hueco
+  // Fase 2: cualquier candidata distinta de la última y NO prohibida con hueco
   for (const d of datos) {
     if (asign.has(d.profNorm)) continue;
-    const op = d.cand.filter(u => u !== d.ultima && restante[u] > 0)
+    const op = d.cand.filter(u => u !== d.ultima && u !== d.prohibida && restante[u] > 0)
       .sort((x, y) => d.urg[y] - d.urg[x]);
     if (op.length) { asign.set(d.profNorm, op[0]); restante[op[0]]--; }
   }
-  // Fase 3: permitir repetir (única forma de no dejar hueco)
+  // Fase 3: permitir repetir la última (pero NO la prohibida) si es la única forma
   for (const d of datos) {
     if (asign.has(d.profNorm)) continue;
-    const op = d.cand.filter(u => restante[u] > 0).sort((x, y) => d.urg[y] - d.urg[x]);
+    const op = d.cand.filter(u => u !== d.prohibida && restante[u] > 0)
+      .sort((x, y) => d.urg[y] - d.urg[x]);
     if (op.length) { asign.set(d.profNorm, op[0]); restante[op[0]]--; }
   }
+  // (Sin Fase 4: nunca se asigna la unidad prohibida. Quien quede sin unidad por
+  // capacidad fluye al relleno de huecos / excedente en su unidad de rotación,
+  // que sí cumple la regla de los 2 meses máximo.)
   return asign;
 }
 // Capacidad (plazas por unidad) de un bloque. esNoche define qué posiciones cuentan.
@@ -1886,7 +1944,7 @@ function _gridSemana(sem, db, ENGINE, S, areasLayout) {
             const lista = (sem.asig.excedentes[d * 3 + b.idx] || []).filter(x => x.area === area.rotacion);
             const ex = lista[e];
             if (ex) row.push({ v: db.apodo(ex.nombre), s: S.cBlanco, t: "s" });
-            else row.push({ v: "", s: S.cVacio });
+            else row.push({ v: "", s: S.cBlanco }); // excedente vacío -> blanco (no es ubicación real)
           }
           grid.push(row);
         }
@@ -2021,6 +2079,7 @@ function exportarCronogramaXLSX(resultado, db, ENGINE) {
     ajustarTurnosDobles, ajustarParciales, construirAvisosDecalaje,
     filasHistoricoDeSemana, regenerarInformeMensual, parsearAntiguedad,
     resumenHistoricoRotacion, unidadRotacionObligatoria, unidadesCandidatasProf,
+    extraerNombresSinVincular,
     turnoNaturalCanon, clasificarJornadaNatural, UMBRAL_H,
     exportarCronogramaXLSX,
   };
@@ -2118,6 +2177,15 @@ function fechaLarga(d) {
    ============================================================ */
 const DIAS_CORTOS = ["LUN", "MAR", "MIÉ", "JUE", "VIE", "SÁB", "DOM"];
 
+// Mezcla dos listas de alias [{abreviatura, nombre}] sin duplicar abreviaturas.
+// Los del segundo argumento (nuevos) prevalecen sobre los del primero.
+function mezclarAlias(previos, nuevos) {
+  const map = new Map();
+  for (const a of (previos || [])) if (a && a.abreviatura) map.set(String(a.abreviatura).toUpperCase().trim(), a.nombre);
+  for (const a of (nuevos || [])) if (a && a.abreviatura) map.set(String(a.abreviatura).toUpperCase().trim(), a.nombre);
+  return [...map.entries()].map(([abreviatura, nombre]) => ({ abreviatura, nombre }));
+}
+
 export default function App() {
   const [planilla, setPlanilla] = useState(null);
   const [planillaInfo, setPlanillaInfo] = useState(null);
@@ -2129,6 +2197,7 @@ export default function App() {
   const [historico, setHistorico] = useState([]);
   const [estructura, setEstructura] = useState(null); // config de la unidad (Fase A)
   const [resultado, setResultado] = useState(null);
+  const [nombresSinVincular, setNombresSinVincular] = useState(null);
   const [semanaActiva, setSemanaActiva] = useState(0);
   const [vista, setVista] = useState("inicio"); // inicio | cronograma | decalajes | informe | profesionales | editor
   const [error, setError] = useState("");
@@ -2179,6 +2248,11 @@ export default function App() {
         }
         const h = await cargarHistorico();
         if (h && h.length) setHistorico(h);
+        // Alias de profesionales guardados (vínculos abreviatura → nombre)
+        try {
+          const al = await cargarAlias();
+          if (al && al.length) setAlias(al);
+        } catch { /* opcional */ }
         // Estructura de la unidad: la guardada, o la por defecto
         const est = await cargarEstructura();
         setEstructura(est && est.length ? est : ENGINE.estructuraPorDefecto());
@@ -2214,7 +2288,7 @@ export default function App() {
       // ¿Trae también profesionales/alias embebidos? (p.ej. el libro v3)
       const p = leerProfesionales(wb);
       const al = leerAlias(wb);
-      if (al && al.length) setAlias(al);
+      if (al && al.length) setAlias(prev => mezclarAlias(prev, al));
       // Solo poblar la base compartida si todavía está vacía
       if (p && p.length && (!profs || profs.length === 0)) {
         const guardados = await guardarProfesionales(p);
@@ -2235,7 +2309,7 @@ export default function App() {
       const p = leerProfesionales(wb);
       const al = leerAlias(wb);
       if (!p || !p.length) { setError("Ese archivo no contiene la hoja DATOS_PROFESIONALES."); return; }
-      if (al && al.length) setAlias(al);
+      if (al && al.length) setAlias(prev => mezclarAlias(prev, al));
       const guardados = await guardarProfesionales(p);
       setProfs(guardados.length ? guardados : p);
       setStaffSource("base compartida · cargada de " + file.name);
@@ -2246,9 +2320,30 @@ export default function App() {
 
   const puedeGenerar = planilla && db;
 
+  // Generación: primero comprueba nombres sin vincular. Si los hay, abre el modal
+  // de vinculación; si no, genera directamente.
   function generar() {
     if (!puedeGenerar) return;
-    setError(""); setBusy(true);
+    setError("");
+    let sinVincular = [];
+    try {
+      const lunes = parseISO(fechaLunes);
+      const ns = Math.max(1, Math.min(12, +numSemanas));
+      sinVincular = ENGINE.extraerNombresSinVincular(planilla, db, lunes, ns);
+    } catch (err) {
+      setError("Error al analizar la planilla: " + err.message);
+      return;
+    }
+    if (sinVincular.length > 0) {
+      setNombresSinVincular(sinVincular);
+      setVista("vincular");
+    } else {
+      ejecutarGeneracion();
+    }
+  }
+
+  function ejecutarGeneracion() {
+    setError(""); setBusy(true); setNombresSinVincular(null);
     setTimeout(() => {
       try {
         const lunes = parseISO(fechaLunes);
@@ -2261,6 +2356,34 @@ export default function App() {
         console.error(err);
       } finally { setBusy(false); }
     }, 30);
+  }
+
+  // Aplica las vinculaciones decididas por el usuario en el modal:
+  //  - aliasNuevos: { rawNombre: nombreCompletoExistente }  -> añade alias
+  //  - profsNuevos: [ {nombre, turno, apodo, criterio, suplente, antiguedad} ] -> añade a BD
+  async function aplicarVinculaciones(aliasNuevos, profsNuevos) {
+    setBusy(true); setError("");
+    try {
+      // 1) Añadir nuevos profesionales a la base (si hay)
+      if (profsNuevos && profsNuevos.length > 0) {
+        const nuevosTodos = [...(profs || []), ...profsNuevos];
+        const guardados = await guardarProfesionales(nuevosTodos);
+        setProfs(guardados && guardados.length ? guardados : nuevosTodos);
+      }
+      // 2) Añadir alias (vínculos a profesionales existentes)
+      if (aliasNuevos && Object.keys(aliasNuevos).length > 0) {
+        const nuevosAlias = Object.entries(aliasNuevos).map(([abreviatura, nombre]) => ({ abreviatura, nombre }));
+        const todosAlias = [...(alias || []), ...nuevosAlias];
+        setAlias(todosAlias);
+        try { await guardarAliasTodos(todosAlias); } catch (e) { /* persistencia opcional */ }
+      }
+      setNombresSinVincular(null);
+      // Tras vincular, generar directamente (ya están en profs/alias).
+      setTimeout(() => ejecutarGeneracion(), 80);
+    } catch (err) {
+      setError("No se pudieron guardar las vinculaciones: " + err.message);
+      setBusy(false);
+    }
   }
 
   async function guardarEnHistorico() {
@@ -2418,6 +2541,15 @@ export default function App() {
             />
           )}
 
+          {vista === "vincular" && nombresSinVincular && (
+            <VincularProfesionales
+              nombres={nombresSinVincular} profs={profs} ENGINE={ENGINE}
+              busy={busy}
+              onAplicar={aplicarVinculaciones}
+              onCancelar={() => { setNombresSinVincular(null); setVista(resultado ? "cronograma" : "inicio"); }}
+            />
+          )}
+
           {vista === "editor" && (
             <EditorPlantilla
               profs={profs} saveProfs={saveProfs}
@@ -2427,9 +2559,9 @@ export default function App() {
             />
           )}
 
-          {vista !== "editor" && vista !== "estructura" && vista !== "historico" && !resultado && <Welcome planilla={planilla} db={db} />}
+          {vista !== "editor" && vista !== "estructura" && vista !== "historico" && vista !== "vincular" && !resultado && <Welcome planilla={planilla} db={db} />}
 
-          {vista !== "editor" && vista !== "estructura" && vista !== "historico" && resultado && (
+          {vista !== "editor" && vista !== "estructura" && vista !== "historico" && vista !== "vincular" && resultado && (
             <>
               <Tabs vista={vista} setVista={setVista}
                 semanas={resultado.semanas} semanaActiva={semanaActiva} setSemanaActiva={setSemanaActiva}
@@ -3276,6 +3408,170 @@ function ChipUnidad({ u }) {
   return <span className="uni-chip" style={{ background: c.bg, color: c.fg, borderColor: c.bd }}>{u}</span>;
 }
 
+/* ---------- Vinculación de profesionales sin reconocer (al generar) ---------- */
+function VincularProfesionales({ nombres, profs, ENGINE, onAplicar, onCancelar, busy }) {
+  // Por cada nombre sin vincular: decisión "vincular" (a un profesional existente)
+  // o "nuevo" (añadir a la base). Estado por fila.
+  const profsOrden = useMemo(
+    () => (profs || []).slice().sort((a, b) => String(a.nombre).localeCompare(String(b.nombre))),
+    [profs]
+  );
+  // estado: { [norm]: { modo:'vincular'|'nuevo'|'', vinculadoA:'', nuevo:{...} } }
+  const [dec, setDec] = useState(() => {
+    const init = {};
+    for (const n of nombres) {
+      init[ENGINE.normalizarTexto(n.raw)] = {
+        modo: "", vinculadoA: "",
+        nuevo: { nombre: n.raw.indexOf(",") >= 0 ? n.raw : "", turno: "TM", apodo: n.raw, criterio: "SI", suplente: "No", antiguedad: "< 3 ANY" },
+      };
+    }
+    return init;
+  });
+
+  const setFila = (norm, patch) => setDec(prev => ({ ...prev, [norm]: { ...prev[norm], ...patch } }));
+  const setNuevoCampo = (norm, campo, valor) =>
+    setDec(prev => ({ ...prev, [norm]: { ...prev[norm], nuevo: { ...prev[norm].nuevo, [campo]: valor } } }));
+
+  // ¿Está todo decidido? (cada fila con modo y datos válidos)
+  const pendientes = nombres.filter(n => {
+    const d = dec[ENGINE.normalizarTexto(n.raw)];
+    if (!d || !d.modo) return true;
+    if (d.modo === "vincular") return !d.vinculadoA;
+    if (d.modo === "nuevo") return !d.nuevo.nombre.trim();
+    return true;
+  });
+
+  function aplicar() {
+    const aliasNuevos = {};
+    const profsNuevos = [];
+    for (const n of nombres) {
+      const d = dec[ENGINE.normalizarTexto(n.raw)];
+      if (!d || !d.modo) continue;
+      if (d.modo === "vincular" && d.vinculadoA) {
+        aliasNuevos[n.raw] = d.vinculadoA;
+      } else if (d.modo === "nuevo" && d.nuevo.nombre.trim()) {
+        // el apodo por defecto es la abreviatura de la planilla, para que case
+        profsNuevos.push({ ...d.nuevo, apodo: d.nuevo.apodo || n.raw });
+        // además, si el texto de la planilla es una abreviatura (sin coma) y el
+        // nombre nuevo tiene coma, creamos alias abreviatura→nombre para vincularlos
+        if (n.raw.indexOf(",") < 0 && d.nuevo.nombre.indexOf(",") >= 0) {
+          aliasNuevos[n.raw] = d.nuevo.nombre;
+        }
+      }
+    }
+    onAplicar(aliasNuevos, profsNuevos);
+  }
+
+  return (
+    <div className="vincular">
+      <div className="editor-head">
+        <div>
+          <h2>Profesionales sin reconocer</h2>
+          <p className="section-intro">
+            Estos nombres aparecen en la planilla pero no se han podido vincular con la base
+            de profesionales. Para cada uno, vincúlalo con un profesional existente (si es una
+            abreviatura) o añádelo como nuevo. Así el cronograma quedará completo.
+          </p>
+        </div>
+        <button className="linkbtn" onClick={onCancelar} disabled={busy}>← Cancelar</button>
+      </div>
+
+      <div className="vinc-list">
+        {nombres.map(n => {
+          const norm = ENGINE.normalizarTexto(n.raw);
+          const d = dec[norm];
+          return (
+            <div key={norm} className="vinc-card">
+              <div className="vinc-head">
+                <div className="vinc-name">{n.raw}</div>
+                <div className="vinc-meta">aparece {n.veces}× · p.ej. «{n.ejemploHorario}»</div>
+              </div>
+              <div className="vinc-modos">
+                <button className={"vinc-tab" + (d.modo === "vincular" ? " on" : "")}
+                  onClick={() => setFila(norm, { modo: "vincular" })}>Vincular a existente</button>
+                <button className={"vinc-tab" + (d.modo === "nuevo" ? " on" : "")}
+                  onClick={() => setFila(norm, { modo: "nuevo" })}>Añadir como nuevo</button>
+              </div>
+
+              {d.modo === "vincular" && (
+                <div className="vinc-body">
+                  <label className="vinc-lbl">Es la misma persona que:</label>
+                  <select className="vinc-select" value={d.vinculadoA}
+                    onChange={e => setFila(norm, { vinculadoA: e.target.value })}>
+                    <option value="">— elige un profesional —</option>
+                    {profsOrden.map((p, i) => (
+                      <option key={i} value={p.nombre}>{p.nombre}{p.apodo ? " (" + p.apodo + ")" : ""}</option>
+                    ))}
+                  </select>
+                </div>
+              )}
+
+              {d.modo === "nuevo" && (
+                <div className="vinc-body vinc-form">
+                  <div className="vinc-row">
+                    <label>Nombre completo<span className="req">*</span></label>
+                    <input value={d.nuevo.nombre} placeholder="Apellidos, Nombre"
+                      onChange={e => setNuevoCampo(norm, "nombre", e.target.value)} />
+                  </div>
+                  <div className="vinc-row">
+                    <label>Apodo (cómo se muestra)</label>
+                    <input value={d.nuevo.apodo}
+                      onChange={e => setNuevoCampo(norm, "apodo", e.target.value)} />
+                  </div>
+                  <div className="vinc-grid">
+                    <div className="vinc-row">
+                      <label>Turno</label>
+                      <select value={d.nuevo.turno} onChange={e => setNuevoCampo(norm, "turno", e.target.value)}>
+                        <option>TM</option><option>TT</option><option>TN</option>
+                        <option>12H Día</option><option>12H Noche</option>
+                      </select>
+                    </div>
+                    <div className="vinc-row">
+                      <label>Criterio</label>
+                      <select value={d.nuevo.criterio} onChange={e => setNuevoCampo(norm, "criterio", e.target.value)}>
+                        <option>SI</option><option>NO</option><option>UCI</option><option>UCCRI</option>
+                      </select>
+                    </div>
+                    <div className="vinc-row">
+                      <label>Suplente</label>
+                      <select value={d.nuevo.suplente} onChange={e => setNuevoCampo(norm, "suplente", e.target.value)}>
+                        <option>No</option><option>Si</option>
+                      </select>
+                    </div>
+                    <div className="vinc-row">
+                      <label>Antigüedad</label>
+                      <select value={d.nuevo.antiguedad} onChange={e => setNuevoCampo(norm, "antiguedad", e.target.value)}>
+                        <option>{"< 3 ANY"}</option>
+                        <option>{"> 3 ANY < 10 ANY"}</option>
+                        <option>{"10 - 20 ANY"}</option>
+                        <option>{"> 20 ANY"}</option>
+                      </select>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      <div className="vinc-footer">
+        <div className="vinc-status">
+          {pendientes.length > 0
+            ? pendientes.length + " de " + nombres.length + " sin decidir"
+            : "Todo listo para generar"}
+        </div>
+        <div className="vinc-actions">
+          <button className="btn-secondary" onClick={onCancelar} disabled={busy}>Cancelar</button>
+          <button className="btn-primary" onClick={aplicar} disabled={busy || pendientes.length > 0}>
+            {busy ? "Guardando…" : "Vincular y generar"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function HistoricoRotacion({ historico, ENGINE, onCerrar }) {
   const datos = useMemo(() => ENGINE.resumenHistoricoRotacion(historico || []), [historico, ENGINE]);
   const [busca, setBusca] = useState("");
@@ -3987,7 +4283,29 @@ td.data-cell:has(.nota-edit) { overflow: visible; }
 .dec-table tr.ko { background: #fcf3f2; }
 .dec-table tr.ko td:last-child { color: var(--danger); font-weight: 560; }
 
-/* ---------- Histórico de rotación ---------- */
+/* ---------- Vinculación de profesionales ---------- */
+.vincular { max-width: 760px; }
+.vinc-list { display: flex; flex-direction: column; gap: 14px; margin-bottom: 20px; }
+.vinc-card { border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); padding: 16px; box-shadow: var(--shadow); }
+.vinc-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
+.vinc-name { font-size: 16px; font-weight: 640; color: var(--ink); }
+.vinc-meta { font-size: 12px; color: var(--muted); }
+.vinc-modos { display: flex; gap: 8px; margin-bottom: 12px; }
+.vinc-tab { flex: 1; padding: 8px 12px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface); color: var(--ink-soft); font: inherit; font-size: 13px; font-weight: 540; cursor: pointer; }
+.vinc-tab:hover { background: var(--panel); }
+.vinc-tab.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+.vinc-body { padding-top: 4px; }
+.vinc-lbl { display: block; font-size: 12.5px; color: var(--ink-soft); margin-bottom: 6px; font-weight: 540; }
+.vinc-select, .vinc-form input, .vinc-form select { width: 100%; padding: 8px 10px; border: 1px solid var(--line-strong); border-radius: 8px; font: inherit; font-size: 13px; background: var(--surface); color: var(--ink); }
+.vinc-select:focus, .vinc-form input:focus, .vinc-form select:focus { outline: 2px solid var(--accent-wash); border-color: var(--accent); }
+.vinc-form { display: flex; flex-direction: column; gap: 10px; }
+.vinc-row { display: flex; flex-direction: column; gap: 4px; }
+.vinc-row label { font-size: 12px; color: var(--ink-soft); font-weight: 540; }
+.vinc-row .req { color: #c0392b; margin-left: 2px; }
+.vinc-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.vinc-footer { position: sticky; bottom: 0; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 0; background: linear-gradient(transparent, var(--paper) 30%); }
+.vinc-status { font-size: 13px; color: var(--ink-soft); font-weight: 540; }
+.vinc-actions { display: flex; gap: 10px; }
 .historico { max-width: 1100px; }
 .hist-grid-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow); }
 .hist-grid { border-collapse: collapse; width: 100%; }

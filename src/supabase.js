@@ -240,3 +240,31 @@ export async function guardarAnotaciones(lunesISO, mapa) {
     .upsert({ clave: "anotacion:" + lunesISO, valor }, { onConflict: "clave" });
   if (error) throw error;
 }
+
+/* ---------- Alias de profesionales (vínculos abreviatura → nombre) ----------
+   Se guardan en config_unidad bajo la clave fija "alias_profesionales", como un
+   objeto { abreviatura: nombreCompleto }.
+*/
+export async function cargarAlias() {
+  const { data, error } = await supabase
+    .from("config_unidad")
+    .select("valor")
+    .eq("clave", "alias_profesionales")
+    .maybeSingle();
+  if (error) throw error;
+  if (!data || !data.valor) return [];
+  try {
+    const obj = typeof data.valor === "string" ? JSON.parse(data.valor) : data.valor;
+    return Object.entries(obj).map(([abreviatura, nombre]) => ({ abreviatura, nombre }));
+  } catch { return []; }
+}
+
+export async function guardarAliasTodos(aliasArray) {
+  const obj = {};
+  for (const a of aliasArray || []) if (a.abreviatura) obj[a.abreviatura] = a.nombre;
+  const valor = JSON.stringify(obj);
+  const { error } = await supabase
+    .from("config_unidad")
+    .upsert({ clave: "alias_profesionales", valor }, { onConflict: "clave" });
+  if (error) throw error;
+}
