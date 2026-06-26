@@ -477,11 +477,16 @@ class ProfesionalesDB {
       this.list.push(p);
       this.byNorm.set(p.nombreNorm, p);
     }
-    // alias: Map abreviatura(UPPER) -> nombre completo
+    // alias: dos índices del diccionario de variantes de nombre.
+    //  - this.alias: clave abreviatura en MAYÚSCULAS (compatibilidad)
+    //  - this.aliasNorm: clave normalizada (cubre cualquier forma con espacios/acentos)
     this.alias = new Map();
+    this.aliasNorm = new Map();
     for (const a of (aliasRows || [])) {
       if (!a || !a.abreviatura) continue;
-      this.alias.set(String(a.abreviatura).toUpperCase().trim(), String(a.nombre || ""));
+      const nombreComp = String(a.nombre || "");
+      this.alias.set(String(a.abreviatura).toUpperCase().trim(), nombreComp);
+      this.aliasNorm.set(normalizarTexto(a.abreviatura), nombreComp);
     }
   }
   get(nombre) { return this.byNorm.get(normalizarTexto(nombre)) || null; }
@@ -507,17 +512,40 @@ class ProfesionalesDB {
   resolverNombre(texto) {
     let t = String(texto || "").trim();
     if (t.length === 0) return "";
+    // 1) SIEMPRE consultar primero el diccionario de alias (por la forma exacta
+    //    normalizada). Cubre cualquier variante guardada manualmente, tenga coma,
+    //    espacio o sea una sola palabra (p.ej. "Eduard Cerezo" -> "Eduardo Cerezo").
+    const aliasDirecto = this.aliasNorm.get(normalizarTexto(t));
+    if (aliasDirecto) return aliasDirecto;
+    // 2) Nombre con coma -> buscar exacto en la base
     if (t.indexOf(",") >= 0) {
       const res = this._buscarExacto(t);
       return res || t;
     }
+    // 3) Una sola palabra (abreviatura) -> alias por mayúsculas o heurística
     if (t.indexOf(" ") < 0) {
       const al = this.alias.get(t.toUpperCase().trim());
       if (al) return al;
       const h = this._buscarHeuristica(t);
       return h || t;
     }
-    return t;
+    // 4) Varias palabras sin coma y sin alias -> intentar heurística suave por
+    //    coincidencia normalizada de "Nombre Apellido" con la base, si no, tal cual
+    const porNombreApellido = this._buscarPorNombreApellido(t);
+    return porNombreApellido || t;
+  }
+  _buscarPorNombreApellido(texto) {
+    // Compara el texto (normalizado, sin orden) con cada profesional cuyo nombre
+    // es "Apellidos, Nombre". Coincide si todas las palabras del texto están en el
+    // nombre completo del profesional (tolera orden invertido nombre/apellido).
+    const palabras = normalizarTexto(texto).split(" ").filter(Boolean);
+    if (palabras.length < 2) return "";
+    for (const p of this.list) {
+      const completo = normalizarTexto(p.nombre.replace(",", " "));
+      const setComp = new Set(completo.split(" ").filter(Boolean));
+      if (palabras.every(w => setComp.has(w))) return p.nombre;
+    }
+    return "";
   }
   _buscarExacto(nombre) {
     const nt = normalizarTexto(nombre);
@@ -3408,6 +3436,71 @@ function ChipUnidad({ u }) {
   return <span className="uni-chip" style={{ background: c.bg, color: c.fg, borderColor: c.bd }}>{u}</span>;
 }
 
+/* Buscador con autocompletado para elegir un profesional de la base. */
+function BuscadorProfesional({ profesionales, valor, onElegir }) {
+  const [texto, setTexto] = useState(valor || "");
+  const [abierto, setAbierto] = useState(false);
+  const [idx, setIdx] = useState(0);
+  const ref = useRef(null);
+
+  useEffect(() => { setTexto(valor || ""); }, [valor]);
+
+  const norm = (s) => String(s || "").toUpperCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  const filtrados = useMemo(() => {
+    const q = norm(texto).trim();
+    if (!q) return profesionales.slice(0, 30);
+    return profesionales.filter(p => norm(p.nombre).includes(q) || norm(p.apodo).includes(q)).slice(0, 30);
+  }, [texto, profesionales]);
+
+  useEffect(() => {
+    function fuera(e) { if (ref.current && !ref.current.contains(e.target)) setAbierto(false); }
+    document.addEventListener("mousedown", fuera);
+    return () => document.removeEventListener("mousedown", fuera);
+  }, []);
+
+  function elegir(p) {
+    onElegir(p.nombre);
+    setTexto(p.nombre);
+    setAbierto(false);
+  }
+
+  const elegido = valor && texto === valor;
+
+  return (
+    <div className="buscador" ref={ref}>
+      <input
+        className={"buscador-input" + (elegido ? " elegido" : "")}
+        value={texto}
+        placeholder="Escribe para buscar un profesional…"
+        onChange={e => { setTexto(e.target.value); setAbierto(true); setIdx(0); if (valor) onElegir(""); }}
+        onFocus={() => setAbierto(true)}
+        onKeyDown={e => {
+          if (!abierto && (e.key === "ArrowDown" || e.key === "ArrowUp")) { setAbierto(true); return; }
+          if (e.key === "ArrowDown") { e.preventDefault(); setIdx(i => Math.min(i + 1, filtrados.length - 1)); }
+          else if (e.key === "ArrowUp") { e.preventDefault(); setIdx(i => Math.max(i - 1, 0)); }
+          else if (e.key === "Enter") { e.preventDefault(); if (filtrados[idx]) elegir(filtrados[idx]); }
+          else if (e.key === "Escape") setAbierto(false);
+        }}
+      />
+      {elegido && <span className="buscador-ok">✓</span>}
+      {abierto && filtrados.length > 0 && (
+        <ul className="buscador-lista">
+          {filtrados.map((p, i) => (
+            <li key={i} className={i === idx ? "activo" : ""}
+              onMouseEnter={() => setIdx(i)} onMouseDown={() => elegir(p)}>
+              <span className="buscador-nombre">{p.nombre}</span>
+              {p.apodo && <span className="buscador-apodo">{p.apodo}</span>}
+            </li>
+          ))}
+        </ul>
+      )}
+      {abierto && filtrados.length === 0 && texto.trim() && (
+        <ul className="buscador-lista"><li className="buscador-vacio">Sin coincidencias</li></ul>
+      )}
+    </div>
+  );
+}
+
 /* ---------- Vinculación de profesionales sin reconocer (al generar) ---------- */
 function VincularProfesionales({ nombres, profs, ENGINE, onAplicar, onCancelar, busy }) {
   // Por cada nombre sin vincular: decisión "vincular" (a un profesional existente)
@@ -3496,13 +3589,11 @@ function VincularProfesionales({ nombres, profs, ENGINE, onAplicar, onCancelar, 
               {d.modo === "vincular" && (
                 <div className="vinc-body">
                   <label className="vinc-lbl">Es la misma persona que:</label>
-                  <select className="vinc-select" value={d.vinculadoA}
-                    onChange={e => setFila(norm, { vinculadoA: e.target.value })}>
-                    <option value="">— elige un profesional —</option>
-                    {profsOrden.map((p, i) => (
-                      <option key={i} value={p.nombre}>{p.nombre}{p.apodo ? " (" + p.apodo + ")" : ""}</option>
-                    ))}
-                  </select>
+                  <BuscadorProfesional
+                    profesionales={profsOrden}
+                    valor={d.vinculadoA}
+                    onElegir={(nombre) => setFila(norm, { vinculadoA: nombre })}
+                  />
                 </div>
               )}
 
@@ -4306,6 +4397,19 @@ td.data-cell:has(.nota-edit) { overflow: visible; }
 .vinc-footer { position: sticky; bottom: 0; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 0; background: linear-gradient(transparent, var(--paper) 30%); }
 .vinc-status { font-size: 13px; color: var(--ink-soft); font-weight: 540; }
 .vinc-actions { display: flex; gap: 10px; }
+
+/* Buscador con autocompletado */
+.buscador { position: relative; }
+.buscador-input { width: 100%; padding: 9px 32px 9px 12px; border: 1px solid var(--line-strong); border-radius: 8px; font: inherit; font-size: 13px; background: var(--surface); color: var(--ink); }
+.buscador-input:focus { outline: 2px solid var(--accent-wash); border-color: var(--accent); }
+.buscador-input.elegido { border-color: var(--accent); background: var(--accent-wash); font-weight: 540; }
+.buscador-ok { position: absolute; right: 11px; top: 50%; transform: translateY(-50%); color: var(--accent-deep); font-weight: 700; pointer-events: none; }
+.buscador-lista { position: absolute; z-index: 40; top: calc(100% + 3px); left: 0; right: 0; max-height: 240px; overflow-y: auto; margin: 0; padding: 4px; list-style: none; background: var(--surface); border: 1px solid var(--line-strong); border-radius: 8px; box-shadow: 0 8px 24px rgba(20,30,48,.18); }
+.buscador-lista li { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; padding: 8px 10px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+.buscador-lista li.activo { background: var(--accent-wash); }
+.buscador-nombre { color: var(--ink); font-weight: 520; }
+.buscador-apodo { color: var(--muted); font-size: 11.5px; white-space: nowrap; }
+.buscador-vacio { color: var(--muted); font-style: italic; cursor: default; padding: 8px 10px; }
 .historico { max-width: 1100px; }
 .hist-grid-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow); }
 .hist-grid { border-collapse: collapse; width: 100%; }
