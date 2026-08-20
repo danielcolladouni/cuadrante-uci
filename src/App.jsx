@@ -8,6 +8,7 @@ import {
   cargarEstructura, guardarEstructura,
   cargarAnotaciones, guardarAnotaciones,
   cargarAlias, guardarAliasTodos,
+  cargarReglas, guardarReglas,
 } from "./supabase.js";
 
 /* ============================================================
@@ -104,11 +105,9 @@ function estructuraPorDefecto() {
   }));
 }
 
-// Etiqueta fija que sustituye/acompaña al número de una posición concreta,
-// según la convención de la unidad (revisión de carro, cama parada, etc.).
-// areaId = id del catálogo (UCI_A, SEMIS, REA, UCCRI_ESQ, UCCRI_DRE, UCI_B).
-// posLocal = número de posición dentro del área (1..n).
-// Devuelve { texto, reemplazaNumero } o null si la posición no tiene etiqueta.
+// Etiqueta fija POR DEFECTO (convención clásica de la unidad) que sustituye o
+// acompaña al número de una posición. Se usa solo si el área no tiene etiquetas
+// personalizadas guardadas en la estructura.
 function etiquetaFijaPosicion(areaId, posLocal) {
   // "+ revisió carro" en posiciones concretas (acompaña al número)
   const revisioCarro = (
@@ -124,6 +123,33 @@ function etiquetaFijaPosicion(areaId, posLocal) {
   return null;
 }
 
+// Etiqueta EFECTIVA de una posición: si el área trae etiquetas personalizadas
+// (campo `etiquetas` en la estructura: {posLocal: texto}), se usan esas; si no,
+// las por defecto. Convenio del texto personalizado: si empieza por "=", el
+// texto SUSTITUYE al número (p.ej. "=ATURADA+ICTUS+CARRO"); si no, lo acompaña.
+// Devuelve { texto, reemplazaNumero } o null.
+function etiquetaDePosicion(area, posLocal) {
+  const ets = area && area.etiquetas;
+  if (ets && Object.prototype.hasOwnProperty.call(ets, String(posLocal))) {
+    const raw = String(ets[String(posLocal)] || "").trim();
+    if (!raw) return null; // vacío explícito = sin etiqueta
+    if (raw.startsWith("=")) return { texto: raw.slice(1).trim(), reemplazaNumero: true };
+    return { texto: raw, reemplazaNumero: false };
+  }
+  return etiquetaFijaPosicion(area ? area.id : "", posLocal);
+}
+
+// Etiquetas por defecto de un área en formato editable {posLocal: texto},
+// para precargar el editor (usa el convenio "=" para las que reemplazan).
+function etiquetasPorDefectoDeArea(areaId, nPos) {
+  const out = {};
+  for (let p = 1; p <= nPos; p++) {
+    const et = etiquetaFijaPosicion(areaId, p);
+    out[String(p)] = et ? (et.reemplazaNumero ? "=" + et.texto : et.texto) : "";
+  }
+  return out;
+}
+
 // Compila una config en un mapa de posiciones globales que usa el motor.
 function compilarEstructura(config) {
   const activas = (config && config.length ? config : estructuraPorDefecto())
@@ -133,7 +159,8 @@ function compilarEstructura(config) {
   for (const a of activas) {
     const ini = cursor, fin = cursor + a.posiciones - 1;
     areas.push({ id: a.id, nombre: a.nombre, rotacion: a.rotacion,
-      posiciones: a.posiciones, posIni: ini, posFin: fin });
+      posiciones: a.posiciones, posIni: ini, posFin: fin,
+      etiquetas: a.etiquetas || null });
     cursor = fin + 1;
   }
   return { areas, nPosTotal: cursor - 1 };
@@ -199,6 +226,44 @@ function puedeIrAArea(criterio, rotacion) {
     default: return true; // conservador
   }
 }
+
+/* ---------- REGLAS DE ROTACIÓN configurables ----------
+   Cada regla puede activarse o desactivarse desde la web. El motor las consulta
+   en los puntos correspondientes. Por defecto, TODAS activas (comportamiento actual).
+*/
+const REGLAS_DEFECTO = {
+  rotacionMensual: true,          // asignar unidad del mes a cada fijo (rotación obligatoria)
+  max2Meses: true,                // nunca 3 meses seguidos en la misma unidad
+  cicloCompleto: true,            // no repetir unidad hasta pasar por todas las permitidas
+  suplentesNoRotan: true,         // los suplentes no entran en la rotación (bolsa flexible)
+  continuidadMes: true,           // mantener la misma unidad durante todo el mes
+  evitarPosicionSemanaAnterior: true, // dentro de la unidad, no repetir posición de la semana previa
+  excedentesEquilibrados: true,   // repartir excedentes equilibrando el ciclo UCCRI→REA→SEMIS→UCI A→UCI B
+  excedentesPrioridadSuplentes: true, // a excedente van antes los suplentes y los fijos menos antiguos
+};
+// Descripciones para la interfaz (título + explicación en lenguaje llano).
+const REGLAS_INFO = [
+  { clave: "rotacionMensual", titulo: "Rotación mensual obligatoria",
+    desc: "Cada mes se asigna a cada profesional fijo una unidad de rotación, repartiendo las plazas para que roten el máximo posible. Si se desactiva, cada uno se coloca donde haya hueco sin obligación de cambiar de unidad.", dependeDe: null },
+  { clave: "max2Meses", titulo: "Máximo 2 meses seguidos en la misma unidad",
+    desc: "Regla dura: nadie puede estar 3 meses consecutivos en la misma unidad. Antes de permitirlo, se le deja como excedente en otra unidad.", dependeDe: "rotacionMensual" },
+  { clave: "cicloCompleto", titulo: "Completar el ciclo antes de repetir",
+    desc: "No se repite una unidad hasta haber pasado por todas las que el criterio permite; al completarlas, el ciclo se reinicia.", dependeDe: "rotacionMensual" },
+  { clave: "suplentesNoRotan", titulo: "Los suplentes no rotan",
+    desc: "El personal suplente queda fuera de la rotación y actúa como bolsa flexible para cubrir huecos. Si se desactiva, los suplentes también reciben unidad de rotación.", dependeDe: "rotacionMensual" },
+  { clave: "continuidadMes", titulo: "Misma unidad durante todo el mes",
+    desc: "Una vez asignada la unidad del mes, se mantiene en todas las semanas de ese mes (no se cambia de unidad a mitad de mes).", dependeDe: null },
+  { clave: "evitarPosicionSemanaAnterior", titulo: "No repetir posición de la semana anterior",
+    desc: "Dentro de la misma unidad, se intenta no asignar exactamente la misma posición (cama) que la semana pasada.", dependeDe: null },
+  { clave: "excedentesEquilibrados", titulo: "Excedentes repartidos en ciclo equilibrado",
+    desc: "Cuando sobra personal, los excedentes se reparten completando una vuelta del ciclo UCCRI → REA → SEMIS → UCI A → UCI B antes de poner un segundo en ninguna unidad. Si se desactiva, se reparten en orden simple.", dependeDe: null },
+  { clave: "excedentesPrioridadSuplentes", titulo: "A excedente: primero suplentes, luego por antigüedad",
+    desc: "Cuando sobra gente, van a posiciones de excedente primero los suplentes y después los fijos de menor antigüedad; los más antiguos conservan posición real.", dependeDe: null },
+];
+// Reglas ACTIVAS (variable de módulo). El motor las fija antes de generar.
+let _REGLAS = { ...REGLAS_DEFECTO };
+function fijarReglas(r) { _REGLAS = { ...REGLAS_DEFECTO, ...(r || {}) }; return _REGLAS; }
+function reglasActivas() { return _REGLAS; }
 function normalizarCriterio(valor) {
   let v = String(valor || "").toUpperCase().trim();
   if (v === "SÍ") v = "SI";
@@ -215,7 +280,10 @@ function areaExcedenteRoundRobin(n) {
 function ordenExcedentes() {
   const pref = ["UCCRI", "REA", "SEMIS", "UCI A", "UCI B"];
   const abiertas = unidadesAbiertasRotacion();
-  return pref.filter(u => abiertas.includes(u));
+  const clasicas = pref.filter(u => abiertas.includes(u));
+  // Rotaciones nuevas (creadas por el usuario) van al final del ciclo.
+  const nuevas = abiertas.filter(u => !pref.includes(u));
+  return clasicas.concat(nuevas);
 }
 // Asigna a una lista de excedentes su unidad siguiendo el ciclo
 // UCCRI → REA → SEMIS → UCI A → UCI B, repartiendo de forma EQUILIBRADA: cada
@@ -228,13 +296,24 @@ function repartirExcedentes(lista, db) {
   const out = [];
   const cont = {};
   for (const u of orden) cont[u] = 0;
+  let punteroSimple = 0;
   for (const ex of lista) {
     const crit = db.criterio(ex.nombre);
     const posibles = orden.filter(u => puedeIrAArea(crit, u));
     if (posibles.length === 0) { out.push({ nombre: ex.nombre, area: orden[0] || "", ordenEnUnidad: 1 }); continue; }
-    // elegir la unidad posible con menos excedentes; empate -> primera en el ciclo
-    let mejor = posibles[0];
-    for (const u of posibles) if (cont[u] < cont[mejor]) mejor = u;
+    let mejor;
+    if (_REGLAS.excedentesEquilibrados) {
+      // elegir la unidad posible con menos excedentes; empate -> primera en el ciclo
+      mejor = posibles[0];
+      for (const u of posibles) if (cont[u] < cont[mejor]) mejor = u;
+    } else {
+      // reparto simple: siguiente unidad del ciclo que este profesional pueda
+      mejor = posibles[0];
+      for (let i = 0; i < orden.length; i++) {
+        const u = orden[(punteroSimple + i) % orden.length];
+        if (posibles.includes(u)) { mejor = u; punteroSimple = (punteroSimple + i + 1) % orden.length; break; }
+      }
+    }
     cont[mejor]++;
     out.push({ nombre: ex.nombre, area: mejor, ordenEnUnidad: cont[mejor] });
   }
@@ -576,6 +655,38 @@ class ProfesionalesDB {
   estaEnBD(nombre) {
     return this.byNorm.has(normalizarTexto(nombre));
   }
+  // Resuelve un texto que puede ser un APODO (como en la hoja ROTACIONS_INF),
+  // un nombre completo, un alias o una abreviatura. Devuelve el nombre completo
+  // de la base, o "" si no se puede identificar con seguridad.
+  resolverDesdeApodo(texto) {
+    const t = String(texto || "").trim();
+    if (!t) return "";
+    const tn = normalizarTexto(t);
+    // 1) coincidencia exacta con un apodo de la base
+    for (const p of this.list) {
+      if (p.apodo && normalizarTexto(p.apodo) === tn) return p.nombre;
+    }
+    // 2) alias guardados / nombre completo / heurísticas ya existentes
+    const res = this.resolverNombre(t);
+    if (this.estaEnBD(res)) return res;
+    // 3) todas las palabras del texto están en el nombre completo
+    const pal = tn.split(" ").filter(Boolean);
+    if (pal.length >= 1) {
+      for (const p of this.list) {
+        const comp = new Set(normalizarTexto(p.nombre.replace(",", " ")).split(" ").filter(Boolean));
+        if (pal.every(w => comp.has(w))) return p.nombre;
+      }
+    }
+    // 4) el apodo de la base empieza por el texto (o al revés), si es inequívoco
+    const cand = [];
+    for (const p of this.list) {
+      const ap = p.apodo ? normalizarTexto(p.apodo) : "";
+      if (!ap) continue;
+      if (ap.startsWith(tn) || tn.startsWith(ap)) cand.push(p.nombre);
+    }
+    if (cand.length === 1) return cand[0];
+    return "";
+  }
 }
 
 /* Recorre la planilla en el rango de semanas a generar y devuelve los nombres
@@ -896,7 +1007,8 @@ function historialMensualProf(historico, profNorm, mesActual) {
 // Unidad que debe ocupar este mes para cumplir la rotación obligatoria.
 // Devuelve "" si no se fuerza (suplente o sin candidatas).
 function unidadRotacionObligatoria(historico, nombreProf, criterio, esSuplente, fechaLunes) {
-  if (esSuplente) return "";
+  if (!_REGLAS.rotacionMensual) return "";
+  if (_REGLAS.suplentesNoRotan && esSuplente) return "";
   const candidatas = unidadesCandidatasProf(criterio);
   if (candidatas.length === 0) return "";
   if (candidatas.length === 1) return candidatas[0];
@@ -906,24 +1018,28 @@ function unidadRotacionObligatoria(historico, nombreProf, criterio, esSuplente, 
 
   // ¿Ya hay asignación de unidad ESTE mes en semanas anteriores? Mantenerla
   // (la rotación es mensual; dentro del mes no se cambia de unidad).
-  const yaEsteMes = unidadDelMesActual(historico, nombreProf, fechaLunes);
-  if (yaEsteMes && candidatas.includes(yaEsteMes)) return yaEsteMes;
+  if (_REGLAS.continuidadMes) {
+    const yaEsteMes = unidadDelMesActual(historico, nombreProf, fechaLunes);
+    if (yaEsteMes && candidatas.includes(yaEsteMes)) return yaEsteMes;
+  }
 
   // Reconstruir el ciclo actual desde el final del historial
   const visitadas = new Set();
-  for (let i = hist.length - 1; i >= 0; i--) {
-    const u = hist[i].unidad;
-    if (!candidatas.includes(u)) continue;
-    if (visitadas.size >= candidatas.length) break;
-    if (visitadas.has(u)) break;
-    visitadas.add(u);
+  if (_REGLAS.cicloCompleto) {
+    for (let i = hist.length - 1; i >= 0; i--) {
+      const u = hist[i].unidad;
+      if (!candidatas.includes(u)) continue;
+      if (visitadas.size >= candidatas.length) break;
+      if (visitadas.has(u)) break;
+      visitadas.add(u);
+    }
+    if (visitadas.size >= candidatas.length) visitadas.clear(); // ciclo completo -> reinicia
   }
-  if (visitadas.size >= candidatas.length) visitadas.clear(); // ciclo completo -> reinicia
 
   const ultima = hist.length ? hist[hist.length - 1].unidad : "";
   const penultima = hist.length >= 2 ? hist[hist.length - 2].unidad : "";
-  // Regla dura: no 3 meses seguidos en la misma unidad.
-  const prohibida = (ultima && ultima === penultima) ? ultima : "";
+  // Regla dura: no 3 meses seguidos en la misma unidad (si está activa).
+  const prohibida = (_REGLAS.max2Meses && ultima && ultima === penultima) ? ultima : "";
   let pendientes = candidatas.filter(u => !visitadas.has(u) && u !== ultima && u !== prohibida);
   if (pendientes.length === 0) pendientes = candidatas.filter(u => !visitadas.has(u) && u !== prohibida);
   if (pendientes.length === 0) pendientes = candidatas.filter(u => u !== ultima && u !== prohibida);
@@ -959,18 +1075,20 @@ function repartirRotacionBloque(profesionales, capacidad, historico, mesActual) 
     const hist = historialMensualProf(historico, p.profNorm, mesActual);
     const ultima = hist.length ? hist[hist.length - 1].unidad : "";
     const penultima = hist.length >= 2 ? hist[hist.length - 2].unidad : "";
-    // REGLA DURA máx. 2 meses seguidos: si los DOS últimos meses fueron la misma
-    // unidad, esa unidad queda PROHIBIDA este mes (sería el 3º consecutivo).
-    const prohibida = (ultima && ultima === penultima) ? ultima : "";
+    // REGLA máx. 2 meses seguidos (si activa): si los DOS últimos meses fueron la
+    // misma unidad, esa unidad queda PROHIBIDA este mes (sería el 3º consecutivo).
+    const prohibida = (_REGLAS.max2Meses && ultima && ultima === penultima) ? ultima : "";
     const visit = new Set();
-    for (let i = hist.length - 1; i >= 0; i--) {
-      const u = hist[i].unidad;
-      if (!cand.includes(u)) continue;
-      if (visit.size >= cand.length) break;
-      if (visit.has(u)) break;
-      visit.add(u);
+    if (_REGLAS.cicloCompleto) {
+      for (let i = hist.length - 1; i >= 0; i--) {
+        const u = hist[i].unidad;
+        if (!cand.includes(u)) continue;
+        if (visit.size >= cand.length) break;
+        if (visit.has(u)) break;
+        visit.add(u);
+      }
+      if (visit.size >= cand.length) visit.clear();
     }
-    if (visit.size >= cand.length) visit.clear();
     const urg = urgenciaPorUnidadRot(hist, cand);
     return { ...p, cand, ultima, prohibida, urg, pendientes: cand.filter(u => !visit.has(u)) };
   });
@@ -1011,12 +1129,13 @@ function capacidadPorUnidad() {
 // Calcula el reparto del mes para día y noche. Devuelve Map(profNorm -> unidad).
 // Solo incluye fijos (Suplente=No) con bloque dominante claro.
 function calcularRepartoMes(estad, db, historico, fechaLunes) {
+  if (!_REGLAS.rotacionMensual) return new Map();
   const mesActual = mesKey(fechaLunes);
   // Si ya hay unidad asignada este mes (semanas previas), respetarla luego en
   // intentarAsignarPos vía unidadDelMesActual; aquí repartimos a todos los fijos.
   const dia = [], noche = [];
   for (const e of estad) {
-    if (db.esSuplente(e.nombre)) continue;
+    if (_REGLAS.suplentesNoRotan && db.esSuplente(e.nombre)) continue;
     const p = { nombre: e.nombre, profNorm: normalizarTexto(e.nombre), criterio: db.criterio(e.nombre) };
     if (esBloqueNoche(e.bloqueDominante)) noche.push(p); else dia.push(p);
   }
@@ -1069,9 +1188,12 @@ function intentarAsignarPos(e, ocDia, ocNoche, db, historico, fechaLunes, repart
   const claveRep = (esBloqueNoche(bloque) ? "N|" : "D|") + normalizarTexto(nombre);
   let unidadRot = reparto && reparto.get(claveRep);
   if (!unidadRot) unidadRot = unidadRotacionObligatoria(historico, nombre, crit, esSupl, fechaLunes);
-  // Continuidad dentro del mes (si ya tenía unidad asignada en semanas previas).
-  const yaMes = unidadDelMesActual(historico, nombre, fechaLunes);
-  const unidadMes = (yaMes && puedeIrAArea(crit, yaMes)) ? yaMes : unidadRot;
+  // Continuidad dentro del mes (si la regla está activa y ya tenía unidad este mes).
+  let unidadMes = unidadRot;
+  if (_REGLAS.continuidadMes) {
+    const yaMes = unidadDelMesActual(historico, nombre, fechaLunes);
+    if (yaMes && puedeIrAArea(crit, yaMes)) unidadMes = yaMes;
+  }
 
   // Pasada 0 y 1: forzar la unidad asignada. Pasada 2: cualquiera compatible
   // (fallback total, solo si no cupo en su unidad — p.ej. unidad llena).
@@ -1081,7 +1203,7 @@ function intentarAsignarPos(e, ocDia, ocNoche, db, historico, fechaLunes, repart
       if (!puedeIrAArea(crit, area)) continue;
       if (pasada <= 1 && unidadMes && area !== unidadMes) continue;
       let posEvitar = 0;
-      if (pasada === 0) posEvitar = posicionSemanaAnterior(historico, nombre, fechaLunes, area);
+      if (pasada === 0 && _REGLAS.evitarPosicionSemanaAnterior) posEvitar = posicionSemanaAnterior(historico, nombre, fechaLunes, area);
       for (let p = posGlobalInicioArea(area); p <= posGlobalFinArea(area); p++) {
         if (pasada === 0 && p === posEvitar) continue;
         if (esBloqueNoche(bloque)) {
@@ -1178,15 +1300,17 @@ function rellenarHuecosYExcedentes(semana, asignEst, asig, db, historico, fechaL
     return u;
   };
   for (let d = 0; d < 7; d++) {
-    // Orden de colocación: primero los FIJOS (Suplente=No) por antigüedad DESC,
-    // luego los SUPLENTES. Así los fijos reclaman posición antes y, cuando sobra
-    // gente, los primeros en quedar en excedente son los suplentes; entre fijos,
-    // los de MENOR antigüedad caen antes a excedente.
-    const regsOrden = semana[d].regs.slice().sort((a, b) => {
-      const sa = db.esSuplente(a.nombre) ? 1 : 0, sb = db.esSuplente(b.nombre) ? 1 : 0;
-      if (sa !== sb) return sa - sb;                       // fijos primero
-      return db.antiguedad(b.nombre) - db.antiguedad(a.nombre); // más antiguos primero
-    });
+    // Orden de colocación (si la regla está activa): primero los FIJOS por
+    // antigüedad DESC, luego los SUPLENTES. Así los fijos reclaman posición antes
+    // y, cuando sobra gente, caen a excedente primero los suplentes y después
+    // los fijos de MENOR antigüedad.
+    const regsOrden = _REGLAS.excedentesPrioridadSuplentes
+      ? semana[d].regs.slice().sort((a, b) => {
+          const sa = db.esSuplente(a.nombre) ? 1 : 0, sb = db.esSuplente(b.nombre) ? 1 : 0;
+          if (sa !== sb) return sa - sb;                       // fijos primero
+          return db.antiguedad(b.nombre) - db.antiguedad(a.nombre); // más antiguos primero
+        })
+      : semana[d].regs;
     for (const reg of regsOrden) {
       const a = buscarAsignEstable(asignEst, reg.nombre);
       if (a && a.posGlobal > 0) continue;
@@ -1495,6 +1619,158 @@ function pickCobertor(lista, evitar, usados) {
 
 /* ---------- M09: registrar en histórico + informe mensual ---------- */
 // Devuelve filas nuevas para el histórico (solo turnos M/T/N ocupados)
+/* =============================================================
+   IMPORTAR el registro de rotación que lleva la coordinadora a mano
+   (libro ROTACIONS_INF: hojas DIA y NIT, una fila por profesional —
+   por su APODO —, una columna por mes, celda = unidad de ese mes).
+   Se convierte en filas de histórico para que la app continúe la
+   rotación a partir de ahí.
+   ============================================================= */
+
+// Nombres de mes admitidos (catalán y castellano) -> número de mes 1..12
+const MESES_IMPORT = {
+  GENER: 1, ENERO: 1,
+  FEBRER: 2, FEBRERO: 2,
+  MARC: 3, MARZO: 3,
+  ABRIL: 4,
+  MAIG: 5, MAYO: 5,
+  JUNY: 6, JUNIO: 6,
+  JULIOL: 7, JULIO: 7,
+  AGOST: 8, AGOSTO: 8,
+  SETEMBRE: 9, SEPTIEMBRE: 9, SEPTEMBRE: 9,
+  OCTUBRE: 10, OCTUBRE_ES: 10,
+  NOVEMBRE: 11, NOVIEMBRE: 11,
+  DESEMBRE: 12, DICIEMBRE: 12, DECEMBRE: 12,
+};
+function mesDesdeEncabezado(texto) {
+  const t = normalizarTexto(texto).replace(/[^A-ZÑ]/g, "");
+  return MESES_IMPORT[t] || 0;
+}
+
+// Interpreta el texto de una celda -> lista de unidades de rotación.
+// Admite: "SEMIS", "UCI B", "UCI A-B" (las dos), "REA/SEMIS", "semis/" (barra
+// suelta), mayúsculas/minúsculas y espacios sobrantes.
+// Devuelve { unidades: [...], reconocido: true|false }.
+function parsearUnidadesCelda(texto) {
+  const bruto = String(texto || "").trim();
+  if (!bruto) return { unidades: [], reconocido: true }; // celda vacía: sin dato
+  const t = normalizarTexto(bruto);
+  // "UCI A-B" (o "UCI A - B") = las dos UCI
+  if (/^UCI\s*A\s*-\s*B$/.test(t)) return { unidades: [AREA.UCI_A, AREA.UCI_B], reconocido: true };
+  const trozos = t.split("/").map(s => s.trim()).filter(Boolean);
+  const unidades = [];
+  let reconocido = true;
+  for (const tr of trozos) {
+    const u = unidadDesdeTexto(tr);
+    if (u) { if (!unidades.includes(u)) unidades.push(u); }
+    else reconocido = false;
+  }
+  return { unidades, reconocido: reconocido && unidades.length > 0 };
+}
+// Un trozo de texto -> nombre de rotación canónico, o "" si no se reconoce.
+function unidadDesdeTexto(t) {
+  const s = normalizarTexto(t).replace(/\s+/g, " ").trim();
+  if (!s) return "";
+  if (/^UCI\s*A$/.test(s)) return AREA.UCI_A;
+  if (/^UCI\s*B$/.test(s)) return AREA.UCI_B;
+  if (/^SEMIS/.test(s)) return AREA.SEMIS;
+  if (/^REA/.test(s)) return AREA.REA;
+  if (/^UCCRI/.test(s)) return AREA.UCCRI;
+  return "";
+}
+
+/* Analiza las hojas leídas del libro y prepara la importación.
+   hojas: [{ bloque: "DIA"|"NIT", encabezados: [...8 textos...], filas: [{ nombre, celdas: [...] }] }]
+   vinculacionesManuales: { apodoExcel: nombreCompletoBD } decididas por el usuario.
+   Devuelve un análisis con todo lo necesario para revisar antes de importar. */
+function analizarImportacionRotaciones(hojas, db, anio, vinculacionesManuales) {
+  const vinc = vinculacionesManuales || {};
+  const entradas = [];          // {prof, profNorm, bloque, mes, unidades}
+  const sinVincularMap = new Map(); // apodoExcel -> {apodo, bloque, meses}
+  const noReconocidas = [];     // {apodo, mesNombre, texto}
+  const mesesSet = new Set();
+
+  for (const hoja of (hojas || [])) {
+    const bloque = hoja.bloque === "NIT" ? "NIT" : "DIA";
+    const mesesCol = (hoja.encabezados || []).map(h => mesDesdeEncabezado(h));
+    for (const fila of (hoja.filas || [])) {
+      const apodoExcel = String(fila.nombre || "").trim();
+      if (!apodoExcel) continue;
+      // ¿tiene algún dato?
+      const tieneDatos = (fila.celdas || []).some(c => String(c || "").trim());
+      if (!tieneDatos) continue;
+      // Resolver el profesional
+      let prof = vinc[apodoExcel] || "";
+      if (!prof) prof = db.resolverDesdeApodo(apodoExcel);
+      if (!prof || !db.estaEnBD(prof)) {
+        if (!sinVincularMap.has(apodoExcel)) sinVincularMap.set(apodoExcel, { apodo: apodoExcel, bloque, meses: 0 });
+        sinVincularMap.get(apodoExcel).meses += (fila.celdas || []).filter(c => String(c || "").trim()).length;
+        continue;
+      }
+      for (let i = 0; i < (fila.celdas || []).length; i++) {
+        const txt = String(fila.celdas[i] || "").trim();
+        if (!txt) continue;
+        const nMes = mesesCol[i] || 0;
+        if (!nMes) continue;
+        const { unidades, reconocido } = parsearUnidadesCelda(txt);
+        if (!reconocido || unidades.length === 0) {
+          noReconocidas.push({ apodo: apodoExcel, mesNombre: (hoja.encabezados || [])[i] || "", texto: txt });
+          continue;
+        }
+        const mes = anio + "-" + String(nMes).padStart(2, "0");
+        mesesSet.add(mes);
+        entradas.push({ prof, profNorm: normalizarTexto(prof), bloque, mes, nMes, unidades });
+      }
+    }
+  }
+  const meses = [...mesesSet].sort();
+  const profs = new Set(entradas.map(e => e.prof));
+  return {
+    entradas,
+    sinVincular: [...sinVincularMap.values()].sort((a, b) => b.meses - a.meses),
+    noReconocidas,
+    meses,
+    nProfesionales: profs.size,
+    nRegistros: entradas.length,
+  };
+}
+
+/* Convierte el análisis en filas de histórico listas para guardar.
+   Por cada (profesional, mes, unidad) se generan varios "días" sintéticos
+   dentro de ese mes, para que la unidad quede registrada como la del mes.
+   Si la celda traía dos unidades, se reparten los días entre ambas (así el
+   histórico refleja que ese mes estuvo repartido, igual que anotó la coordinadora). */
+function filasHistoricoDesdeRotaciones(analisis, anio) {
+  const filas = [];
+  const DIAS_POR_MES = 10; // días sintéticos por profesional y mes
+  for (const e of analisis.entradas) {
+    const turno = e.bloque === "NIT" ? "N" : "M";
+    const nU = e.unidades.length;
+    // repartir los días entre las unidades (la primera se lleva el resto)
+    const base = Math.floor(DIAS_POR_MES / nU);
+    const reparto = e.unidades.map((u, i) => ({ unidad: u, dias: base + (i === 0 ? DIAS_POR_MES - base * nU : 0) }));
+    let diaDelMes = 1;
+    for (const r of reparto) {
+      for (let k = 0; k < r.dias; k++) {
+        const fecha = new Date(Number(anio), e.nMes - 1, Math.min(28, diaDelMes));
+        diaDelMes++;
+        filas.push({
+          fechaSerial: diaSerial(fecha),
+          fecha,
+          mes: e.mes,
+          profNorm: e.profNorm,
+          prof: e.prof,
+          dia: (diaDelMes - 2) % 7,
+          turno,
+          posGlobal: 0,      // sin posición concreta: solo interesa la unidad
+          area: r.unidad,
+        });
+      }
+    }
+  }
+  return filas;
+}
+
 function filasHistoricoDeSemana(asig) {
   const filas = [];
   const letra = ["M", "T", "N"];
@@ -1631,10 +1907,12 @@ function resumenHistoricoRotacion(historico) {
   salida.sort((a, b) => a.profesional.toUpperCase() < b.profesional.toUpperCase() ? -1 : 1);
   return salida;
 }
-function generarCronograma(planilla, db, historicoInicial, fechaLunesInicio, numSemanas, estructuraConfig) {
+function generarCronograma(planilla, db, historicoInicial, fechaLunesInicio, numSemanas, estructuraConfig, reglasConfig) {
   // Fijar la estructura de la unidad para esta generación (Fase A).
   // Si no se pasa ninguna, usa la estructura por defecto.
   fijarEstructura(estructuraConfig || estructuraPorDefecto());
+  // Fijar las reglas de rotación activas (si no se pasan, todas activas).
+  fijarReglas(reglasConfig);
   let historico = (historicoInicial || []).slice();
   const semanas = [];
   for (let s = 0; s < numSemanas; s++) {
@@ -1930,7 +2208,7 @@ function _gridSemana(sem, db, ENGINE, S, areasLayout) {
         if (p === area.pIni) row.push({ v: area.nombre, s: S.areaName, t: "s" });
         else row.push({ v: "", s: S.areaName });
         // col B: número local o etiqueta fija de la posición
-        const etFija = ENGINE.etiquetaFijaPosicion(area.id, local);
+        const etFija = ENGINE.etiquetaDePosicion(area, local);
         if (etFija && etFija.reemplazaNumero) {
           row.push({ v: etFija.texto, s: S.areaNum, t: "s" });
         } else if (etFija) {
@@ -2035,7 +2313,7 @@ function exportarCronogramaXLSX(resultado, db, ENGINE) {
   const { styleSheet, styleIdx: S } = _buildStyles();
   // Áreas reales del cuadrante (estructura dinámica)
   const est = resultado.estructura || ENGINE.estructuraActiva();
-  const areasLayout = (est.areas || []).map(a => ({ id: a.id, nombre: a.nombre, rotacion: a.rotacion, pIni: a.posIni, pFin: a.posFin }));
+  const areasLayout = (est.areas || []).map(a => ({ id: a.id, nombre: a.nombre, rotacion: a.rotacion, pIni: a.posIni, pFin: a.posFin, etiquetas: a.etiquetas }));
 
   // Una hoja por semana + una hoja de informe
   const hojas = [];
@@ -2098,7 +2376,8 @@ function exportarCronogramaXLSX(resultado, db, ENGINE) {
   return {
     TURNO, COLOR, AREA, CRIT, NPOS_TOTAL_actual,
     CATALOGO_AREAS, estructuraPorDefecto, fijarEstructura, estructuraActiva,
-    etiquetaFijaPosicion,
+    etiquetaFijaPosicion, etiquetaDePosicion, etiquetasPorDefectoDeArea,
+    REGLAS_DEFECTO, REGLAS_INFO, fijarReglas, reglasActivas,
     normalizarTexto, colorPorTurno, fechaCorta, mesKey, addDays, weekdayMonday,
     posGlobalAArea, nombreAreaCortoDePosGlobal,
     ProfesionalesDB, obtenerProfesionalesDelDia,
@@ -2106,6 +2385,8 @@ function exportarCronogramaXLSX(resultado, db, ENGINE) {
     construirAsignacionSemanal, generarCronograma,
     ajustarTurnosDobles, ajustarParciales, construirAvisosDecalaje,
     filasHistoricoDeSemana, regenerarInformeMensual, parsearAntiguedad,
+    analizarImportacionRotaciones, filasHistoricoDesdeRotaciones,
+    parsearUnidadesCelda, mesDesdeEncabezado,
     resumenHistoricoRotacion, unidadRotacionObligatoria, unidadesCandidatasProf,
     extraerNombresSinVincular,
     turnoNaturalCanon, clasificarJornadaNatural, UMBRAL_H,
@@ -2163,6 +2444,42 @@ function leerProfesionales(workbook) {
   }
   return out;
 }
+/* Lee el libro de rotaciones de la coordinadora (hojas DIA y NIT).
+   Fila 1 = encabezados de mes (col B en adelante). Col A = apodo del profesional.
+   Devuelve [{ bloque, encabezados, filas: [{nombre, celdas}] }]. */
+function leerRotacionesInf(workbook) {
+  const hojas = [];
+  for (const nombreHoja of workbook.SheetNames) {
+    const esNit = /^\s*(NIT|NOCHE|NOCHES)\s*$/i.test(nombreHoja);
+    const esDia = /^\s*(DIA|DÍA|DIAS|DÍAS)\s*$/i.test(nombreHoja);
+    if (!esNit && !esDia) continue;
+    const ws = workbook.Sheets[nombreHoja];
+    if (!ws || !ws["!ref"]) continue;
+    const range = XLSX.utils.decode_range(ws["!ref"]);
+    const val = (r, c) => {
+      const cell = ws[XLSX.utils.encode_cell({ r, c })];
+      return cell == null ? "" : (cell.w != null ? cell.w : cell.v);
+    };
+    // encabezados: fila 0, columnas 1..8 (B..I)
+    const encabezados = [];
+    const colsMes = [];
+    for (let c = 1; c <= range.e.c && c <= 12; c++) {
+      const h = String(val(0, c) || "").trim();
+      encabezados.push(h);
+      colsMes.push(c);
+    }
+    const filas = [];
+    for (let r = 1; r <= range.e.r; r++) {
+      const nombre = String(val(r, 0) || "").trim();
+      if (!nombre) continue;
+      const celdas = colsMes.map(c => String(val(r, c) || "").trim());
+      filas.push({ nombre, celdas });
+    }
+    hojas.push({ bloque: esNit ? "NIT" : "DIA", nombreHoja, encabezados, filas });
+  }
+  return hojas;
+}
+
 function leerAlias(workbook) {
   const name = workbook.SheetNames.find(n => /alias/i.test(n));
   if (!name) return null;
@@ -2224,8 +2541,10 @@ export default function App() {
   const [numSemanas, setNumSemanas] = useState(2);
   const [historico, setHistorico] = useState([]);
   const [estructura, setEstructura] = useState(null); // config de la unidad (Fase A)
+  const [reglas, setReglas] = useState(null); // reglas de rotación activas
   const [resultado, setResultado] = useState(null);
   const [nombresSinVincular, setNombresSinVincular] = useState(null);
+  const [importRot, setImportRot] = useState(null); // {hojas, fileName} del libro de rotaciones
   const [semanaActiva, setSemanaActiva] = useState(0);
   const [vista, setVista] = useState("inicio"); // inicio | cronograma | decalajes | informe | profesionales | editor
   const [error, setError] = useState("");
@@ -2237,6 +2556,7 @@ export default function App() {
   const [menuPerfil, setMenuPerfil] = useState(false);
   const planillaInputRef = useRef(null);
   const staffInputRef = useRef(null);
+  const rotacionesInputRef = useRef(null);
 
   // Vuelve a leer la sesión desde Supabase (p.ej. tras cambiar el apodo)
   async function refrescarSesion() {
@@ -2284,6 +2604,11 @@ export default function App() {
         // Estructura de la unidad: la guardada, o la por defecto
         const est = await cargarEstructura();
         setEstructura(est && est.length ? est : ENGINE.estructuraPorDefecto());
+        // Reglas de rotación: las guardadas, o todas activas por defecto
+        try {
+          const rg = await cargarReglas();
+          setReglas(rg ? { ...ENGINE.REGLAS_DEFECTO, ...rg } : { ...ENGINE.REGLAS_DEFECTO });
+        } catch { setReglas({ ...ENGINE.REGLAS_DEFECTO }); }
       } catch (err) {
         setError("No se pudieron cargar los datos: " + err.message);
       } finally {
@@ -2386,7 +2711,7 @@ export default function App() {
         }
         const histPrevio = (Array.isArray(historico) ? historico : [])
           .filter(h => !mesesAGenerar.has(h.mes));
-        const out = ENGINE.generarCronograma(planilla, db, histPrevio, lunes, ns, estructura);
+        const out = ENGINE.generarCronograma(planilla, db, histPrevio, lunes, ns, estructura, reglas || ENGINE.REGLAS_DEFECTO);
         setResultado(out);
         setSemanaActiva(0);
         setVista("cronograma");
@@ -2453,6 +2778,43 @@ export default function App() {
     } catch (err) {
       setError("No se pudo vaciar el histórico: " + err.message);
     }
+  }
+
+  // --- Importar el registro de rotación de la coordinadora (libro ROTACIONS_INF) ---
+  async function onRotacionesFile(e) {
+    const file = e.target.files[0];
+    e.target.value = ""; // permitir volver a elegir el mismo archivo
+    if (!file) return;
+    setError(""); setBusy(true);
+    try {
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf, { type: "array", cellDates: true });
+      const hojas = leerRotacionesInf(wb);
+      if (!hojas.length) {
+        setError("Ese archivo no tiene hojas llamadas DIA o NIT. Revisa que sea el libro de rotaciones.");
+        return;
+      }
+      setImportRot({ hojas, fileName: file.name });
+      setVista("importar");
+    } catch (err) {
+      setError("No se pudo leer el archivo de rotaciones: " + err.message);
+    } finally { setBusy(false); }
+  }
+
+  // Guarda las filas importadas como histórico, reemplazando esos meses.
+  async function aplicarImportacionRotaciones(filas, meses) {
+    setBusy(true); setError("");
+    try {
+      if (meses && meses.length) await borrarHistoricoDeMeses(meses);
+      await añadirAlHistorico(filas);
+      const setMeses = new Set(meses || []);
+      const resto = (historico || []).filter(h => !setMeses.has(h.mes));
+      setHistorico(resto.concat(filas));
+      setImportRot(null);
+      setVista("historico");
+    } catch (err) {
+      setError("No se pudo guardar la importación: " + err.message);
+    } finally { setBusy(false); }
   }
 
   // Descarga el cronograma como .xlsx con los colores del Excel original,
@@ -2563,11 +2925,13 @@ export default function App() {
           limpiarHistorico={limpiarHistorico}
           verEditor={verEditor} vistaActiva={vista}
           verEstructura={verEstructura}
+          verReglas={() => setVista("reglas")} reglas={reglas}
           estructura={estructura}
           verHistorico={verHistorico}
         />
         <input ref={planillaInputRef} type="file" accept=".xlsx,.xlsm,.xls" hidden onChange={onPlanillaFile} />
         <input ref={staffInputRef} type="file" accept=".xlsx,.xlsm,.xls" hidden onChange={onStaffFile} />
+        <input ref={rotacionesInputRef} type="file" accept=".xlsx,.xlsm,.xls" hidden onChange={onRotacionesFile} />
 
         <main className="main">
           {error && <div className="error">{error}</div>}
@@ -2578,6 +2942,15 @@ export default function App() {
               catalogo={ENGINE.CATALOGO_AREAS}
               porDefecto={ENGINE.estructuraPorDefecto()}
               saveEstructura={saveEstructura}
+              ENGINE={ENGINE}
+              onCerrar={() => setVista(resultado ? "cronograma" : "inicio")}
+            />
+          )}
+
+          {vista === "reglas" && (
+            <EditorReglas
+              reglas={reglas} ENGINE={ENGINE}
+              saveReglas={async (r) => { await guardarReglas(r); setReglas(r); }}
               onCerrar={() => setVista(resultado ? "cronograma" : "inicio")}
             />
           )}
@@ -2585,7 +2958,16 @@ export default function App() {
           {vista === "historico" && (
             <HistoricoRotacion
               historico={historico} ENGINE={ENGINE}
+              onImportar={() => rotacionesInputRef.current.click()}
               onCerrar={() => setVista(resultado ? "cronograma" : "inicio")}
+            />
+          )}
+
+          {vista === "importar" && importRot && (
+            <ImportarRotaciones
+              datos={importRot} db={db} profs={profs} ENGINE={ENGINE} busy={busy}
+              onAplicar={aplicarImportacionRotaciones}
+              onCancelar={() => { setImportRot(null); setVista("historico"); }}
             />
           )}
 
@@ -2607,9 +2989,9 @@ export default function App() {
             />
           )}
 
-          {vista !== "editor" && vista !== "estructura" && vista !== "historico" && vista !== "vincular" && !resultado && <Welcome planilla={planilla} db={db} />}
+          {vista !== "editor" && vista !== "estructura" && vista !== "historico" && vista !== "vincular" && vista !== "reglas" && vista !== "importar" && !resultado && <Welcome planilla={planilla} db={db} />}
 
-          {vista !== "editor" && vista !== "estructura" && vista !== "historico" && vista !== "vincular" && resultado && (
+          {vista !== "editor" && vista !== "estructura" && vista !== "historico" && vista !== "vincular" && vista !== "reglas" && vista !== "importar" && resultado && (
             <>
               <Tabs vista={vista} setVista={setVista}
                 semanas={resultado.semanas} semanaActiva={semanaActiva} setSemanaActiva={setSemanaActiva}
@@ -2968,7 +3350,7 @@ function Sidebar(props) {
   const { planillaInfo, staffSource, profs, fechaLunes, setFechaLunes, numSemanas, setNumSemanas,
     onPlanillaClick, onStaffClick, generar, puedeGenerar, busy, historicoLen,
     resultado, guardarEnHistorico, limpiarHistorico, verEditor, vistaActiva,
-    verEstructura, estructura, verHistorico } = props;
+    verEstructura, estructura, verHistorico, verReglas, reglas } = props;
   const nAreas = estructura ? estructura.filter(a => a.activa && a.posiciones > 0).length : 0;
   const nPos = estructura ? estructura.filter(a => a.activa).reduce((s, a) => s + (a.posiciones || 0), 0) : 0;
   return (
@@ -3008,6 +3390,19 @@ function Sidebar(props) {
               <span>Camas operativas de esta semana</span>
             </div>
           : <p className="hint">Define qué unidades están abiertas y con cuántas posiciones.</p>}
+      </Section>
+
+      <Section step="R" title="Reglas de rotación">
+        <button className={"filebtn ghost" + (vistaActiva === "reglas" ? " is-active" : "")}
+          onClick={verReglas}>
+          {vistaActiva === "reglas" ? "Configurando reglas" : "Configurar reglas"}
+        </button>
+        {reglas
+          ? <div className="filemeta">
+              <strong>{Object.values(reglas).filter(Boolean).length} de {Object.keys(reglas).length} reglas activas</strong>
+              <span>Normas aplicadas al generar</span>
+            </div>
+          : <p className="hint">Elige qué normas de rotación se aplican al generar el cuadrante.</p>}
       </Section>
 
       <Section step="4" title="Periodo">
@@ -3185,7 +3580,7 @@ function Cronograma({ semana, db, ENGINE, planilla, estructura, cargarAnotacione
   // Layout de áreas a partir de la estructura real del cuadrante generado.
   const areasLayout = useMemo(() => {
     const est = estructura || ENGINE.estructuraActiva();
-    return (est.areas || []).map(a => ({ id: a.id, nombre: a.nombre, rotacion: a.rotacion, pIni: a.posIni, pFin: a.posFin }));
+    return (est.areas || []).map(a => ({ id: a.id, nombre: a.nombre, rotacion: a.rotacion, pIni: a.posIni, pFin: a.posFin, etiquetas: a.etiquetas }));
   }, [estructura, ENGINE]);
   // Precalcular el turnoFinal y la etiqueta de cada profesional por día
   const turnoPorDiaNombre = useMemo(() => {
@@ -3287,7 +3682,7 @@ function Cronograma({ semana, db, ENGINE, planilla, estructura, cargarAnotacione
                   const filasArea = (area.pFin - area.pIni + 1) + maxExced;
                   for (let p = area.pIni; p <= area.pFin; p++) {
                     const isFirst = p === area.pIni;
-                    const etFija = ENGINE.etiquetaFijaPosicion(area.id, local);
+                    const etFija = ENGINE.etiquetaDePosicion(area, local);
                     rows.push(
                       <tr key={p} className={isFirst ? "area-start" : ""}>
                         {isFirst && (
@@ -3683,7 +4078,7 @@ function VincularProfesionales({ nombres, profs, ENGINE, onAplicar, onCancelar, 
   );
 }
 
-function HistoricoRotacion({ historico, ENGINE, onCerrar }) {
+function HistoricoRotacion({ historico, ENGINE, onCerrar, onImportar }) {
   const datos = useMemo(() => ENGINE.resumenHistoricoRotacion(historico || []), [historico, ENGINE]);
   const [busca, setBusca] = useState("");
   const meses = useMemo(() => {
@@ -3708,7 +4103,14 @@ function HistoricoRotacion({ historico, ENGINE, onCerrar }) {
             repartido, aparecen las dos unidades donde más tiempo ha pasado.
           </p>
         </div>
-        <button className="linkbtn" onClick={onCerrar}>← Volver</button>
+        <div className="hist-head-acciones">
+          {onImportar && (
+            <button className="minibtn" onClick={onImportar} title="Cargar el registro de rotación llevado a mano">
+              Importar desde Excel
+            </button>
+          )}
+          <button className="linkbtn" onClick={onCerrar}>← Volver</button>
+        </div>
       </div>
 
       {datos.length === 0 ? (
@@ -3799,34 +4201,302 @@ function Informe({ informe }) {
    La coordinadora marca/desmarca qué unidades están abiertas y ajusta
    el nº de posiciones de cada una. Se guarda en la base compartida.
 */
-function EditorEstructura({ estructura, catalogo, porDefecto, saveEstructura, onCerrar }) {
-  // Trabajar sobre una copia local indexada por id, completando con el catálogo
-  const inicial = () => catalogo.map(cat => {
-    const guardada = (estructura || []).find(a => a.id === cat.id);
-    return guardada
-      ? { ...cat, posiciones: guardada.posiciones, activa: guardada.activa }
-      : { ...cat, posiciones: cat.posDefecto, activa: false };
+/* ---------- Importar el registro de rotación de la coordinadora ---------- */
+function ImportarRotaciones({ datos, db, profs, ENGINE, onAplicar, onCancelar, busy }) {
+  // Año por defecto: el Excel solo trae el nombre del mes. Si el último mes con
+  // datos aún no ha llegado este año, lo más probable es que sea del año pasado.
+  const anioSugerido = useMemo(() => {
+    const hoy = new Date();
+    let maxMes = 0;
+    for (const h of (datos.hojas || [])) {
+      (h.encabezados || []).forEach((enc, i) => {
+        const m = ENGINE.mesDesdeEncabezado(enc);
+        if (!m) return;
+        const hayDatos = (h.filas || []).some(f => String((f.celdas || [])[i] || "").trim());
+        if (hayDatos && m > maxMes) maxMes = m;
+      });
+    }
+    const anioHoy = hoy.getFullYear();
+    return String(maxMes > hoy.getMonth() + 1 ? anioHoy - 1 : anioHoy);
+  }, [datos, ENGINE]);
+  const [anio, setAnio] = useState(anioSugerido);
+  const [vinc, setVinc] = useState({});   // apodoExcel -> nombre completo BD
+  const [omitidos, setOmitidos] = useState({}); // apodoExcel -> true (no importar)
+
+  const profsOrden = useMemo(
+    () => (profs || []).slice().sort((a, b) => String(a.nombre).localeCompare(String(b.nombre))),
+    [profs]
+  );
+
+  const analisis = useMemo(
+    () => ENGINE.analizarImportacionRotaciones(datos.hojas, db, anio, vinc),
+    [datos, db, anio, vinc, ENGINE]
+  );
+
+  const pendientes = analisis.sinVincular.filter(s => !omitidos[s.apodo] && !vinc[s.apodo]);
+  const mesesTexto = analisis.meses.map(m => {
+    const [y, mm] = m.split("-");
+    return MESES_ES[parseInt(mm, 10) - 1] + " " + y;
   });
-  const [filas, setFilas] = useState(inicial);
+
+  function aplicar() {
+    const filas = ENGINE.filasHistoricoDesdeRotaciones(analisis, anio);
+    onAplicar(filas, analisis.meses);
+  }
+
+  return (
+    <div className="importar">
+      <div className="editor-head">
+        <div>
+          <h2>Importar rotación desde Excel</h2>
+          <p className="section-intro">
+            Carga el registro que lleva la coordinadora a mano (hojas DIA y NIT) para que la
+            app parta de esa rotación como histórico. A partir de ahí, los cuadrantes que
+            generes continuarán la rotación desde donde lo dejó.
+          </p>
+        </div>
+        <button className="linkbtn" onClick={onCancelar} disabled={busy}>← Cancelar</button>
+      </div>
+
+      <div className="imp-file">
+        <strong>{datos.fileName}</strong>
+        <span>{datos.hojas.map(h => h.nombreHoja + " (" + h.filas.length + " filas)").join(" · ")}</span>
+      </div>
+
+      <div className="imp-anio">
+        <label>Año de estos meses</label>
+        <input type="number" min="2000" max="2100" value={anio}
+          onChange={e => setAnio(e.target.value)} />
+        <span className="imp-hint">
+          El Excel indica el mes pero no el año. Comprueba que sea el correcto.
+        </span>
+      </div>
+
+      <div className="imp-resumen">
+        <div className="imp-dato">
+          <strong>{analisis.nProfesionales}</strong>
+          <span>profesionales reconocidos</span>
+        </div>
+        <div className="imp-dato">
+          <strong>{analisis.nRegistros}</strong>
+          <span>registros mes/unidad</span>
+        </div>
+        <div className="imp-dato">
+          <strong>{analisis.meses.length}</strong>
+          <span>meses detectados</span>
+        </div>
+      </div>
+
+      {mesesTexto.length > 0 && (
+        <p className="imp-meses">Meses que se importarán: <strong>{mesesTexto.join(", ")}</strong>.
+          Si ya tenías histórico de esos meses, se reemplazará.</p>
+      )}
+
+      {analisis.sinVincular.length > 0 && (
+        <div className="imp-bloque">
+          <h3>Profesionales sin reconocer ({analisis.sinVincular.length})</h3>
+          <p className="imp-sub">
+            Estos nombres del Excel no se han podido emparejar con la base. Vincúlalos o
+            márcalos para omitirlos (no se importarán).
+          </p>
+          {analisis.sinVincular.map(s => (
+            <div key={s.apodo} className={"imp-vinc" + (omitidos[s.apodo] ? " omitido" : "")}>
+              <div className="imp-vinc-nom">
+                <strong>{s.apodo}</strong>
+                <span className="imp-vinc-meta">{s.bloque} · {s.meses} mes(es) con dato</span>
+              </div>
+              <div className="imp-vinc-sel">
+                {!omitidos[s.apodo] ? (
+                  <BuscadorProfesional
+                    profesionales={profsOrden}
+                    valor={vinc[s.apodo] || ""}
+                    onElegir={(nombre) => setVinc(prev => ({ ...prev, [s.apodo]: nombre }))}
+                  />
+                ) : <span className="imp-omitido-txt">Se omitirá</span>}
+              </div>
+              <button className="minibtn"
+                onClick={() => setOmitidos(prev => ({ ...prev, [s.apodo]: !prev[s.apodo] }))}>
+                {omitidos[s.apodo] ? "Recuperar" : "Omitir"}
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {analisis.noReconocidas.length > 0 && (
+        <div className="imp-bloque">
+          <h3>Celdas que no se han entendido ({analisis.noReconocidas.length})</h3>
+          <p className="imp-sub">
+            Estos textos no corresponden a ninguna unidad conocida, así que se ignorarán.
+            El resto de meses de esos profesionales sí se importa.
+          </p>
+          <ul className="imp-raras">
+            {analisis.noReconocidas.slice(0, 12).map((n, i) => (
+              <li key={i}><strong>{n.apodo}</strong> · {n.mesNombre}: «{n.texto}»</li>
+            ))}
+            {analisis.noReconocidas.length > 12 && <li>… y {analisis.noReconocidas.length - 12} más</li>}
+          </ul>
+        </div>
+      )}
+
+      <div className="vinc-footer">
+        <div className="vinc-status">
+          {pendientes.length > 0
+            ? pendientes.length + " sin vincular (se omitirán si no los vinculas)"
+            : "Todo listo para importar"}
+        </div>
+        <div className="vinc-actions">
+          <button className="btn-secondary" onClick={onCancelar} disabled={busy}>Cancelar</button>
+          <button className="btn-primary" onClick={aplicar}
+            disabled={busy || analisis.nRegistros === 0}>
+            {busy ? "Importando…" : "Importar como histórico"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- Editor de REGLAS DE ROTACIÓN (ítems marcables) ---------- */
+function EditorReglas({ reglas, ENGINE, saveReglas, onCerrar }) {
+  const [estado, setEstado] = useState(() => ({ ...ENGINE.REGLAS_DEFECTO, ...(reglas || {}) }));
   const [busy, setBusy] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [msg, setMsg] = useState("");
 
-  function setActiva(id, val) {
-    setFilas(prev => prev.map(f => f.id === id ? { ...f, activa: val } : f));
-    setDirty(true); setMsg("");
-  }
-  function setPos(id, val) {
-    const n = Math.max(0, Math.min(12, parseInt(val, 10) || 0));
-    setFilas(prev => prev.map(f => f.id === id ? { ...f, posiciones: n } : f));
+  function toggle(clave) {
+    setEstado(prev => ({ ...prev, [clave]: !prev[clave] }));
     setDirty(true); setMsg("");
   }
   async function guardar() {
     setBusy(true); setMsg("");
     try {
+      await saveReglas(estado);
+      setDirty(false); setMsg("ok");
+      setTimeout(() => setMsg(""), 2600);
+    } catch (err) { setMsg(err.message || "No se pudo guardar."); }
+    finally { setBusy(false); }
+  }
+  function restaurar() {
+    setEstado({ ...ENGINE.REGLAS_DEFECTO });
+    setDirty(true); setMsg("");
+  }
+
+  const activasN = Object.values(estado).filter(Boolean).length;
+
+  return (
+    <div className="reglas">
+      <div className="editor-head">
+        <div>
+          <h2>Reglas de rotación</h2>
+          <p className="section-intro">
+            Marca qué normas quieres que se apliquen al generar el cuadrante. Los cambios
+            se guardan y afectan a las próximas generaciones. El criterio de acceso de cada
+            profesional (SI / NO / UCI / UCCRI) se respeta siempre, no es desactivable.
+          </p>
+        </div>
+        <button className="linkbtn" onClick={onCerrar}>← Volver</button>
+      </div>
+
+      <div className="reglas-list">
+        {ENGINE.REGLAS_INFO.map(r => {
+          const apagadaPorDependencia = r.dependeDe && !estado[r.dependeDe];
+          return (
+            <div key={r.clave}
+              className={"regla-card" + (estado[r.clave] ? " on" : "") + (apagadaPorDependencia ? " dep-off" : "")}>
+              <button className={"chk grande " + (estado[r.clave] ? "on" : "")}
+                onClick={() => toggle(r.clave)}
+                disabled={busy}
+                aria-label={estado[r.clave] ? "Desactivar" : "Activar"}>
+                {estado[r.clave] ? "✓" : ""}
+              </button>
+              <div className="regla-txt">
+                <div className="regla-titulo">{r.titulo}</div>
+                <div className="regla-desc">{r.desc}</div>
+                {apagadaPorDependencia && (
+                  <div className="regla-aviso">Sin efecto mientras «Rotación mensual obligatoria» esté desactivada.</div>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      <div className="vinc-footer">
+        <div className="vinc-status">{activasN} de {ENGINE.REGLAS_INFO.length} reglas activas{msg === "ok" ? " · Guardado ✓" : (msg ? " · " + msg : "")}</div>
+        <div className="vinc-actions">
+          <button className="btn-secondary" onClick={restaurar} disabled={busy}>Restaurar todas</button>
+          <button className="btn-primary" onClick={guardar} disabled={busy || !dirty}>
+            {busy ? "Guardando…" : "Guardar reglas"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function EditorEstructura({ estructura, catalogo, porDefecto, saveEstructura, onCerrar, ENGINE }) {
+  // Copia local: unidades del catálogo (completadas con lo guardado) + unidades
+  // personalizadas que estén en la estructura guardada pero no en el catálogo.
+  const inicial = () => {
+    const filasCat = catalogo.map(cat => {
+      const guardada = (estructura || []).find(a => a.id === cat.id);
+      return guardada
+        ? { ...cat, nombre: guardada.nombre || cat.nombre, posiciones: guardada.posiciones,
+            activa: guardada.activa, etiquetas: guardada.etiquetas || null, esCatalogo: true }
+        : { ...cat, posiciones: cat.posDefecto, activa: false, etiquetas: null, esCatalogo: true };
+    });
+    const personalizadas = (estructura || [])
+      .filter(a => !catalogo.some(c => c.id === a.id))
+      .map(a => ({ ...a, esCatalogo: false }));
+    return [...filasCat, ...personalizadas];
+  };
+  const [filas, setFilas] = useState(inicial);
+  const [busy, setBusy] = useState(false);
+  const [dirty, setDirty] = useState(false);
+  const [msg, setMsg] = useState("");
+  const [abiertaEtiquetas, setAbiertaEtiquetas] = useState(null); // id del área con etiquetas desplegadas
+
+  const marca = () => { setDirty(true); setMsg(""); };
+  function setCampo(id, campo, val) {
+    setFilas(prev => prev.map(f => f.id === id ? { ...f, [campo]: val } : f));
+    marca();
+  }
+  function setActiva(id, val) { setCampo(id, "activa", val); }
+  function setPos(id, val) {
+    const n = Math.max(0, Math.min(12, parseInt(val, 10) || 0));
+    setFilas(prev => prev.map(f => f.id === id ? { ...f, posiciones: n } : f));
+    marca();
+  }
+  function setEtiqueta(id, posLocal, texto) {
+    setFilas(prev => prev.map(f => {
+      if (f.id !== id) return f;
+      const base = f.etiquetas || ENGINE.etiquetasPorDefectoDeArea(f.id, f.posiciones);
+      return { ...f, etiquetas: { ...base, [String(posLocal)]: texto } };
+    }));
+    marca();
+  }
+  function anadirUnidad() {
+    const n = filas.filter(f => !f.esCatalogo).length + 1;
+    const id = "CUSTOM_" + Date.now();
+    setFilas(prev => [...prev, {
+      id, nombre: "Nueva unidad " + n, rotacion: "UCI A", posiciones: 2,
+      activa: true, etiquetas: null, esCatalogo: false,
+    }]);
+    marca();
+  }
+  function borrarUnidad(id) {
+    setFilas(prev => prev.filter(f => f.id !== id));
+    if (abiertaEtiquetas === id) setAbiertaEtiquetas(null);
+    marca();
+  }
+  async function guardar() {
+    setBusy(true); setMsg("");
+    try {
       const config = filas.map(f => ({
-        id: f.id, nombre: f.nombre, rotacion: f.rotacion,
+        id: f.id, nombre: (f.nombre || "").trim() || f.id, rotacion: f.rotacion,
         posiciones: f.posiciones, activa: f.activa,
+        etiquetas: f.etiquetas || null,
       }));
       await saveEstructura(config);
       setDirty(false); setMsg("ok");
@@ -3839,23 +4509,24 @@ function EditorEstructura({ estructura, catalogo, porDefecto, saveEstructura, on
     const def = porDefecto;
     setFilas(catalogo.map(cat => {
       const d = def.find(a => a.id === cat.id);
-      return { ...cat, posiciones: d ? d.posiciones : cat.posDefecto, activa: d ? d.activa : false };
+      return { ...cat, posiciones: d ? d.posiciones : cat.posDefecto, activa: d ? d.activa : false, etiquetas: null, esCatalogo: true };
     }));
+    setAbiertaEtiquetas(null);
     setDirty(true); setMsg("");
   }
 
   const totalPos = filas.filter(f => f.activa).reduce((s, f) => s + (f.posiciones || 0), 0);
+  const rotacionesDisponibles = ["UCI A", "UCI B", "SEMIS", "REA", "UCCRI"];
 
-  // Agrupar visualmente por rotación (UCI, SEMIS, REA, UCCRI)
   return (
     <div className="estructura">
       <div className="editor-head">
         <div>
           <h2>Estructura de la unidad</h2>
           <p className="section-intro">
-            Marca qué unidades están abiertas esta semana y ajusta cuántas posiciones
-            (camas/enfermeras) tiene cada una. Se guarda y se reutiliza la próxima vez;
-            solo tienes que marcar o desmarcar según cómo esté la unidad.
+            Marca qué unidades están abiertas, ajusta sus posiciones, cambia su nombre si lo
+            necesitas, y edita la etiqueta de cada posición (por ejemplo «+ revisió carro»).
+            También puedes crear unidades nuevas. Todo se guarda para las próximas generaciones.
           </p>
         </div>
         <button className="linkbtn" onClick={onCerrar}>← Volver</button>
@@ -3864,32 +4535,78 @@ function EditorEstructura({ estructura, catalogo, porDefecto, saveEstructura, on
       <div className="est-card">
         <div className="est-row est-head-row">
           <span className="est-c-check">Abierta</span>
-          <span className="est-c-nombre">Unidad</span>
+          <span className="est-c-nombre">Unidad (nombre editable)</span>
           <span className="est-c-rot">Cuenta como</span>
           <span className="est-c-pos">Posiciones</span>
+          <span className="est-c-acciones"></span>
         </div>
         {filas.map(f => (
-          <div key={f.id} className={"est-row" + (f.activa ? "" : " inactiva")}>
-            <span className="est-c-check">
-              <button className={"chk " + (f.activa ? "on" : "")}
-                onClick={() => setActiva(f.id, !f.activa)}
-                aria-label={f.activa ? "Cerrar unidad" : "Abrir unidad"}>
-                {f.activa ? "✓" : ""}
-              </button>
-            </span>
-            <span className="est-c-nombre">{f.nombre}</span>
-            <span className="est-c-rot"><span className="rot-tag">{f.rotacion}</span></span>
-            <span className="est-c-pos">
-              <input type="number" min="0" max="12" value={f.posiciones}
-                disabled={!f.activa}
-                onChange={e => setPos(f.id, e.target.value)} />
-            </span>
-          </div>
+          <React.Fragment key={f.id}>
+            <div className={"est-row" + (f.activa ? "" : " inactiva")}>
+              <span className="est-c-check">
+                <button className={"chk " + (f.activa ? "on" : "")}
+                  onClick={() => setActiva(f.id, !f.activa)}
+                  aria-label={f.activa ? "Cerrar unidad" : "Abrir unidad"}>
+                  {f.activa ? "✓" : ""}
+                </button>
+              </span>
+              <span className="est-c-nombre">
+                <input className="est-nombre-input" value={f.nombre}
+                  onChange={e => setCampo(f.id, "nombre", e.target.value)} />
+              </span>
+              <span className="est-c-rot">
+                {f.esCatalogo
+                  ? <span className="rot-tag">{f.rotacion}</span>
+                  : <select className="rot-select" value={f.rotacion}
+                      onChange={e => setCampo(f.id, "rotacion", e.target.value)}>
+                      {rotacionesDisponibles.map(r => <option key={r}>{r}</option>)}
+                    </select>}
+              </span>
+              <span className="est-c-pos">
+                <input type="number" min="0" max="12" value={f.posiciones}
+                  disabled={!f.activa}
+                  onChange={e => setPos(f.id, e.target.value)} />
+              </span>
+              <span className="est-c-acciones">
+                <button className="minibtn" disabled={!f.activa || f.posiciones === 0}
+                  onClick={() => setAbiertaEtiquetas(abiertaEtiquetas === f.id ? null : f.id)}>
+                  {abiertaEtiquetas === f.id ? "Ocultar etiquetas" : "Etiquetas…"}
+                </button>
+                {!f.esCatalogo && (
+                  <button className="minibtn peligro" onClick={() => borrarUnidad(f.id)} title="Eliminar esta unidad">✕</button>
+                )}
+              </span>
+            </div>
+            {abiertaEtiquetas === f.id && f.activa && (
+              <div className="est-etiquetas">
+                <div className="est-et-hint">
+                  Texto que acompaña al número de cada posición (deja vacío si no lleva).
+                  Si quieres que el texto <strong>sustituya</strong> al número, empieza por «=»
+                  (p. ej. <code>=ATURADA+ICTUS+CARRO</code>).
+                </div>
+                {Array.from({ length: f.posiciones }, (_, i) => i + 1).map(pl => {
+                  const base = f.etiquetas || ENGINE.etiquetasPorDefectoDeArea(f.id, f.posiciones);
+                  return (
+                    <div key={pl} className="est-et-row">
+                      <span className="est-et-num">Posición {pl}</span>
+                      <input className="est-et-input" value={base[String(pl)] || ""}
+                        placeholder="(sin etiqueta)"
+                        onChange={e => setEtiqueta(f.id, pl, e.target.value)} />
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </React.Fragment>
         ))}
         <div className="est-total">
           <span>Total de posiciones abiertas</span>
           <strong>{totalPos}</strong>
         </div>
+      </div>
+
+      <div className="est-add">
+        <button className="minibtn" onClick={anadirUnidad}>+ Añadir unidad nueva</button>
       </div>
 
       {msg && msg !== "ok" && <div className="login-error" style={{ marginTop: 14 }}>{msg}</div>}
@@ -3904,9 +4621,9 @@ function EditorEstructura({ estructura, catalogo, porDefecto, saveEstructura, on
       </div>
 
       <p className="foot-hint" style={{ marginTop: 18 }}>
-        UCCRI Esquerra y UCCRI Dreta cuentan ambas como «UCCRI» para la rotación mensual:
-        a efectos de rotación da igual el lado. Puedes abrir solo una, las dos, o ninguna,
-        y poner en cada una el número de enfermeras que corresponda.
+        «Cuenta como» define el grupo de rotación y qué criterios pueden acceder: por ejemplo,
+        UCCRI Esquerra y Dreta cuentan ambas como «UCCRI». Las unidades nuevas usan el grupo
+        que elijas; su personal se rige por las mismas normas de acceso de ese grupo.
       </p>
     </div>
   );
@@ -4418,6 +5135,60 @@ td.data-cell:has(.nota-edit) { overflow: visible; }
 .vinc-status { font-size: 13px; color: var(--ink-soft); font-weight: 540; }
 .vinc-actions { display: flex; gap: 10px; }
 
+/* ---------- Importar rotación desde Excel ---------- */
+.importar { max-width: 820px; }
+.hist-head-acciones { display: flex; align-items: center; gap: 12px; }
+.imp-file { display: flex; flex-direction: column; gap: 3px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; margin-bottom: 14px; }
+.imp-file strong { font-size: 14px; color: var(--ink); }
+.imp-file span { font-size: 12px; color: var(--muted); }
+.imp-anio { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }
+.imp-anio label { font-size: 13px; font-weight: 560; color: var(--ink-soft); }
+.imp-anio input { width: 100px; padding: 7px 10px; border: 1px solid var(--line-strong); border-radius: 8px; font: inherit; font-size: 13px; text-align: center; background: var(--surface); color: var(--ink); }
+.imp-anio input:focus { outline: 2px solid var(--accent-wash); border-color: var(--accent); }
+.imp-hint { font-size: 12px; color: var(--muted); }
+.imp-resumen { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+.imp-dato { flex: 1; min-width: 150px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; box-shadow: var(--shadow); }
+.imp-dato strong { display: block; font-size: 22px; color: var(--accent-deep); line-height: 1.2; }
+.imp-dato span { font-size: 12px; color: var(--ink-soft); }
+.imp-meses { font-size: 13px; color: var(--ink-soft); background: var(--accent-wash); border-radius: 8px; padding: 10px 13px; margin-bottom: 18px; line-height: 1.5; }
+.imp-bloque { border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); padding: 16px; margin-bottom: 16px; box-shadow: var(--shadow); }
+.imp-bloque h3 { font-size: 14.5px; margin: 0 0 4px; color: var(--ink); }
+.imp-sub { font-size: 12.5px; color: var(--ink-soft); margin: 0 0 12px; line-height: 1.45; }
+.imp-vinc { display: grid; grid-template-columns: 200px 1fr 90px; gap: 10px; align-items: center; padding: 9px 0; border-top: 1px solid var(--line); }
+.imp-vinc.omitido { opacity: .55; }
+.imp-vinc-nom strong { font-size: 13.5px; color: var(--ink); display: block; }
+.imp-vinc-meta { font-size: 11.5px; color: var(--muted); }
+.imp-omitido-txt { font-size: 12.5px; color: var(--muted); font-style: italic; }
+.imp-raras { margin: 0; padding-left: 18px; font-size: 12.5px; color: var(--ink-soft); line-height: 1.6; }
+@media (max-width: 700px) { .imp-vinc { grid-template-columns: 1fr; } }
+
+/* ---------- Editor de reglas de rotación ---------- */
+.reglas { max-width: 760px; }
+.reglas-list { display: flex; flex-direction: column; gap: 10px; margin-bottom: 18px; }
+.regla-card { display: flex; gap: 14px; align-items: flex-start; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); padding: 14px 16px; box-shadow: var(--shadow); transition: border-color .15s; }
+.regla-card.on { border-color: var(--accent); }
+.regla-card.dep-off { opacity: .55; }
+.regla-txt { flex: 1; }
+.regla-titulo { font-size: 14.5px; font-weight: 640; color: var(--ink); margin-bottom: 3px; }
+.regla-desc { font-size: 12.8px; color: var(--ink-soft); line-height: 1.45; }
+.regla-aviso { font-size: 12px; color: #a2652a; margin-top: 5px; font-style: italic; }
+.chk.grande { width: 26px; height: 26px; min-width: 26px; font-size: 15px; margin-top: 2px; }
+
+/* ---------- Editor de estructura ampliado ---------- */
+.est-nombre-input { width: 100%; padding: 6px 9px; border: 1px solid var(--line-strong); border-radius: 7px; font: inherit; font-size: 13px; background: var(--surface); color: var(--ink); }
+.est-nombre-input:focus { outline: 2px solid var(--accent-wash); border-color: var(--accent); }
+.rot-select { padding: 5px 8px; border: 1px solid var(--line-strong); border-radius: 7px; font: inherit; font-size: 12.5px; background: var(--surface); }
+.est-c-acciones { display: flex; gap: 6px; align-items: center; justify-content: flex-end; min-width: 150px; }
+.minibtn.peligro { color: #b3402f; border-color: #e0b7af; }
+.minibtn.peligro:hover { background: #fbeeeb; }
+.est-etiquetas { grid-column: 1 / -1; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; margin: 2px 0 10px; }
+.est-et-hint { font-size: 12px; color: var(--ink-soft); margin-bottom: 10px; line-height: 1.5; }
+.est-et-hint code { background: var(--surface); padding: 1px 5px; border-radius: 4px; border: 1px solid var(--line); }
+.est-et-row { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+.est-et-num { min-width: 88px; font-size: 12.5px; color: var(--ink-soft); font-weight: 540; }
+.est-et-input { flex: 1; padding: 6px 9px; border: 1px solid var(--line-strong); border-radius: 7px; font: inherit; font-size: 12.5px; background: var(--surface); }
+.est-add { margin-top: 12px; }
+
 /* Buscador con autocompletado */
 .buscador { position: relative; }
 .buscador-input { width: 100%; padding: 9px 32px 9px 12px; border: 1px solid var(--line-strong); border-radius: 8px; font: inherit; font-size: 13px; background: var(--surface); color: var(--ink); }
@@ -4665,7 +5436,7 @@ td.data-cell:has(.nota-edit) { overflow: visible; }
 /* ---------- Editor de estructura ---------- */
 .estructura { max-width: 720px; }
 .est-card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; box-shadow: var(--shadow); }
-.est-row { display: grid; grid-template-columns: 78px 1fr 110px 110px; align-items: center; gap: 10px; padding: 11px 16px; border-bottom: 1px solid var(--line); }
+.est-row { display: grid; grid-template-columns: 78px 1fr 120px 90px 160px; align-items: center; gap: 10px; padding: 11px 16px; border-bottom: 1px solid var(--line); }
 .est-row:last-of-type { border-bottom: none; }
 .est-head-row { background: var(--panel); font-size: 11.5px; font-weight: 620; color: var(--ink-soft); letter-spacing: .02em; text-transform: uppercase; }
 .est-head-row span { font-size: 11px; }
