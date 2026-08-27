@@ -194,6 +194,30 @@ export async function borrarHistoricoDeMeses(meses) {
   if (error) throw error;
 }
 
+/* ---------- Reglas de rotación (configuración compartida) ----------
+   Se guardan como una fila única en config_unidad, clave "reglas_rotacion",
+   valor JSON { regla: true/false }.
+*/
+export async function cargarReglas() {
+  const { data, error } = await supabase
+    .from("config_unidad")
+    .select("valor")
+    .eq("clave", "reglas_rotacion")
+    .maybeSingle();
+  if (error) throw error;
+  if (!data || !data.valor) return null;
+  try { return typeof data.valor === "string" ? JSON.parse(data.valor) : data.valor; }
+  catch { return null; }
+}
+
+export async function guardarReglas(reglas) {
+  const valor = JSON.stringify(reglas || {});
+  const { error } = await supabase
+    .from("config_unidad")
+    .upsert({ clave: "reglas_rotacion", valor }, { onConflict: "clave" });
+  if (error) throw error;
+}
+
 /* ---------- Estructura de la unidad (configuración compartida) ----------
    Se guarda como una fila única (clave fija) en la tabla "config_unidad".
    El valor es un JSON con la lista de áreas y sus posiciones.
