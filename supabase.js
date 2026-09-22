@@ -83,7 +83,7 @@ export async function cargarProfesionales() {
   // (no se ha ejecutado el SQL), se vuelve a leer sin ella y se deduce del turno.
   let { data, error } = await supabase
     .from("profesionales")
-    .select("nombre, apodo, turno, criterio, suplente, antiguedad, fondo")
+    .select("nombre, apodo, turno, criterio, suplente, antiguedad, fondo, antiguo")
     .order("nombre", { ascending: true });
   if (error) {
     const r2 = await supabase
@@ -93,7 +93,7 @@ export async function cargarProfesionales() {
     if (r2.error) throw r2.error;
     data = r2.data;
   }
-  return (data || []).map(p => ({ ...p, fondo: p.fondo || fondoSegunTurno(p.turno) }));
+  return (data || []).map(p => ({ ...p, fondo: p.fondo || fondoSegunTurno(p.turno), antiguo: p.antiguo || "No" }));
 }
 
 // Reemplaza por completo la plantilla: borra todo y vuelve a insertar.
@@ -110,6 +110,7 @@ export async function guardarProfesionales(profs) {
       suplente: p.suplente || "No",
       antiguedad: p.antiguedad || "< 3 ANY",
       fondo: p.fondo || fondoSegunTurno(p.turno),
+      antiguo: p.antiguo || "No",
     }));
 
   // 1. Borrar TODOS los registros existentes.
@@ -126,13 +127,13 @@ export async function guardarProfesionales(profs) {
   let sinFondo = false;
   for (let i = 0; i < limpio.length; i += LOTE) {
     let trozo = limpio.slice(i, i + LOTE);
-    if (sinFondo) trozo = trozo.map(({ fondo, ...resto }) => resto);
+    if (sinFondo) trozo = trozo.map(({ fondo, antiguo, ...resto }) => resto);
     let { error } = await supabase.from("profesionales").insert(trozo);
-    if (error && !sinFondo && /fondo/i.test(error.message || "")) {
+    if (error && !sinFondo && /fondo|antiguo/i.test(error.message || "")) {
       sinFondo = true;
       const reintento = await supabase
         .from("profesionales")
-        .insert(trozo.map(({ fondo, ...resto }) => resto));
+        .insert(trozo.map(({ fondo, antiguo, ...resto }) => resto));
       error = reintento.error;
     }
     if (error) {
@@ -214,8 +215,22 @@ export async function vaciarHistorico() {
   if (error) throw error;
 }
 
+// Borra del histórico las filas de un RANGO de días (por fecha_serial, ambos
+// extremos incluidos). Es lo que se usa al guardar un cuadrante: se reemplazan
+// exactamente las semanas generadas, sin tocar el resto del mes. Borrar por mes
+// entero haría perder las semanas de ese mes que no se estén regenerando.
+export async function borrarHistoricoDeRango(desdeSerial, hastaSerial) {
+  if (desdeSerial == null || hastaSerial == null) return;
+  const { error } = await supabase
+    .from("historico")
+    .delete()
+    .gte("fecha_serial", desdeSerial)
+    .lte("fecha_serial", hastaSerial);
+  if (error) throw error;
+}
+
 // Borra del histórico las filas de los meses indicados (p.ej. ["2025-11"]).
-// Se usa al regenerar un mes ya guardado, para reemplazarlo sin duplicar.
+// Se usa al importar el registro de rotación, que sí va por meses completos.
 export async function borrarHistoricoDeMeses(meses) {
   if (!meses || meses.length === 0) return;
   const { error } = await supabase.from("historico").delete().in("mes", meses);
