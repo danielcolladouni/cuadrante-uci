@@ -71,13 +71,29 @@ export function escucharRecuperacion(callback) {
    La app usa registros con forma { nombre, turno, apodo, criterio,
    suplente, antiguedad }. La tabla usa esas mismas columnas + id.
 */
+// Deduce el color de fondo a partir del turno (TM/TT/TN -> Blanco, 12H -> Lila).
+// Se usa como valor por defecto cuando la columna "fondo" aún no existe en la
+// base o está vacía, para que la app funcione igual antes y después de añadirla.
+function fondoSegunTurno(turno) {
+  return String(turno || "").indexOf("12") >= 0 ? "Lila" : "Blanco";
+}
+
 export async function cargarProfesionales() {
-  const { data, error } = await supabase
+  // Se intenta leer la columna "fondo"; si todavía no existe en la base
+  // (no se ha ejecutado el SQL), se vuelve a leer sin ella y se deduce del turno.
+  let { data, error } = await supabase
     .from("profesionales")
-    .select("nombre, apodo, turno, criterio, suplente, antiguedad")
+    .select("nombre, apodo, turno, criterio, suplente, antiguedad, fondo, antiguo")
     .order("nombre", { ascending: true });
-  if (error) throw error;
-  return data || [];
+  if (error) {
+    const r2 = await supabase
+      .from("profesionales")
+      .select("nombre, apodo, turno, criterio, suplente, antiguedad")
+      .order("nombre", { ascending: true });
+    if (r2.error) throw r2.error;
+    data = r2.data;
+  }
+  return (data || []).map(p => ({ ...p, fondo: p.fondo || fondoSegunTurno(p.turno), antiguo: p.antiguo || "No" }));
 }
 
 // Reemplaza por completo la plantilla: borra todo y vuelve a insertar.
@@ -93,6 +109,8 @@ export async function guardarProfesionales(profs) {
       criterio: p.criterio || "SI",
       suplente: p.suplente || "No",
       antiguedad: p.antiguedad || "< 3 ANY",
+      fondo: p.fondo || fondoSegunTurno(p.turno),
+      antiguo: p.antiguo || "No",
     }));
 
   // 1. Borrar TODOS los registros existentes.
@@ -104,9 +122,20 @@ export async function guardarProfesionales(profs) {
 
   // 2. Insertar por lotes (evita problemas con inserciones grandes de una vez).
   const LOTE = 100;
+  // Si la columna "fondo" todavía no existe en la base, se reintenta sin ella
+  // (así la app sigue funcionando hasta que se ejecute el SQL que la añade).
+  let sinFondo = false;
   for (let i = 0; i < limpio.length; i += LOTE) {
-    const trozo = limpio.slice(i, i + LOTE);
-    const { error } = await supabase.from("profesionales").insert(trozo);
+    let trozo = limpio.slice(i, i + LOTE);
+    if (sinFondo) trozo = trozo.map(({ fondo, antiguo, ...resto }) => resto);
+    let { error } = await supabase.from("profesionales").insert(trozo);
+    if (error && !sinFondo && /fondo|antiguo/i.test(error.message || "")) {
+      sinFondo = true;
+      const reintento = await supabase
+        .from("profesionales")
+        .insert(trozo.map(({ fondo, antiguo, ...resto }) => resto));
+      error = reintento.error;
+    }
     if (error) {
       throw new Error(
         `Error al guardar profesionales (lote desde el nº ${i + 1}): ${error.message}`
@@ -186,8 +215,22 @@ export async function vaciarHistorico() {
   if (error) throw error;
 }
 
+// Borra del histórico las filas de un RANGO de días (por fecha_serial, ambos
+// extremos incluidos). Es lo que se usa al guardar un cuadrante: se reemplazan
+// exactamente las semanas generadas, sin tocar el resto del mes. Borrar por mes
+// entero haría perder las semanas de ese mes que no se estén regenerando.
+export async function borrarHistoricoDeRango(desdeSerial, hastaSerial) {
+  if (desdeSerial == null || hastaSerial == null) return;
+  const { error } = await supabase
+    .from("historico")
+    .delete()
+    .gte("fecha_serial", desdeSerial)
+    .lte("fecha_serial", hastaSerial);
+  if (error) throw error;
+}
+
 // Borra del histórico las filas de los meses indicados (p.ej. ["2025-11"]).
-// Se usa al regenerar un mes ya guardado, para reemplazarlo sin duplicar.
+// Se usa al importar el registro de rotación, que sí va por meses completos.
 export async function borrarHistoricoDeMeses(meses) {
   if (!meses || meses.length === 0) return;
   const { error } = await supabase.from("historico").delete().in("mes", meses);

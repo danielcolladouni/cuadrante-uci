@@ -4,7 +4,7 @@ import {
   iniciarSesion, cerrarSesion, sesionActual, onCambioSesion,
   cambiarPassword, recuperarPassword, apodoDeSesion, cambiarApodo, escucharRecuperacion,
   cargarProfesionales, guardarProfesionales,
-  cargarHistorico, añadirAlHistorico, vaciarHistorico, borrarHistoricoDeMeses,
+  cargarHistorico, añadirAlHistorico, vaciarHistorico, borrarHistoricoDeMeses, borrarHistoricoDeRango,
   cargarEstructura, guardarEstructura,
   cargarAnotaciones, guardarAnotaciones,
   cargarAlias, guardarAliasTodos,
@@ -240,6 +240,7 @@ const REGLAS_DEFECTO = {
   evitarPosicionSemanaAnterior: true, // dentro de la unidad, no repetir posición de la semana previa
   excedentesEquilibrados: true,   // repartir excedentes equilibrando el ciclo UCCRI→REA→SEMIS→UCI A→UCI B
   excedentesPrioridadSuplentes: true, // a excedente van antes los suplentes y los fijos menos antiguos
+  antiguosPosicionFija: true,     // los marcados "Antiguo/a" no se mueven de sitio en toda la semana
 };
 // Descripciones para la interfaz (título + explicación en lenguaje llano).
 const REGLAS_INFO = [
@@ -257,6 +258,8 @@ const REGLAS_INFO = [
     desc: "Dentro de la misma unidad, se intenta no asignar exactamente la misma posición (cama) que la semana pasada.", dependeDe: null },
   { clave: "excedentesEquilibrados", titulo: "Excedentes repartidos en ciclo equilibrado",
     desc: "Cuando sobra personal, los excedentes se reparten completando una vuelta del ciclo UCCRI → REA → SEMIS → UCI A → UCI B antes de poner un segundo en ninguna unidad. Si se desactiva, se reparten en orden simple.", dependeDe: null },
+  { clave: "antiguosPosicionFija", titulo: "Antiguos/as con posición fija",
+    desc: "Las personas marcadas como «Antiguo/a» en la plantilla tienen prioridad absoluta: no cambian de sitio en toda la semana, se quedan en la misma unidad todo el mes, y cada semana avanzan una posición dentro de esa unidad (al llegar a la última, vuelven a la primera). Al mes siguiente rotan de unidad como todo el mundo.", dependeDe: null },
   { clave: "excedentesPrioridadSuplentes", titulo: "A excedente: primero suplentes, luego por antigüedad",
     desc: "Cuando sobra gente, van a posiciones de excedente primero los suplentes y después los fijos de menor antigüedad; los más antiguos conservan posición real.", dependeDe: null },
 ];
@@ -536,6 +539,31 @@ function parsearAntiguedad(texto) {
   return 1;
 }
 
+/* ---------- FONDO de las celdas (color por profesional) ----------
+   Cada profesional tiene un color de fondo fijo en el cuadrante: LILA o BLANCO.
+   Por defecto se deduce de su turno habitual (12H Día / 12H Noche -> Lila;
+   TM / TT / TN -> Blanco), pero la coordinadora puede cambiarlo a mano desde
+   la plantilla, porque hay casos que no siguen la regla.
+*/
+const FONDO = { LILA: "Lila", BLANCO: "Blanco" };
+const COLOR_LILA = "#D2BEE6";
+const COLOR_BLANCO = "#FFFFFF";
+
+function normalizarFondo(v) {
+  const t = normalizarTexto(v);
+  if (!t) return "";
+  if (t.indexOf("LILA") >= 0 || t.indexOf("MORAD") >= 0 || t.indexOf("VIOLET") >= 0) return FONDO.LILA;
+  if (t.indexOf("BLANC") >= 0) return FONDO.BLANCO;
+  return "";
+}
+// Fondo que corresponde por defecto a un turno habitual.
+function fondoPorDefectoDeTurno(turno) {
+  const t = normalizarTexto(turno);
+  // 12H Día, 12H Noche, o cualquier texto que hable de 12 h -> lila
+  if (t.indexOf("12") >= 0) return FONDO.LILA;
+  return FONDO.BLANCO;           // TM, TT, TN y el resto -> blanco
+}
+
 class ProfesionalesDB {
   constructor(rows, aliasRows) {
     // rows: array de objetos {nombre,turno,apodo,criterio,suplente,antiguedad}
@@ -550,8 +578,14 @@ class ProfesionalesDB {
         apodo: String(r.apodo || "").trim(),
         criterio: normalizarCriterio(r.criterio),
         esSuplente: String(r.suplente || "").toUpperCase().trim() === "SI",
+        // "Antiguo/a": posición fija durante toda la semana, misma unidad todo el
+        // mes, y una posición más cada semana dentro de esa unidad.
+        esAntiguo: String(r.antiguo || "").toUpperCase().trim() === "SI",
         textoAntiguedad: String(r.antiguedad || "").trim(),
         antiguedad: parsearAntiguedad(r.antiguedad),
+        // Color de fondo de sus celdas en el cuadrante. Si no viene guardado,
+        // se deduce del turno habitual (12h -> lila; 7h/10h -> blanco).
+        fondo: normalizarFondo(r.fondo) || fondoPorDefectoDeTurno(r.turno),
       };
       this.list.push(p);
       this.byNorm.set(p.nombreNorm, p);
@@ -571,6 +605,7 @@ class ProfesionalesDB {
   get(nombre) { return this.byNorm.get(normalizarTexto(nombre)) || null; }
   criterio(nombre) { const p = this.get(nombre); return p ? p.criterio : CRIT.SI; }
   esSuplente(nombre) { const p = this.get(nombre); return p ? p.esSuplente : false; }
+  esAntiguo(nombre) { const p = this.get(nombre); return p ? p.esAntiguo : false; }
   antiguedad(nombre) { const p = this.get(nombre); return p ? p.antiguedad : 1; }
   turnoHabitual(nombre) { const p = this.get(nombre); return p ? p.turnoHabitual : ""; }
   score(nombre) {
@@ -586,6 +621,13 @@ class ProfesionalesDB {
     const p = this.get(nombre);
     if (p && p.apodo) return p.apodo;
     return nombre;
+  }
+  // Color de fondo de las celdas de este profesional ("Lila" | "Blanco").
+  // Si el nombre no está en la base, devuelve "" para que quien llame decida
+  // (se usa entonces el tipo de jornada de ese día, como antes).
+  fondo(nombre) {
+    const p = this.get(nombre);
+    return p ? (p.fondo || fondoPorDefectoDeTurno(p.turnoHabitual)) : "";
   }
   // --- Resolución de nombres (M01 ResolverNombreCompleto) ---
   resolverNombre(texto) {
@@ -1217,6 +1259,45 @@ function intentarAsignarPos(e, ocDia, ocNoche, db, historico, fechaLunes, repart
   return posElegida;
 }
 
+/* ---------- ANTIGUOS/AS: posición fija y rotación de posición semanal ----------
+   Reglas (tienen prioridad absoluta sobre todo lo demás):
+   - Durante la semana NO cambian de ubicación: se les da una posición estable y
+     la ocupan todos los días que trabajan.
+   - Durante el MES no cambian de unidad.
+   - Cada semana avanzan UNA posición dentro de su unidad; al pasar la última,
+     vuelven a la primera.
+   - Al mes siguiente rotan de unidad con las reglas normales.
+*/
+// Posición GLOBAL que le toca a un antiguo esta semana dentro de `unidad`.
+// Se apoya en el histórico: si la semana pasada (del mismo mes) ocupaba una
+// posición de esa unidad, le toca la siguiente; si no, la primera libre.
+// ocupadas = array de booleanos de posiciones ya cogidas en este bloque.
+function posicionAntiguoEstaSemana(historico, nombre, unidad, fechaLunes, ocupadas) {
+  const ini = posGlobalInicioArea(unidad);
+  const fin = posGlobalFinArea(unidad);
+  if (ini <= 0 || fin < ini) return 0;
+  const nPos = fin - ini + 1;
+
+  // ¿Es la primera semana del mes? Entonces empieza ciclo nuevo.
+  const lunesPrevio = addDays(fechaLunes, -7);
+  const mismoMes = mesKey(lunesPrevio) === mesKey(fechaLunes);
+
+  let posPrevia = 0;
+  if (mismoMes) posPrevia = posicionSemanaAnterior(historico, nombre, fechaLunes, unidad);
+
+  if (posPrevia >= ini && posPrevia <= fin) {
+    // Avanzar una posición dentro de la unidad, ciclando
+    const localPrev = posPrevia - ini;            // 0..nPos-1
+    for (let salto = 1; salto <= nPos; salto++) {
+      const cand = ini + ((localPrev + salto) % nPos);
+      if (!ocupadas[cand]) return cand;
+    }
+  }
+  // Sin referencia previa (o todas cogidas): la primera libre de la unidad
+  for (let p = ini; p <= fin; p++) if (!ocupadas[p]) return p;
+  return 0;
+}
+
 function asignarEstables(estad, db, historico, fechaLunes) {
   const ocDia = new Array(NPOS_TOTAL_actual() + 1).fill(false);
   const ocNoche = new Array(NPOS_TOTAL_actual() + 1).fill(false);
@@ -1227,6 +1308,52 @@ function asignarEstables(estad, db, historico, fechaLunes) {
   const reparto = calcularRepartoMes(estad, db, historico, fechaLunes);
 
   const pushAsign = (e, pos) => asignEst.push({ nombreNorm: normalizarTexto(e.nombre), posGlobal: pos, bloque: e.bloqueDominante });
+
+  // PASADA 0 — ANTIGUOS/AS (prioridad absoluta, antes que nadie).
+  // Se les fija la unidad del mes y la posición que les toca esta semana.
+  if (_REGLAS.antiguosPosicionFija) {
+    const antiguos = [];
+    for (let i = 0; i < estad.length; i++) {
+      if (ya[i] || !db.esAntiguo(estad[i].nombre)) continue;
+      antiguos.push(i);
+    }
+    // Orden estable: más antigüedad primero, y a igualdad por nombre, para que
+    // el reparto de posiciones no baile entre generaciones.
+    antiguos.sort((a, b) => {
+      const d = db.antiguedad(estad[b].nombre) - db.antiguedad(estad[a].nombre);
+      if (d !== 0) return d;
+      return String(estad[a].nombre).localeCompare(String(estad[b].nombre), "es");
+    });
+    for (const i of antiguos) {
+      const e = estad[i];
+      const esNoche = esBloqueNoche(e.bloqueDominante);
+      const ocupadas = esNoche ? ocNoche : ocDia;
+      const crit = db.criterio(e.nombre);
+      // Unidad del mes: la que ya tenga este mes; si no, la del reparto/rotación.
+      let unidad = unidadDelMesActual(historico, e.nombre, fechaLunes);
+      if (!unidad || !puedeIrAArea(crit, unidad)) {
+        unidad = reparto.get((esNoche ? "N|" : "D|") + normalizarTexto(e.nombre)) || "";
+      }
+      if (!unidad || !puedeIrAArea(crit, unidad)) {
+        unidad = unidadRotacionObligatoria(historico, e.nombre, crit, db.esSuplente(e.nombre), fechaLunes);
+      }
+      if (!unidad || !puedeIrAArea(crit, unidad)) {
+        const cand = unidadesCandidatasProf(crit).filter(u => unidadesAbiertasRotacion().includes(u));
+        unidad = cand[0] || "";
+      }
+      let pos = unidad ? posicionAntiguoEstaSemana(historico, e.nombre, unidad, fechaLunes, ocupadas) : 0;
+      // Si su unidad está completa, se le busca sitio en otra que su criterio permita
+      if (pos === 0) {
+        for (const u of listaAreasOrdenadas()) {
+          if (!puedeIrAArea(crit, u)) continue;
+          pos = posicionAntiguoEstaSemana(historico, e.nombre, u, fechaLunes, ocupadas);
+          if (pos > 0) break;
+        }
+      }
+      if (pos > 0) ocupadas[pos] = true;
+      pushAsign(e, pos); ya[i] = true;
+    }
+  }
 
   // Pasada 1: 12HD y 12HN no-suplentes
   for (let i = 0; i < estad.length; i++) {
@@ -1391,6 +1518,45 @@ function colocarEnDiaTurno(asig, d, turnos, nombre, db, posPreferida, unidadRot)
   }
 }
 
+/* Pasada FINAL para los antiguos/as: después de los ajustes de dobles de 12 h y
+   de parciales, alguien puede haberlos desplazado de su posición. Aquí se les
+   devuelve a su sitio de forma garantizada (intercambiando con quien lo ocupe,
+   para no descolocar al resto). Es lo que hace que la regla sea "sí o sí". */
+function reafirmarAntiguos(asig, semana, db, asignEst) {
+  if (!_REGLAS.antiguosPosicionFija) return;
+  const nPos = NPOS_TOTAL_actual();
+  for (const a of asignEst) {
+    if (!a || a.posGlobal <= 0) continue;
+    const reg0 = { nombreNorm: a.nombreNorm };
+    // ¿es antiguo? buscamos su nombre real en los registros de la semana
+    let nombreReal = "";
+    for (let d = 0; d < 7 && !nombreReal; d++)
+      for (const r of semana[d].regs)
+        if (normalizarTexto(r.nombre) === a.nombreNorm) { nombreReal = r.nombre; break; }
+    if (!nombreReal || !db.esAntiguo(nombreReal)) continue;
+
+    const P = a.posGlobal;
+    for (let d = 0; d < 7; d++) {
+      // ¿trabaja este día?
+      const trabaja = semana[d].regs.some(r => normalizarTexto(r.nombre) === a.nombreNorm);
+      if (!trabaja) continue;
+      for (let t = 0; t < 3; t++) {
+        // ¿dónde está ahora en este turno?
+        let posActual = 0;
+        for (let p = 1; p <= nPos; p++) {
+          const n = asig.celdas[d][t][p];
+          if (n && normalizarTexto(n) === a.nombreNorm) { posActual = p; break; }
+        }
+        if (posActual === 0) continue;   // no está en este turno: nada que hacer
+        if (posActual === P) continue;   // ya está en su sitio
+        const otro = asig.celdas[d][t][P];
+        asig.celdas[d][t][P] = nombreReal;
+        asig.celdas[d][t][posActual] = otro || "";   // intercambio limpio
+      }
+    }
+  }
+}
+
 function construirAsignacionSemanal(planilla, db, historico, fechaLunes) {
   const asig = nuevaMatriz();
   asig.fechaLunes = fechaLunes;
@@ -1399,7 +1565,7 @@ function construirAsignacionSemanal(planilla, db, historico, fechaLunes) {
   const { asignEst, reparto } = asignarEstables(estad, db, historico, fechaLunes);
   aplicarEstablesAdiaPorDia(semana, asignEst, asig);
   rellenarHuecosYExcedentes(semana, asignEst, asig, db, historico, fechaLunes, reparto);
-  return { asig, semana, estad };
+  return { asig, semana, estad, asignEst };
 }
 
 
@@ -1917,9 +2083,11 @@ function generarCronograma(planilla, db, historicoInicial, fechaLunesInicio, num
   const semanas = [];
   for (let s = 0; s < numSemanas; s++) {
     const fechaLunes = addDays(fechaLunesInicio, s * 7);
-    const { asig, semana, estad } = construirAsignacionSemanal(planilla, db, historico, fechaLunes);
+    const { asig, semana, estad, asignEst } = construirAsignacionSemanal(planilla, db, historico, fechaLunes);
     ajustarTurnosDobles(asig, planilla, db);
     ajustarParciales(asig, planilla, db);
+    // Los antiguos/as vuelven a su posición si algún ajuste los ha desplazado
+    reafirmarAntiguos(asig, semana, db, asignEst);
     const avisos = construirAvisosDecalaje(asig, planilla, db);
     const filasHist = filasHistoricoDeSemana(asig);
     historico = historico.concat(filasHist); // acumular para que la siguiente rote
@@ -2227,8 +2395,15 @@ function _gridSemana(sem, db, ENGINE, S, areasLayout) {
             const et = etiqMap[d].get(ENGINE.normalizarTexto(nombre));
             const suf = et === "doblaje" ? " (DBL)" : et === "+" ? " (+)" : et === "parcial" ? " (½)" : "";
             let estilo;
-            if (tf === ENGINE.TURNO.D12 || tf === ENGINE.TURNO.N12 || tf === ENGINE.TURNO.DOBLAJE) estilo = S.cNit; // 12h día/noche/doblaje -> lila
-            else estilo = S.cBlanco;                                  // 7h, 10h, parcial -> blanco
+            const fondoProf = db.fondo(nombre);
+            if (fondoProf) {
+              // El color lo manda el FONDO del profesional (configurable en la plantilla)
+              estilo = fondoProf === ENGINE.FONDO.LILA ? S.cNit : S.cBlanco;
+            } else if (tf === ENGINE.TURNO.D12 || tf === ENGINE.TURNO.N12 || tf === ENGINE.TURNO.DOBLAJE) {
+              estilo = S.cNit;   // no está en la base: 12h/doblaje -> lila
+            } else {
+              estilo = S.cBlanco; // no está en la base: 7h, 10h, parcial -> blanco
+            }
             row.push({ v: db.apodo(nombre) + suf, s: estilo, t: "s" });
           }
         }
@@ -2249,7 +2424,11 @@ function _gridSemana(sem, db, ENGINE, S, areasLayout) {
           for (let d = 0; d < 7; d++) {
             const lista = (sem.asig.excedentes[d * 3 + b.idx] || []).filter(x => x.area === area.rotacion);
             const ex = lista[e];
-            if (ex) row.push({ v: db.apodo(ex.nombre), s: S.cBlanco, t: "s" });
+            if (ex) {
+              // El excedente lleva el MISMO fondo que tendría en una posición real
+              const fEx = db.fondo(ex.nombre);
+              row.push({ v: db.apodo(ex.nombre), s: fEx === ENGINE.FONDO.LILA ? S.cNit : S.cBlanco, t: "s" });
+            }
             else row.push({ v: "", s: S.cBlanco }); // excedente vacío -> blanco (no es ubicación real)
           }
           grid.push(row);
@@ -2377,6 +2556,7 @@ function exportarCronogramaXLSX(resultado, db, ENGINE) {
     TURNO, COLOR, AREA, CRIT, NPOS_TOTAL_actual,
     CATALOGO_AREAS, estructuraPorDefecto, fijarEstructura, estructuraActiva,
     etiquetaFijaPosicion, etiquetaDePosicion, etiquetasPorDefectoDeArea,
+    FONDO, COLOR_LILA, COLOR_BLANCO, fondoPorDefectoDeTurno, normalizarFondo,
     REGLAS_DEFECTO, REGLAS_INFO, fijarReglas, reglasActivas,
     normalizarTexto, colorPorTurno, fechaCorta, mesKey, addDays, weekdayMonday,
     posGlobalAArea, nombreAreaCortoDePosGlobal,
@@ -2440,7 +2620,10 @@ function leerProfesionales(workbook) {
     const g = (c) => { const cell = ws[XLSX.utils.encode_cell({ r, c })]; return cell ? cell.v : ""; };
     const nombre = g(0);
     if (!nombre || !String(nombre).trim()) continue;
-    out.push({ nombre, turno: g(1), apodo: g(2), criterio: g(3), suplente: g(4), antiguedad: g(5) });
+    // Cols G y H (índices 6 y 7) opcionales: color de fondo y marca de Antiguo/a.
+    // Si no vienen, el fondo se deduce del turno y Antiguo/a queda en "No".
+    out.push({ nombre, turno: g(1), apodo: g(2), criterio: g(3), suplente: g(4),
+               antiguedad: g(5), fondo: g(6), antiguo: g(7) });
   }
   return out;
 }
@@ -2545,6 +2728,7 @@ export default function App() {
   const [resultado, setResultado] = useState(null);
   const [nombresSinVincular, setNombresSinVincular] = useState(null);
   const [importRot, setImportRot] = useState(null); // {hojas, fileName} del libro de rotaciones
+  const [histGuardado, setHistGuardado] = useState(null); // aviso "guardado en el histórico"
   const [semanaActiva, setSemanaActiva] = useState(0);
   const [vista, setVista] = useState("inicio"); // inicio | cronograma | decalajes | informe | profesionales | editor
   const [error, setError] = useState("");
@@ -2715,6 +2899,10 @@ export default function App() {
         setResultado(out);
         setSemanaActiva(0);
         setVista("cronograma");
+        // Volcado AUTOMÁTICO al histórico: el cuadrante generado queda registrado
+        // sin depender de que nadie pulse un botón. Reemplaza exactamente las
+        // semanas generadas, así que regenerar no duplica ni pierde nada.
+        guardarEnHistorico(out, true);
       } catch (err) {
         setError("Error al generar: " + err.message);
         console.error(err);
@@ -2750,24 +2938,32 @@ export default function App() {
     }
   }
 
-  async function guardarEnHistorico() {
-    if (!resultado) return;
-    setError("");
-    const nuevasFilas = resultado.semanas.flatMap(s => ENGINE.filasHistoricoDeSemana(s.asig));
-    // Meses que abarca lo que se va a guardar
-    const meses = new Set(nuevasFilas.map(f => f.mes));
+  /* Guarda en el histórico las semanas del cuadrante que hay en pantalla.
+     Reemplaza EXACTAMENTE el rango de días generado (no el mes entero), para
+     no borrar semanas del mismo mes que no se estén regenerando.
+     `silencioso` = se llama solo tras generar; no molesta con mensajes de éxito. */
+  async function guardarEnHistorico(resultadoOpc, silencioso) {
+    const res = resultadoOpc || resultado;
+    if (!res) return false;
+    if (!silencioso) setError("");
+    const nuevasFilas = res.semanas.flatMap(s => ENGINE.filasHistoricoDeSemana(s.asig));
+    if (nuevasFilas.length === 0) return false;
+    // Rango de días que abarca lo generado (primer día ... último día)
+    let minS = Infinity, maxS = -Infinity;
+    for (const f of nuevasFilas) {
+      if (f.fechaSerial < minS) minS = f.fechaSerial;
+      if (f.fechaSerial > maxS) maxS = f.fechaSerial;
+    }
     try {
-      // Si ya había filas guardadas de esos meses (p.ej. regeneración), se borran
-      // primero para que el guardado las reemplace y no se dupliquen.
-      const yaDeEsosMeses = (historico || []).some(h => meses.has(h.mes));
-      if (yaDeEsosMeses) {
-        await borrarHistoricoDeMeses([...meses]);
-      }
+      await borrarHistoricoDeRango(minS, maxS);
       await añadirAlHistorico(nuevasFilas);
-      const historicoLimpio = (historico || []).filter(h => !meses.has(h.mes));
-      setHistorico(historicoLimpio.concat(nuevasFilas));
+      const resto = (historico || []).filter(h => h.fechaSerial < minS || h.fechaSerial > maxS);
+      setHistorico(resto.concat(nuevasFilas));
+      setHistGuardado({ n: nuevasFilas.length, cuando: Date.now() });
+      return true;
     } catch (err) {
       setError("No se pudo guardar el histórico: " + err.message);
+      return false;
     }
   }
   async function limpiarHistorico() {
@@ -2935,6 +3131,12 @@ export default function App() {
 
         <main className="main">
           {error && <div className="error">{error}</div>}
+          {histGuardado && vista === "cronograma" && (
+            <div className="saved-note" style={{ marginBottom: 14 }}>
+              Cuadrante registrado en el histórico de rotación automáticamente
+              ({histGuardado.n} registros). Lo ven todas las personas que entran en la web.
+            </div>
+          )}
 
           {vista === "estructura" && (
             <EditorEstructura
@@ -3444,11 +3646,11 @@ function Sidebar(props) {
         </button>
         <p className="hint">
           {historicoLen > 0
-            ? "Unidad de cada profesional mes a mes. Guarda los cuadrantes que generes para alimentarlo."
-            : "Aún no hay histórico. Genera un cuadrante y pulsa «Guardar en histórico» para registrar la rotación."}
+            ? "Unidad de cada profesional mes a mes. Cada cuadrante que generas se registra aquí automáticamente."
+            : "Aún no hay histórico. En cuanto generes un cuadrante, la rotación se registra aquí automáticamente."}
         </p>
         <div className="row-btns">
-          <button className="minibtn" disabled={!resultado} onClick={guardarEnHistorico}>Guardar en histórico</button>
+          <button className="minibtn" disabled={!resultado} onClick={() => guardarEnHistorico()}>Volver a guardar en histórico</button>
           <button className="minibtn danger" disabled={historicoLen === 0} onClick={limpiarHistorico}>Vaciar</button>
         </div>
       </Section>
@@ -3615,18 +3817,21 @@ function Cronograma({ semana, db, ENGINE, planilla, estructura, cargarAnotacione
   //  - sin cubrir -> rojo
   function cellColor(nombre, d, bloqueIdx) {
     if (!nombre) return { background: "var(--empty)", color: "transparent" };
+    // 1) El color lo manda el FONDO del profesional (configurable en la plantilla).
+    const f = db.fondo(nombre);
+    if (f) return { background: f === ENGINE.FONDO.LILA ? ENGINE.COLOR_LILA : ENGINE.COLOR_BLANCO };
+    // 2) Si no está en la base, se deduce del tipo de jornada de ese día.
     const tf = turnoPorDiaNombre[d].get(ENGINE.normalizarTexto(nombre));
     const esDoce = tf === ENGINE.TURNO.D12 || tf === ENGINE.TURNO.N12 || tf === ENGINE.TURNO.DOBLAJE;
-    if (esDoce) return { background: "#D2BEE6" };   // 12h día/noche y doblaje -> lila
-    return { background: "#FFFFFF" };               // 7h, 10h noche, parcial -> blanco
+    return { background: esDoce ? ENGINE.COLOR_LILA : ENGINE.COLOR_BLANCO };
   }
 
   return (
     <div className="crono-wrap">
       <div className="crono-toolbar">
         <div className="crono-legend">
-          <LegendItem color="#D2BEE6" label="12 h (día o noche)" />
-          <LegendItem color="#fff" label="7 h / 10 h / parcial" border />
+          <LegendItem color="#D2BEE6" label="Fondo lila (12 h)" />
+          <LegendItem color="#fff" label="Fondo blanco (7 h / 10 h)" border />
           <LegendItem color="var(--empty)" label="Sin cubrir" />
           <span className="legend-item"><span className="badge badge-dbl">DBL</span> Doblaje</span>
           <span className="legend-item"><span className="badge badge-plus">+</span> Extra</span>
@@ -3732,6 +3937,7 @@ function Cronograma({ semana, db, ENGINE, planilla, estructura, cargarAnotacione
                           const ex = lista[e];
                           return (
                             <td key={d} className="data-cell exc-cell"
+                              style={ex ? cellColor(ex.nombre, d, b.idx) : undefined}
                               title={ex ? ex.nombre + " · excedente" : ""}>
                               {ex ? db.apodo(ex.nombre) : ""}
                             </td>
@@ -4115,7 +4321,7 @@ function HistoricoRotacion({ historico, ENGINE, onCerrar, onImportar }) {
 
       {datos.length === 0 ? (
         <div className="empty-note">
-          Todavía no hay histórico. Genera un cuadrante y pulsa «Guardar en histórico»
+          Todavía no hay histórico. En cuanto generes un cuadrante se registra aquí automáticamente
           en el panel lateral para empezar a registrar la rotación mensual.
         </div>
       ) : (
@@ -4641,7 +4847,8 @@ const OPC_CRITERIO = ["SI", "NO", "UCI", "UCCRI"];
 const OPC_ANTIG = ["< 3 ANY", "> 3 ANY < 10 ANY", "10 - 20 ANY", "> 20 ANY"];
 
 function filaVacia() {
-  return { nombre: "", turno: "TM", apodo: "", criterio: "SI", suplente: "No", antiguedad: "< 3 ANY" };
+  return { nombre: "", turno: "TM", apodo: "", criterio: "SI", suplente: "No",
+           antiguedad: "< 3 ANY", fondo: ENGINE.fondoPorDefectoDeTurno("TM"), antiguo: "No" };
 }
 // Normaliza un registro venido de Excel a los valores de los desplegables
 function normalizarFila(p) {
@@ -4651,7 +4858,11 @@ function normalizarFila(p) {
   if (!OPC_CRITERIO.includes(crit)) crit = "SI";
   const sup = String(p.suplente || "").toUpperCase().trim() === "SI" ? "Si" : "No";
   const antig = OPC_ANTIG.find(a => a.toUpperCase() === String(p.antiguedad || "").toUpperCase().trim()) || String(p.antiguedad || "< 3 ANY");
-  return { nombre: p.nombre || "", turno, apodo: p.apodo || "", criterio: crit, suplente: sup, antiguedad: antig };
+  // Fondo: el guardado si es válido; si no, el que toca por el turno.
+  const fondo = ENGINE.normalizarFondo(p.fondo) || ENGINE.fondoPorDefectoDeTurno(turno);
+  const ant = String(p.antiguo || "").toUpperCase().trim() === "SI" ? "Si" : "No";
+  return { nombre: p.nombre || "", turno, apodo: p.apodo || "", criterio: crit,
+           suplente: sup, antiguedad: antig, fondo, antiguo: ant };
 }
 
 function EditorPlantilla({ profs, saveProfs, onCerrar, hayResultado, onCargarExcel }) {
@@ -4673,7 +4884,11 @@ function EditorPlantilla({ profs, saveProfs, onCerrar, hayResultado, onCargarExc
   function setCampo(globalIdx, campo, valor) {
     setRows(prev => {
       const next = prev.slice();
-      next[globalIdx] = { ...next[globalIdx], [campo]: valor };
+      const fila = { ...next[globalIdx], [campo]: valor };
+      // Al cambiar el turno, el fondo se preconfigura solo:
+      // TM/TT/TN -> Blanco ; 12H Día / 12H Noche -> Lila.
+      if (campo === "turno") fila.fondo = ENGINE.fondoPorDefectoDeTurno(valor);
+      next[globalIdx] = fila;
       return next;
     });
     setDirty(true); setSavedFlash(false);
@@ -4723,7 +4938,13 @@ function EditorPlantilla({ profs, saveProfs, onCerrar, hayResultado, onCargarExc
           <h2>Profesionales en plantilla</h2>
           <p className="section-intro">
             Esta es la base que usa el motor para asignar posiciones. Lo que cambies aquí se guarda
-            en este navegador y se aplica a las próximas planillas que generes.
+            en la base compartida y se aplica a las próximas planillas que generes.
+          </p>
+          <p className="section-intro">
+            La columna <strong>Fondo</strong> es el color de las celdas de esa persona en el
+            cuadrante. Se rellena sola según el turno (TM, TT y TN → blanco; 12 H Día y
+            12 H Noche → lila), y puedes cambiarla a mano cuando haga falta. El punto ·
+            indica que está cambiada respecto a lo que le tocaría por su turno.
           </p>
         </div>
         {hayResultado && (
@@ -4759,6 +4980,7 @@ function EditorPlantilla({ profs, saveProfs, onCerrar, hayResultado, onCargarExc
         <div className="saved-note">Plantilla guardada. Vuelve a generar el cuadrante para ver los cambios aplicados.</div>
       )}
 
+      <p className="scroll-hint">Desliza la tabla hacia los lados para ver todas las columnas →</p>
       <div className="editor-tablewrap">
         <table className="edit-table">
           <thead>
@@ -4766,15 +4988,17 @@ function EditorPlantilla({ profs, saveProfs, onCerrar, hayResultado, onCargarExc
               <th className="c-nombre">Nombre completo</th>
               <th className="c-apodo">Apodo</th>
               <th className="c-turno">Turno habitual</th>
+              <th className="c-fondo">Fondo</th>
               <th className="c-crit">Criterio UCI</th>
               <th className="c-antig">Antigüedad</th>
               <th className="c-sup">Suplente</th>
+              <th className="c-ant">Antiguo/a</th>
               <th className="c-del"></th>
             </tr>
           </thead>
           <tbody>
             {visibles.length === 0 && (
-              <tr><td colSpan="7" className="edit-empty">
+              <tr><td colSpan="9" className="edit-empty">
                 {q ? "Ningún profesional coincide con la búsqueda." : "No hay profesionales. Añade uno o carga un Excel."}
               </td></tr>
             )}
@@ -4797,6 +5021,23 @@ function EditorPlantilla({ profs, saveProfs, onCerrar, hayResultado, onCargarExc
                   </select>
                 </td>
                 <td>
+                  <span className="fondo-cell">
+                    <span className={"fondo-muestra " + (r.fondo === ENGINE.FONDO.LILA ? "lila" : "blanco")}
+                      aria-hidden="true" />
+                    <select className="cell-select fondo-sel" value={r.fondo}
+                      title={r.fondo === ENGINE.fondoPorDefectoDeTurno(r.turno)
+                        ? "Color por defecto según el turno"
+                        : "Color cambiado a mano (no es el que toca por el turno)"}
+                      onChange={e => setCampo(i, "fondo", e.target.value)}>
+                      <option value={ENGINE.FONDO.BLANCO}>Blanco</option>
+                      <option value={ENGINE.FONDO.LILA}>Lila</option>
+                    </select>
+                    {r.fondo !== ENGINE.fondoPorDefectoDeTurno(r.turno) && (
+                      <span className="fondo-manual" title="Cambiado a mano">•</span>
+                    )}
+                  </span>
+                </td>
+                <td>
                   <select className={"cell-select crit-sel crit-" + r.criterio} value={r.criterio}
                     onChange={e => setCampo(i, "criterio", e.target.value)}>
                     {OPC_CRITERIO.map(o => <option key={o} value={o}>{o}</option>)}
@@ -4813,6 +5054,13 @@ function EditorPlantilla({ profs, saveProfs, onCerrar, hayResultado, onCargarExc
                     onClick={() => setCampo(i, "suplente", r.suplente === "Si" ? "No" : "Si")}
                     title="Marcar como suplente">
                     {r.suplente === "Si" ? "Sí" : "No"}
+                  </button>
+                </td>
+                <td className="td-center">
+                  <button className={"toggle ant " + (r.antiguo === "Si" ? "on" : "")}
+                    onClick={() => setCampo(i, "antiguo", r.antiguo === "Si" ? "No" : "Si")}
+                    title="Antiguo/a: posición fija toda la semana y misma unidad todo el mes">
+                    {r.antiguo === "Si" ? "Sí" : "No"}
                   </button>
                 </td>
                 <td className="td-center">
@@ -5264,8 +5512,10 @@ td.data-cell:has(.nota-edit) { overflow: visible; }
 .dirty-note { padding: 9px 14px; background: #fff7ec; border: 1px solid #f0dcb6; color: #8a6a2a; border-radius: 8px; font-size: 12.5px; margin-bottom: 14px; }
 .saved-note { padding: 9px 14px; background: var(--accent-wash); border: 1px solid #bfe0db; color: var(--accent-deep); border-radius: 8px; font-size: 12.5px; margin-bottom: 14px; }
 
-.editor-tablewrap { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; box-shadow: var(--shadow); }
-.edit-table { width: 100%; border-collapse: collapse; }
+/* overflow-x: auto para poder desplazar la tabla de lado en móvil.
+   -webkit-overflow-scrolling da inercia en iPhone. */
+.editor-tablewrap { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); overflow-x: auto; overflow-y: hidden; box-shadow: var(--shadow); -webkit-overflow-scrolling: touch; }
+.edit-table { width: 100%; border-collapse: collapse; min-width: 900px; }
 .edit-table thead th {
   text-align: left; padding: 10px 12px; background: var(--panel);
   font-size: 11.5px; font-weight: 620; color: var(--ink-soft); letter-spacing: .02em;
@@ -5274,8 +5524,18 @@ td.data-cell:has(.nota-edit) { overflow: visible; }
 .edit-table td { padding: 5px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }
 .edit-table tr:last-child td { border-bottom: none; }
 .edit-table tbody tr:hover { background: #fafbfc; }
-.c-nombre { width: 30%; } .c-apodo { width: 16%; } .c-turno { width: 13%; }
-.c-crit { width: 12%; } .c-antig { width: 17%; } .c-sup { width: 7%; } .c-del { width: 36px; }
+.c-nombre { width: 26%; } .c-apodo { width: 14%; } .c-turno { width: 12%; }
+.c-fondo { width: 11%; }
+.c-crit { width: 11%; } .c-antig { width: 14%; } .c-sup { width: 7%; } .c-ant { width: 8%; } .c-del { width: 36px; }
+.toggle.ant.on { background: #efe6fa; border-color: #b79bd8; color: #5c3d84; }
+
+/* Casilla de color de fondo del profesional */
+.fondo-cell { display: flex; align-items: center; gap: 6px; }
+.fondo-muestra { width: 14px; height: 14px; border-radius: 4px; border: 1px solid var(--line-strong); flex: none; }
+.fondo-muestra.lila { background: #D2BEE6; }
+.fondo-muestra.blanco { background: #FFFFFF; }
+.fondo-sel { flex: 1; min-width: 0; }
+.fondo-manual { color: var(--accent-deep); font-size: 16px; line-height: 1; cursor: default; }
 .td-center { text-align: center; }
 .edit-empty { text-align: center; color: var(--muted); padding: 32px; font-size: 13px; }
 
@@ -5468,7 +5728,16 @@ td.data-cell:has(.nota-edit) { overflow: visible; }
   .perfil-menu { width: calc(100vw - 24px); right: -6px; }
   .tabsbar-right { width: 100%; }
   .export-hint { width: 240px; }
+  /* Plantilla en móvil: la barra de herramientas se apila y la tabla
+     se desplaza de lado (la tabla lleva min-width y overflow-x: auto). */
+  .editor-bar { flex-wrap: wrap; gap: 8px; }
+  .editor-bar .search { flex: 1 1 100%; }
+  .editor-actions { flex: 1 1 100%; }
+  .editor-actions button { flex: 1; }
+  .scroll-hint { display: block; }
 }
+/* Aviso de "desliza de lado", solo visible en pantallas estrechas */
+.scroll-hint { display: none; font-size: 12px; color: var(--muted); margin: 0 0 8px; }
 
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; }
