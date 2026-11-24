@@ -9,6 +9,7 @@ import {
   cargarAnotaciones, guardarAnotaciones,
   cargarAlias, guardarAliasTodos,
   cargarReglas, guardarReglas,
+  fijarColectivo,
 } from "./supabase.js";
 
 /* ============================================================
@@ -3105,6 +3106,9 @@ export default function App() {
   const [authLoading, setAuthLoading] = useState(true);
   const [cargandoDatos, setCargandoDatos] = useState(false);
   const [menuPerfil, setMenuPerfil] = useState(false);
+  // Grupo profesional con el que se trabaja: null (aún sin elegir) | "ENF" | "TCAE".
+  // Cada grupo tiene su plantilla, histórico, estructura, reglas y alias por separado.
+  const [colectivo, setColectivo] = useState(null);
   const planillaInputRef = useRef(null);
   const staffInputRef = useRef(null);
   const rotacionesInputRef = useRef(null);
@@ -3128,14 +3132,19 @@ export default function App() {
     return () => { if (sub) sub.unsubscribe(); };
   }, []);
 
-  // Cuando hay sesión, cargar plantilla e histórico desde Supabase
+  // Cuando hay sesión y se ha elegido grupo profesional, cargar sus datos de Supabase.
+  // Depende del id de usuario (no del objeto sesión) para que refrescos del token
+  // o cambios de apodo no borren el trabajo en curso.
+  const usuarioId = session?.user?.id || null;
   useEffect(() => {
-    if (!session) {
-      // al cerrar sesión, limpiar datos en memoria
-      setProfs(null); setAlias(null); setHistorico([]); setStaffSource("");
-      setResultado(null); setVista("inicio");
-      return;
-    }
+    // Al cerrar sesión o cambiar de grupo, limpiar todo lo que hay en memoria
+    setProfs(null); setAlias(null); setHistorico([]); setStaffSource("");
+    setResultado(null); setVista("inicio"); setPlanilla(null); setPlanillaInfo(null);
+    setEstructura(null); setReglas(null); setNombresSinVincular(null); setImportRot(null);
+    setHistGuardado(null); setSemanaActiva(0); setError("");
+    if (!usuarioId) { setColectivo(null); return; }
+    if (!colectivo) return;
+    fijarColectivo(colectivo);
     (async () => {
       setCargandoDatos(true);
       setError("");
@@ -3166,7 +3175,7 @@ export default function App() {
         setCargandoDatos(false);
       }
     })();
-  }, [session]);
+  }, [usuarioId, colectivo]);
 
   // Detectar si el usuario ha llegado desde un enlace de recuperación de contraseña
   const [modoRecuperacion, setModoRecuperacion] = useState(false);
@@ -3464,10 +3473,10 @@ export default function App() {
 
   const apodoUsuario = apodoDeSesion(session);
 
-  return (
-    <div className="app">
-      <style>{CSS}</style>
+  const cabecera = (
       <Header
+        colectivo={colectivo}
+        onCambiarColectivo={() => { setMenuPerfil(false); setColectivo(null); }}
         email={session?.user?.email}
         apodo={apodoUsuario}
         abierto={menuPerfil}
@@ -3478,6 +3487,23 @@ export default function App() {
         onCambiarPassword={cambiarPassword}
         onSesionActualizada={refrescarSesion}
       />
+  );
+
+  // Pantalla de inicio: elegir el grupo profesional con el que se va a trabajar
+  if (!colectivo) {
+    return (
+      <div className="app">
+        <style>{CSS}</style>
+        {cabecera}
+        <SelectorColectivo nombre={apodoUsuario || (session?.user?.email || "").split("@")[0]} onElegir={setColectivo} />
+      </div>
+    );
+  }
+
+  return (
+    <div className="app">
+      <style>{CSS}</style>
+      {cabecera}
       <div className="layout">
         <Sidebar
           planillaInfo={planillaInfo} staffSource={staffSource} profs={profs}
@@ -3594,7 +3620,36 @@ function iniciales(texto) {
   return t.slice(0, 2).toUpperCase();
 }
 
-function Header({ email, apodo, abierto, onToggle, onCerrarMenu, onLogout, onCambiarApodo, onCambiarPassword, onSesionActualizada }) {
+/* ---------- Pantalla de inicio: elegir grupo profesional ---------- */
+function SelectorColectivo({ nombre, onElegir }) {
+  const opciones = [
+    { id: "ENF", titulo: "Enfermería", desc: "Cuadrante y rotación de las enfermeras de la UCI.",
+      icono: <path d="M16 7v18M7 16h18" stroke="currentColor" strokeWidth="2.6" strokeLinecap="round" /> },
+    { id: "TCAE", titulo: "TCAE", desc: "Cuadrante y rotación de las técnicas auxiliares en cuidados de enfermería.",
+      icono: <g fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><circle cx="16" cy="11" r="4.5" /><path d="M7.5 25c1.2-4.6 4.4-7 8.5-7s7.3 2.4 8.5 7" /></g> },
+  ];
+  return (
+    <div className="selector-wrap">
+      <div className="selector-head">
+        <h1>{nombre ? "Hola, " + nombre : "Hola"}</h1>
+        <p>¿Con qué grupo profesional vas a trabajar?</p>
+      </div>
+      <div className="selector-grid">
+        {opciones.map(o => (
+          <button key={o.id} className={"selector-card " + (o.id === "TCAE" ? "is-tcae" : "is-enf")} onClick={() => onElegir(o.id)}>
+            <span className="selector-icon"><svg viewBox="0 0 32 32" width="30" height="30">{o.icono}</svg></span>
+            <span className="selector-title">{o.titulo}</span>
+            <span className="selector-desc">{o.desc}</span>
+            <span className="selector-go">Entrar →</span>
+          </button>
+        ))}
+      </div>
+      <p className="selector-nota">Cada grupo tiene su propia plantilla, histórico de rotación y estructura de la unidad. Puedes cambiar de grupo en cualquier momento desde la barra superior.</p>
+    </div>
+  );
+}
+
+function Header({ colectivo, onCambiarColectivo, email, apodo, abierto, onToggle, onCerrarMenu, onLogout, onCambiarApodo, onCambiarPassword, onSesionActualizada }) {
   const nombreMostrado = apodo || (email ? email.split("@")[0] : "");
   return (
     <header className="header">
@@ -3607,8 +3662,19 @@ function Header({ email, apodo, abierto, onToggle, onCerrarMenu, onLogout, onCam
         </div>
         <div>
           <div className="brand-title">Cuadrante UCI</div>
-          <div className="brand-sub">Rotación de enfermería · planificación semanal</div>
+          <div className="brand-sub">
+            {colectivo === "TCAE" ? "Rotación de TCAE · planificación semanal"
+              : colectivo === "ENF" ? "Rotación de enfermería · planificación semanal"
+              : "Planificación semanal de la unidad"}
+          </div>
         </div>
+        {colectivo && (
+          <button className="colectivo-chip" onClick={onCambiarColectivo} title="Cambiar de grupo profesional">
+            <span className={"colectivo-dot " + (colectivo === "TCAE" ? "is-tcae" : "is-enf")} />
+            {colectivo === "TCAE" ? "TCAE" : "Enfermería"}
+            <span className="colectivo-cambiar">Cambiar</span>
+          </button>
+        )}
       </div>
       {email && (
         <div className="perfil">
@@ -6031,6 +6097,42 @@ td.data-cell:has(.nota-edit) { overflow: visible; }
 .login-ok { background: var(--accent-wash); border: 1px solid #bfe0db; color: var(--accent-deep); padding: 12px 14px; border-radius: 9px; font-size: 13px; line-height: 1.5; margin-bottom: 16px; text-align: left; }
 
 /* ---------- Pantalla de arranque ---------- */
+/* ---------- Selector de grupo profesional ---------- */
+.selector-wrap { max-width: 760px; margin: 0 auto; padding: 56px 22px 40px; }
+.selector-head h1 { margin: 0 0 6px; font-size: 24px; font-weight: 680; letter-spacing: -.02em; }
+.selector-head p { margin: 0 0 26px; color: var(--muted); font-size: 15px; }
+.selector-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.selector-card {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 8px; text-align: left;
+  background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 22px 22px 18px;
+  box-shadow: var(--shadow); cursor: pointer; font: inherit; color: var(--ink);
+  transition: border-color .15s, transform .15s, box-shadow .15s;
+}
+.selector-card:hover { border-color: var(--accent); transform: translateY(-2px); box-shadow: 0 2px 4px rgba(20,30,48,.06), 0 10px 26px rgba(20,30,48,.08); }
+.selector-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.selector-icon { width: 48px; height: 48px; border-radius: 12px; display: grid; place-items: center; margin-bottom: 4px; }
+.selector-card.is-enf .selector-icon { background: var(--accent-wash); color: var(--accent-deep); }
+.selector-card.is-tcae .selector-icon { background: #efeaf8; color: #5b4a8a; }
+.selector-title { font-size: 18px; font-weight: 660; letter-spacing: -.01em; }
+.selector-desc { color: var(--ink-soft); font-size: 13.5px; line-height: 1.45; flex: 1; }
+.selector-go { margin-top: 8px; font-size: 13px; font-weight: 600; color: var(--accent); }
+.selector-card.is-tcae .selector-go { color: #5b4a8a; }
+.selector-nota { margin: 22px 2px 0; color: var(--muted); font-size: 12.5px; line-height: 1.5; }
+@media (max-width: 560px) {
+  .selector-wrap { padding-top: 32px; }
+  .selector-grid { grid-template-columns: 1fr; }
+}
+.colectivo-chip {
+  margin-left: 16px; display: inline-flex; align-items: center; gap: 7px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 999px;
+  padding: 5px 6px 5px 11px; font: inherit; font-size: 12.5px; font-weight: 600; color: var(--ink); cursor: pointer;
+}
+.colectivo-chip:hover { border-color: var(--line-strong); }
+.colectivo-dot { width: 8px; height: 8px; border-radius: 50%; }
+.colectivo-dot.is-enf { background: var(--accent); }
+.colectivo-dot.is-tcae { background: #7a66b3; }
+.colectivo-cambiar { font-weight: 520; color: var(--muted); background: var(--surface); border: 1px solid var(--line); border-radius: 999px; padding: 2px 8px; font-size: 11.5px; }
+@media (max-width: 560px) { .colectivo-cambiar { display: none; } .colectivo-chip { margin-left: 8px; } }
 .bootscreen { display: grid; place-items: center; height: 100vh; color: var(--muted); font-size: 14px; }
 
 /* ---------- Pantalla de login ---------- */

@@ -14,6 +14,18 @@ const SUPABASE_ANON_KEY =
 
 export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
+/* ---------- Grupo profesional activo ----------
+   La misma web sirve a dos colectivos con datos SEPARADOS:
+   "ENF" (enfermería, todo lo que ya existía) y "TCAE".
+   - profesionales e histórico: columna "colectivo" en cada fila.
+   - config_unidad (estructura, reglas, alias, anotaciones): enfermería usa
+     las claves de siempre; TCAE las mismas con el prefijo "tcae:".
+*/
+let COLECTIVO = "ENF";
+export function fijarColectivo(c) { COLECTIVO = c === "TCAE" ? "TCAE" : "ENF"; }
+export function colectivoActual() { return COLECTIVO; }
+function clave(k) { return COLECTIVO === "ENF" ? k : "tcae:" + k; }
+
 /* ---------- Autenticación ---------- */
 export async function iniciarSesion(email, password) {
   const { data, error } = await supabase.auth.signInWithPassword({ email, password });
@@ -84,11 +96,13 @@ export async function cargarProfesionales() {
   let { data, error } = await supabase
     .from("profesionales")
     .select("nombre, apodo, turno, criterio, suplente, antiguedad, fondo, antiguo")
+    .eq("colectivo", COLECTIVO)
     .order("nombre", { ascending: true });
   if (error) {
     const r2 = await supabase
       .from("profesionales")
       .select("nombre, apodo, turno, criterio, suplente, antiguedad")
+      .eq("colectivo", COLECTIVO)
       .order("nombre", { ascending: true });
     if (r2.error) throw r2.error;
     data = r2.data;
@@ -111,11 +125,12 @@ export async function guardarProfesionales(profs) {
       antiguedad: p.antiguedad || "< 3 ANY",
       fondo: p.fondo || fondoSegunTurno(p.turno),
       antiguo: p.antiguo || "No",
+      colectivo: COLECTIVO,
     }));
 
-  // 1. Borrar TODOS los registros existentes.
+  // 1. Borrar TODOS los registros existentes DE ESTE COLECTIVO.
   //    gte('id', 0) afecta a todas las filas (los id son siempre >= 1).
-  const del = await supabase.from("profesionales").delete().gte("id", 0);
+  const del = await supabase.from("profesionales").delete().gte("id", 0).eq("colectivo", COLECTIVO);
   if (del.error) throw new Error("No se pudo limpiar la base anterior: " + del.error.message);
 
   if (limpio.length === 0) return [];
@@ -163,6 +178,7 @@ function filaAppARegistro(f) {
     turno: f.turno,
     pos_global: f.posGlobal,
     area: f.area,
+    colectivo: COLECTIVO,
   };
 }
 function registroAFilaApp(r) {
@@ -188,6 +204,7 @@ export async function cargarHistorico() {
     const { data, error } = await supabase
       .from("historico")
       .select("fecha_serial, fecha, mes, prof_norm, prof, dia, turno, pos_global, area")
+      .eq("colectivo", COLECTIVO)
       .order("fecha_serial", { ascending: true })
       .range(desde, desde + PAGE - 1);
     if (error) throw error;
@@ -211,7 +228,7 @@ export async function añadirAlHistorico(filasApp) {
 }
 
 export async function vaciarHistorico() {
-  const { error } = await supabase.from("historico").delete().gte("id", 0);
+  const { error } = await supabase.from("historico").delete().gte("id", 0).eq("colectivo", COLECTIVO);
   if (error) throw error;
 }
 
@@ -224,6 +241,7 @@ export async function borrarHistoricoDeRango(desdeSerial, hastaSerial) {
   const { error } = await supabase
     .from("historico")
     .delete()
+    .eq("colectivo", COLECTIVO)
     .gte("fecha_serial", desdeSerial)
     .lte("fecha_serial", hastaSerial);
   if (error) throw error;
@@ -233,7 +251,7 @@ export async function borrarHistoricoDeRango(desdeSerial, hastaSerial) {
 // Se usa al importar el registro de rotación, que sí va por meses completos.
 export async function borrarHistoricoDeMeses(meses) {
   if (!meses || meses.length === 0) return;
-  const { error } = await supabase.from("historico").delete().in("mes", meses);
+  const { error } = await supabase.from("historico").delete().eq("colectivo", COLECTIVO).in("mes", meses);
   if (error) throw error;
 }
 
@@ -245,7 +263,7 @@ export async function cargarReglas() {
   const { data, error } = await supabase
     .from("config_unidad")
     .select("valor")
-    .eq("clave", "reglas_rotacion")
+    .eq("clave", clave("reglas_rotacion"))
     .maybeSingle();
   if (error) throw error;
   if (!data || !data.valor) return null;
@@ -257,7 +275,7 @@ export async function guardarReglas(reglas) {
   const valor = JSON.stringify(reglas || {});
   const { error } = await supabase
     .from("config_unidad")
-    .upsert({ clave: "reglas_rotacion", valor }, { onConflict: "clave" });
+    .upsert({ clave: clave("reglas_rotacion"), valor }, { onConflict: "clave" });
   if (error) throw error;
 }
 
@@ -271,7 +289,7 @@ export async function cargarEstructura() {
   const { data, error } = await supabase
     .from("config_unidad")
     .select("valor")
-    .eq("clave", CLAVE_ESTRUCTURA)
+    .eq("clave", clave(CLAVE_ESTRUCTURA))
     .maybeSingle();
   if (error) throw error;
   if (!data || !data.valor) return null;
@@ -285,7 +303,7 @@ export async function guardarEstructura(config) {
   // upsert: inserta o actualiza la fila de clave fija
   const { error } = await supabase
     .from("config_unidad")
-    .upsert({ clave: CLAVE_ESTRUCTURA, valor }, { onConflict: "clave" });
+    .upsert({ clave: clave(CLAVE_ESTRUCTURA), valor }, { onConflict: "clave" });
   if (error) throw error;
 }
 
@@ -299,7 +317,7 @@ export async function cargarAnotaciones(lunesISO) {
   const { data, error } = await supabase
     .from("config_unidad")
     .select("valor")
-    .eq("clave", "anotacion:" + lunesISO)
+    .eq("clave", clave("anotacion:" + lunesISO))
     .maybeSingle();
   if (error) throw error;
   if (!data || !data.valor) return {};
@@ -312,7 +330,7 @@ export async function guardarAnotaciones(lunesISO, mapa) {
   const valor = JSON.stringify(mapa || {});
   const { error } = await supabase
     .from("config_unidad")
-    .upsert({ clave: "anotacion:" + lunesISO, valor }, { onConflict: "clave" });
+    .upsert({ clave: clave("anotacion:" + lunesISO), valor }, { onConflict: "clave" });
   if (error) throw error;
 }
 
@@ -324,7 +342,7 @@ export async function cargarAlias() {
   const { data, error } = await supabase
     .from("config_unidad")
     .select("valor")
-    .eq("clave", "alias_profesionales")
+    .eq("clave", clave("alias_profesionales"))
     .maybeSingle();
   if (error) throw error;
   if (!data || !data.valor) return [];
@@ -340,6 +358,6 @@ export async function guardarAliasTodos(aliasArray) {
   const valor = JSON.stringify(obj);
   const { error } = await supabase
     .from("config_unidad")
-    .upsert({ clave: "alias_profesionales", valor }, { onConflict: "clave" });
+    .upsert({ clave: clave("alias_profesionales"), valor }, { onConflict: "clave" });
   if (error) throw error;
 }
