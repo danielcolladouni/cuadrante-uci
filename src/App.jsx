@@ -2556,6 +2556,11 @@ const FILL = {
   decSub: "FFDCDCDC",       // gris subcabecera
   decOk: "FFC6E0B4",        // verde cubierto
   decKo: "FFFCCBCB",        // rojo claro sin cubrir
+  // Colores de la hoja de la coordinadora "INF_PLANING SETMANAL"
+  // (encabezados laterales de unidad y filas de fechas)
+  planMati: "FFFFF2CC",     // mañana: amarillo claro
+  planTarda: "FFCCFFCC",    // tarde: verde claro
+  planNit: "FF99CCFF",      // noche: azul claro
 };
 
 /* ---------- Construcción de styles.xml ----------
@@ -2568,7 +2573,7 @@ function _buildStyles() {
     "none", "gray", FILL.manana, FILL.tarde, FILL.noche, FILL.d12, FILL.n12,
     FILL.doblaje, FILL.parcial, FILL.blanco, FILL.vacio, FILL.cabFecha,
     FILL.matiHdr, FILL.tardeHdr, FILL.areaBg, FILL.decHdr, FILL.decSub, FILL.decOk, FILL.decKo,
-    FILL.diaBloque, FILL.nitBloque,
+    FILL.diaBloque, FILL.nitBloque, FILL.planMati, FILL.planTarda, FILL.planNit,
   ];
   const fillIdx = {};
   fillList.forEach((c, i) => { if (c !== "none" && c !== "gray") fillIdx[c] = i; });
@@ -2579,12 +2584,20 @@ function _buildStyles() {
     fillsXml += `<fill><patternFill patternType="solid"><fgColor rgb="${fillList[i]}"/></patternFill></fill>`;
   }
 
-  // fonts: 0 normal, 1 bold, 2 bold white, 3 white
+  // fonts: 0 normal, 1 bold, 2 bold white, 3 white,
+  //        4 encabezado lateral (Calibri 10 negrita), 5 fecha de día (Arial 12 negrita),
+  //        6 fecha de noche (Arial 11 negrita), 7 etiqueta de posición (Calibri 8),
+  //        8 etiqueta de posición de noche (Calibri 9)  — como en INF_PLANING SETMANAL
   const fonts =
     '<font><sz val="11"/><name val="Calibri"/></font>'
     + '<font><b/><sz val="11"/><name val="Calibri"/></font>'
     + '<font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font>'
-    + '<font><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font>';
+    + '<font><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font>'
+    + '<font><b/><sz val="10"/><name val="Calibri"/></font>'
+    + '<font><b/><sz val="12"/><name val="Arial"/></font>'
+    + '<font><b/><sz val="11"/><name val="Arial"/></font>'
+    + '<font><sz val="8"/><name val="Calibri"/></font>'
+    + '<font><sz val="9"/><name val="Calibri"/></font>';
 
   // borders: 0 none, 1 thin all
   const borders =
@@ -2612,6 +2625,16 @@ function _buildStyles() {
   addXf("tardeHdr", { font: 2, fill: fillIdx[FILL.tardeHdr], border: 1, hAlign: "left" });
   addXf("areaName", { font: 1, fill: fillIdx[FILL.areaBg], border: 1, vAlign: "center" });
   addXf("areaNum", { fill: fillIdx[FILL.areaBg], border: 1, hAlign: "center" });
+  // Estilo INF_PLANING SETMANAL: encabezado lateral de unidad, fila de fechas y
+  // etiqueta de posición, para mañana (amarillo), tarde (verde) y noche (azul)
+  addXf("latMati", { font: 4, fill: fillIdx[FILL.planMati], border: 1, hAlign: "left", vAlign: "center", wrap: true });
+  addXf("latTarda", { font: 4, fill: fillIdx[FILL.planTarda], border: 1, hAlign: "left", vAlign: "center", wrap: true });
+  addXf("latNit", { font: 4, fill: fillIdx[FILL.planNit], border: 1, hAlign: "left", vAlign: "center", wrap: true });
+  addXf("fechaMati", { font: 5, fill: fillIdx[FILL.planMati], border: 1, hAlign: "center", vAlign: "center" });
+  addXf("fechaTarda", { font: 5, fill: fillIdx[FILL.planTarda], border: 1, hAlign: "center", vAlign: "center" });
+  addXf("fechaNit", { font: 6, fill: fillIdx[FILL.planNit], border: 1, hAlign: "center", vAlign: "center" });
+  addXf("posDia", { font: 7, fill: fillIdx[FILL.blanco], border: 1, hAlign: "center", vAlign: "center", wrap: true });
+  addXf("posNit", { font: 8, fill: fillIdx[FILL.blanco], border: 1, hAlign: "center", vAlign: "center", wrap: true });
   // celdas de datos por color de turno
   addXf("cManana", { fill: fillIdx[FILL.manana], border: 1, hAlign: "center" });
   addXf("cTarde", { fill: fillIdx[FILL.tarde], border: 1, hAlign: "center" });
@@ -2638,7 +2661,7 @@ function _buildStyles() {
   const styleSheet =
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
     + '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-    + `<fonts count="4">${fonts}</fonts>`
+    + `<fonts count="9">${fonts}</fonts>`
     + `<fills count="${fillList.length}">${fillsXml}</fills>`
     + `<borders count="2">${borders}</borders>`
     + '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
@@ -2683,6 +2706,9 @@ function _sheetXml(grid, colWidths) {
     + '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
     + cols
     + `<sheetData>${rowsXml}</sheetData>`
+    + ((grid.merges && grid.merges.length)
+        ? `<mergeCells count="${grid.merges.length}">${grid.merges.map(m => `<mergeCell ref="${m}"/>`).join("")}</mergeCells>`
+        : "")
     + '</worksheet>';
 }
 
@@ -2703,13 +2729,15 @@ function _estiloPorTurno(turnoFinal, S) {
 /* ---------- Construye la grid de una semana (cuadrante + decalajes) ---------- */
 const _DIAS = ["LUN", "MAR", "MIÉ", "JUE", "VIE", "SÁB", "DOM"];
 const _BLOQUES = [
-  { idx: 0, label: "MAÑANA", suf: "MATI", hdr: "matiHdr" },
-  { idx: 1, label: "TARDE", suf: "TARDE", hdr: "tardeHdr" },
-  { idx: 2, label: "NOCHE", suf: "NIT", hdr: "matiHdr" },
+  { idx: 0, label: "MAÑANA", suf: "MATI", lat: "latMati", fecha: "fechaMati", pos: "posDia" },
+  { idx: 1, label: "TARDE", suf: "TARDA", lat: "latTarda", fecha: "fechaTarda", pos: "posDia" },
+  { idx: 2, label: "NOCHE", suf: "NIT", lat: "latNit", fecha: "fechaNit", pos: "posNit" },
 ];
 
 function _gridSemana(sem, db, ENGINE, S, areasLayout) {
   const grid = [];
+  const merges = [];   // celdas combinadas (encabezados laterales de unidad)
+  grid.merges = merges;
   const fechas = Array.from({ length: 7 }, (_, i) => ENGINE.addDays(sem.fechaLunes, i));
   // turno y etiqueta por día/nombre
   const turnoMap = [];
@@ -2727,11 +2755,11 @@ function _gridSemana(sem, db, ENGINE, S, areasLayout) {
   for (const b of _BLOQUES) {
     // fila de cabecera del bloque (col A) + fechas
     const cab = [];
-    cab.push({ v: `${b.label} · ${b.suf}`, s: S[b.hdr], t: "s" });
-    cab.push({ v: "", s: S[b.hdr] }); // col B
+    cab.push({ v: `${b.label} · ${b.suf}`, s: S[b.lat], t: "s" });
+    cab.push({ v: "", s: S[b.fecha] }); // col B
     for (let d = 0; d < 7; d++) {
       const f = fechas[d];
-      cab.push({ v: `${_DIAS[d]} ${f.getDate()}/${f.getMonth() + 1}`, s: S.dateHdr, t: "s" });
+      cab.push({ v: `${_DIAS[d]} ${f.getDate()}/${f.getMonth() + 1}`, s: S[b.fecha], t: "s" });
     }
     grid.push(cab);
 
@@ -2741,16 +2769,20 @@ function _gridSemana(sem, db, ENGINE, S, areasLayout) {
       for (let p = area.pIni; p <= area.pFin; p++) {
         const row = [];
         // col A: nombre de área solo en la primera fila
-        if (p === area.pIni) row.push({ v: area.nombre, s: S.areaName, t: "s" });
-        else row.push({ v: "", s: S.areaName });
+        // (la celda se combina con las de debajo, como en INF_PLANING SETMANAL)
+        if (p === area.pIni) {
+          row.push({ v: area.nombre + " " + b.suf, s: S[b.lat], t: "s" });
+          if (area.pFin > area.pIni) merges.push(`A${grid.length + 1}:A${grid.length + 1 + area.pFin - area.pIni}`);
+        }
+        else row.push({ v: "", s: S[b.lat] });
         // col B: número local o etiqueta fija de la posición
         const etFija = ENGINE.etiquetaDePosicion(area, local);
         if (etFija && etFija.reemplazaNumero) {
-          row.push({ v: etFija.texto, s: S.areaNum, t: "s" });
+          row.push({ v: etFija.texto, s: S[b.pos], t: "s" });
         } else if (etFija) {
-          row.push({ v: local + " " + etFija.texto, s: S.areaNum, t: "s" });
+          row.push({ v: local + " " + etFija.texto, s: S[b.pos], t: "s" });
         } else {
-          row.push({ v: local, s: S.areaNum, t: "n" });
+          row.push({ v: local, s: S[b.pos], t: "n" });
         }
         // cols C..I: color según el TIPO de jornada del profesional ese día
         // (12h día verde, 12h noche lila, 7h/10h/parcial blanco)
@@ -2788,7 +2820,7 @@ function _gridSemana(sem, db, ENGINE, S, areasLayout) {
           if (lista.length > maxExced) maxExced = lista.length;
         }
         for (let e = 0; e < maxExced; e++) {
-          const row = [{ v: "", s: S.areaName }, { v: "+", s: S.areaNum, t: "s" }];
+          const row = [{ v: "", s: S.normal }, { v: "+", s: S[b.pos], t: "s" }];
           for (let d = 0; d < 7; d++) {
             const lista = (sem.asig.excedentes[d * 3 + b.idx] || []).filter(x => x.area === area.rotacion);
             const ex = lista[e];
@@ -2867,7 +2899,7 @@ function exportarCronogramaXLSX(resultado, db, ENGINE) {
   resultado.semanas.forEach((sem, i) => {
     const nombre = "Sem " + ENGINE.fechaCorta(sem.fechaLunes).replace(/[^\w]/g, "");
     hojas.push({ name: nombre.slice(0, 31), grid: _gridSemana(sem, db, ENGINE, S, areasLayout),
-      widths: [16, 5, 20, 20, 20, 20, 20, 20, 20] });
+      widths: [20, 14, 20, 20, 20, 20, 20, 20, 20] });
   });
   hojas.push({ name: "Rotació DIA", grid: _gridInforme(resultado.informe, S, "DIA"),
     widths: [10, 34, 60] });
