@@ -342,7 +342,7 @@ function parsearHoraAMinutos(s) {
   return (+t) * 60;
 }
 
-// Parsea "8-14 MMORALES" / "* 8-20 COLLADO MORENO, DANIEL" -> {horario, nombre}
+// Parsea "8-14 MMORALES" / "* 8-20 APELLIDO APELLIDO, NOMBRE" -> {horario, nombre}
 function parsearLineaPlanilla(linea) {
   let t = String(linea || "").trim();
   let asterisco = "";
@@ -2885,16 +2885,14 @@ export default function App() {
       try {
         const lunes = parseISO(fechaLunes);
         const ns = Math.max(1, Math.min(12, +numSemanas));
-        // Histórico previo (de Supabase) para que la rotación vea los meses anteriores.
-        // Se excluyen los meses que se van a (re)generar ahora, para no contarlos dos
-        // veces si ya estaban guardados (p.ej. al regenerar un mes corregido).
-        const mesesAGenerar = new Set();
-        for (let s = 0; s < ns; s++) {
-          const l = new Date(lunes); l.setDate(l.getDate() + s * 7);
-          mesesAGenerar.add(l.getFullYear() + "-" + String(l.getMonth() + 1).padStart(2, "0"));
-        }
+        // Histórico previo (de Supabase) para que la rotación vea lo ya ocurrido.
+        // Se excluye SOLO el rango de días que se va a (re)generar ahora; así las
+        // semanas anteriores del mismo mes (p.ej. las sincronizadas con la hoja
+        // real INF_PLANING SETMANAL) sí cuentan para continuidad y recuento mensual.
+        const desdeGen = diaSerial(lunes);
+        const hastaGen = desdeGen + ns * 7 - 1;
         const histPrevio = (Array.isArray(historico) ? historico : [])
-          .filter(h => !mesesAGenerar.has(h.mes));
+          .filter(h => h.fechaSerial < desdeGen || h.fechaSerial > hastaGen);
         const out = ENGINE.generarCronograma(planilla, db, histPrevio, lunes, ns, estructura, reglas || ENGINE.REGLAS_DEFECTO);
         setResultado(out);
         setSemanaActiva(0);
@@ -2957,8 +2955,14 @@ export default function App() {
     try {
       await borrarHistoricoDeRango(minS, maxS);
       await añadirAlHistorico(nuevasFilas);
-      const resto = (historico || []).filter(h => h.fechaSerial < minS || h.fechaSerial > maxS);
-      setHistorico(resto.concat(nuevasFilas));
+      // Se recarga de la base: los días ya sincronizados con la hoja real están
+      // protegidos y no se sobrescriben, así que lo que queda guardado puede no
+      // coincidir con lo generado.
+      try { setHistorico(await cargarHistorico()); }
+      catch (e) {
+        const resto = (historico || []).filter(h => h.fechaSerial < minS || h.fechaSerial > maxS);
+        setHistorico(resto.concat(nuevasFilas));
+      }
       setHistGuardado({ n: nuevasFilas.length, cuando: Date.now() });
       return true;
     } catch (err) {

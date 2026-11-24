@@ -40,7 +40,7 @@ export async function cambiarPassword(nuevaPassword) {
 
 // Enviar email de recuperación de contraseña a una dirección.
 export async function recuperarPassword(email) {
-  const redirectTo = (typeof window !== "undefined" ? window.location.origin : "") + "/";
+  const redirectTo = (typeof window !== "undefined" ? window.location.origin : "") + import.meta.env.BASE_URL;
   const { error } = await supabase.auth.resetPasswordForEmail(email, { redirectTo });
   if (error) throw error;
 }
