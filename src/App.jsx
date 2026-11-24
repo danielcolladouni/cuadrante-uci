@@ -1557,6 +1557,370 @@ function reafirmarAntiguos(asig, semana, db, asignEst) {
   }
 }
 
+/* ============================================================
+   REPASO FINAL DE COBERTURA (siempre activo, forma parte del motor)
+   Se ejecuta al final de cada semana, después de los ajustes de 12 h,
+   parciales y antiguos/as, y antes de los decalajes y del histórico.
+   0) Saneado: nadie en posición y excedente a la vez; nadie en una unidad
+      que su criterio no permita; los 12 h de día y doblajes, mañana y tarde
+      en la misma posición.
+   1) Rojos con excedentes: no queda ningún rojo mientras haya un excedente
+      compatible en ese turno (suplentes y 12 h incluidos). Primero se cubre
+      la unidad con menos gente.
+   2) Unidad a cero: si una unidad no tiene a nadie y otra tiene 2 o más, se
+      trae a alguien compatible (suplente > sin posición fija > menor
+      antigüedad). El resto de la semana esa persona pasa también a esa unidad
+      los días en que allí hay hueco y el origen se queda con 2 o más.
+   3) Se repite el paso 1.
+   4) Una unidad por semana: intercambios (también entre jornadas distintas)
+      que solo se aplican si reducen las unidades por persona y no dejan
+      ninguna unidad a cero.
+   Los antiguos/as con posición fija no se mueven nunca. Cada cambio queda
+   registrado en asig.afinado.
+   ============================================================ */
+function afinarCobertura(asig, semana, db, asignEst) {
+  const nPos = NPOS_TOTAL_actual();
+  const M = TURNO_IDX.MANANA, T = TURNO_IDX.TARDE, N = TURNO_IDX.NOCHE;
+  const C = asig.celdas;
+  const log = [];
+  asig.afinado = log;
+  const nt = (s) => normalizarTexto(s);
+  const areaDe = (p) => posGlobalAArea(p).area;
+  const unidades = listaAreasOrdenadas();
+
+  // Turno de cada persona cada día
+  const turnoDia = [];
+  for (let d = 0; d < 7; d++) {
+    const m = new Map();
+    for (const r of (semana[d] && semana[d].regs) || []) m.set(nt(r.nombre), r.turnoFinal);
+    turnoDia.push(m);
+  }
+  const esDoble = (d, nombre) => {
+    const tf = turnoDia[d].get(nt(nombre));
+    return tf === TURNO.D12 || tf === TURNO.DOBLAJE;
+  };
+  // Antiguos/as con posición fija esta semana: intocables
+  const fijos = new Set();
+  if (_REGLAS.antiguosPosicionFija) {
+    for (const a of asignEst || []) {
+      if (!a || a.posGlobal <= 0) continue;
+      const p = db.list ? db.list.find(x => x.nombreNorm === a.nombreNorm) : null;
+      if (p && p.esAntiguo) fijos.add(a.nombreNorm);
+    }
+  }
+  const conPosFija = new Set((asignEst || []).filter(a => a && a.posGlobal > 0).map(a => a.nombreNorm));
+  const exc = (d, t) => {
+    const k = d * 3 + t;
+    if (!asig.excedentes[k]) asig.excedentes[k] = [];
+    return asig.excedentes[k];
+  };
+  const quitarDeExc = (d, t, nombre) => {
+    const k = d * 3 + t;
+    if (!asig.excedentes[k]) return;
+    asig.excedentes[k] = asig.excedentes[k].filter(e => nt(e.nombre) !== nt(nombre));
+  };
+  const posDe = (d, t, nombre) => {
+    const n0 = nt(nombre);
+    for (let p = 1; p <= nPos; p++) if (C[d][t][p] && nt(C[d][t][p]) === n0) return p;
+    return 0;
+  };
+  const cuentaUnidad = (d, t, u) => {
+    let n = 0;
+    for (let p = posGlobalInicioArea(u); p <= posGlobalFinArea(u); p++) if (C[d][t][p]) n++;
+    return n;
+  };
+  const turnosDe = (t) => (t === N ? [N] : [t]);
+  const reg = (tipo, d, t, nombre, de, a) => log.push({ tipo, dia: d, turno: ["M", "T", "N"][t], nombre, de: de || "", a: a || "" });
+
+  /* ---------- 0) Saneado ---------- */
+  for (let d = 0; d < 7; d++) {
+    for (let t = 0; t < 3; t++) {
+      // duplicados en posiciones del mismo turno
+      const vistos = new Set();
+      for (let p = 1; p <= nPos; p++) {
+        const n = C[d][t][p];
+        if (!n) continue;
+        if (vistos.has(nt(n))) { C[d][t][p] = ""; reg("duplicado", d, t, n, areaDe(p), ""); }
+        else vistos.add(nt(n));
+      }
+      // nadie en posición y excedente a la vez
+      const k = d * 3 + t;
+      if (asig.excedentes[k]) {
+        const antes = asig.excedentes[k].length;
+        asig.excedentes[k] = asig.excedentes[k].filter(e => e && e.nombre && !vistos.has(nt(e.nombre)));
+        // excedentes duplicados
+        const ve = new Set();
+        asig.excedentes[k] = asig.excedentes[k].filter(e => { const x = nt(e.nombre); if (ve.has(x)) return false; ve.add(x); return true; });
+        if (asig.excedentes[k].length !== antes) reg("saneado", d, t, "", "", "");
+      }
+    }
+  }
+  // criterio incumplido: se intenta intercambiar con alguien del mismo turno;
+  // si no se puede, pasa a excedente (y el paso 1 cubrirá el hueco).
+  for (let d = 0; d < 7; d++) {
+    for (let t = 0; t < 3; t++) {
+      for (let p = 1; p <= nPos; p++) {
+        const n = C[d][t][p];
+        if (!n || puedeIrAArea(db.criterio(n), areaDe(p))) continue;
+        if (fijos.has(nt(n))) continue;
+        const doble = t !== N && esDoble(d, n);
+        const S = doble ? [M, T] : [t];
+        let hecho = false;
+        for (let q = 1; q <= nPos && !hecho; q++) {
+          if (q === p) continue;
+          if (intercambioValido(d, S, p, q, false)) { aplicarIntercambio(d, S, p, q); hecho = true; reg("criterio", d, t, n, areaDe(p), areaDe(q)); }
+        }
+        if (!hecho) {
+          for (const tt of S) { if (C[d][tt][p] && nt(C[d][tt][p]) === nt(n)) { C[d][tt][p] = ""; exc(d, tt).push({ nombre: n, area: "" }); } }
+          reg("criterio", d, t, n, areaDe(p), "excedente");
+        }
+      }
+    }
+  }
+  // 12 h de día / doblajes: mañana y tarde en la misma posición
+  for (let d = 0; d < 7; d++) {
+    for (const [nn, tf] of turnoDia[d]) {
+      if (tf !== TURNO.D12 && tf !== TURNO.DOBLAJE) continue;
+      if (fijos.has(nn)) continue;
+      let pm = 0, pt = 0, nombre = "";
+      for (let p = 1; p <= nPos; p++) {
+        if (C[d][M][p] && nt(C[d][M][p]) === nn) { pm = p; nombre = C[d][M][p]; }
+        if (C[d][T][p] && nt(C[d][T][p]) === nn) { pt = p; nombre = C[d][T][p]; }
+      }
+      if (pm && pt && pm === pt) continue;
+      if (pm && !pt && !C[d][T][pm]) { C[d][T][pm] = nombre; quitarDeExc(d, T, nombre); reg("12h", d, T, nombre, "", areaDe(pm)); continue; }
+      if (pt && !pm && !C[d][M][pt]) { C[d][M][pt] = nombre; quitarDeExc(d, M, nombre); reg("12h", d, M, nombre, "", areaDe(pt)); continue; }
+      if (pm && pt && pm !== pt) {
+        const movible = (x, destino) => !x || (!fijos.has(nt(x)) && !esDoble(d, x) && puedeIrAArea(db.criterio(x), areaDe(destino)));
+        // a) llevar la tarde a la posición de la mañana, intercambiando con quien esté
+        const otroT = C[d][T][pm];
+        if (movible(otroT, pt) && puedeIrAArea(db.criterio(nombre), areaDe(pm))) {
+          C[d][T][pm] = nombre; C[d][T][pt] = otroT || ""; reg("12h", d, T, nombre, areaDe(pt), areaDe(pm));
+          continue;
+        }
+        // b) si no se puede (p.ej. un antiguo/a fijo esa tarde), llevar la mañana a la posición de la tarde
+        const otroM = C[d][M][pt];
+        if (movible(otroM, pm) && puedeIrAArea(db.criterio(nombre), areaDe(pt))) {
+          C[d][M][pt] = nombre; C[d][M][pm] = otroM || ""; reg("12h", d, M, nombre, areaDe(pm), areaDe(pt));
+        }
+      }
+    }
+  }
+
+  /* ---------- utilidades de intercambio ----------
+     Intercambiar las columnas p y q del día d en los turnos S. Sirve para
+     mover a un hueco (q vacía) o intercambiar personas, también entre
+     jornadas distintas (un 12 h con un TT + un TM). */
+  function intercambioValido(d, S, p, q, exigirNoCero) {
+    const ap = areaDe(p), aq = areaDe(q);
+    for (const t of S) {
+      const a = C[d][t][p], b = C[d][t][q];
+      if (a && (fijos.has(nt(a)) || !puedeIrAArea(db.criterio(a), aq))) return false;
+      if (b && (fijos.has(nt(b)) || !puedeIrAArea(db.criterio(b), ap))) return false;
+    }
+    // los 12 h / doblajes no pueden quedar partidos entre mañana y tarde
+    if (S.length === 1 && S[0] !== N) {
+      const otro = S[0] === M ? T : M;
+      for (const n of [C[d][S[0]][p], C[d][S[0]][q]]) if (n && esDoble(d, n) && posDe(d, otro, n)) return false;
+    }
+    if (exigirNoCero && ap !== aq) {
+      for (const t of S) {
+        const dp = (C[d][t][p] ? 1 : 0) - (C[d][t][q] ? 1 : 0); // personas que salen de ap
+        if (dp > 0 && cuentaUnidad(d, t, ap) - dp <= 0) return false;
+        if (dp < 0 && cuentaUnidad(d, t, aq) + dp <= 0) return false;
+      }
+    }
+    return true;
+  }
+  function aplicarIntercambio(d, S, p, q) {
+    for (const t of S) { const x = C[d][t][p]; C[d][t][p] = C[d][t][q]; C[d][t][q] = x; }
+  }
+  // Unidad "de la semana" de cada persona (la que más días ocupa), por ámbito
+  function unidadesSemana(nn, noche) {
+    const cnt = {};
+    for (let d = 0; d < 7; d++) for (const t of (noche ? [N] : [M, T])) {
+      for (let p = 1; p <= nPos; p++) if (C[d][t][p] && nt(C[d][t][p]) === nn) { const u = areaDe(p); cnt[u] = (cnt[u] || 0) + 1; }
+    }
+    return cnt;
+  }
+  function unidadPrincipal(nn, noche) {
+    const cnt = unidadesSemana(nn, noche);
+    let mejor = "", mx = 0;
+    for (const u of Object.keys(cnt)) if (cnt[u] > mx) { mx = cnt[u]; mejor = u; }
+    return mejor;
+  }
+
+  /* ---------- 1) Rojos con excedentes ---------- */
+  function cubrirRojos() {
+    for (let d = 0; d < 7; d++) {
+      for (const t of [M, T, N]) {
+        for (;;) {
+          const pool = exc(d, t).filter(e => e && e.nombre);
+          if (pool.length === 0) break;
+          // huecos, empezando por la unidad con menos gente
+          const huecos = [];
+          for (let p = 1; p <= nPos; p++) if (!C[d][t][p]) huecos.push(p);
+          if (huecos.length === 0) break;
+          huecos.sort((a, b) => cuentaUnidad(d, t, areaDe(a)) - cuentaUnidad(d, t, areaDe(b)) || a - b);
+          let colocado = false;
+          for (const p of huecos) {
+            const u = areaDe(p);
+            let mejor = null, mejorScore = -1;
+            for (const e of pool) {
+              const n = e.nombre;
+              if (!puedeIrAArea(db.criterio(n), u)) continue;
+              const doble = t !== N && esDoble(d, n);
+              const otroT = t === M ? T : M;
+              let ambos = false;
+              if (doble) {
+                // Un 12 h va mañana y tarde en la misma posición si esa posición está
+                // libre en los dos turnos. Si en el otro turno ya está ocupada (p.ej.
+                // por un TM), cubre solo este turno y sigue de extra en el otro.
+                const ocup = C[d][otroT][p];
+                const yaEnOtra = posDe(d, otroT, n);
+                if (yaEnOtra && yaEnOtra !== p) continue;   // no partir a nadie entre dos posiciones
+                ambos = !ocup || nt(ocup) === nt(n);
+              }
+              let s = 0;
+              if (unidadPrincipal(nt(n), t === N) === u) s += 4;
+              if (e.area === u) s += 2;
+              if (!doble || ambos) s += 1;
+              if (s > mejorScore) { mejorScore = s; mejor = { e, ambos }; }
+            }
+            if (!mejor) continue;
+            const n = mejor.e.nombre;
+            const turnos = (t !== N && esDoble(d, n) && mejor.ambos) ? [M, T] : [t];
+            for (const tt of turnos) { C[d][tt][p] = n; quitarDeExc(d, tt, n); }
+            reg("rojo", d, t, n, "excedente", u);
+            colocado = true;
+            break;
+          }
+          if (!colocado) break;
+        }
+      }
+    }
+  }
+  cubrirRojos();
+
+  /* ---------- 2) Unidad a cero ---------- */
+  for (let d = 0; d < 7; d++) {
+    for (const t of [M, T, N]) {
+      for (const u of unidades) {
+        if (cuentaUnidad(d, t, u) > 0) continue;
+        // destino: primera posición libre de u (para 12 h, libre mañana y tarde)
+        // origen: unidad con más gente (>= 2)
+        const origenes = unidades.filter(o => o !== u && cuentaUnidad(d, t, o) >= 2)
+          .sort((a, b) => cuentaUnidad(d, t, b) - cuentaUnidad(d, t, a));
+        let hecho = null;
+        for (const o of origenes) {
+          const cands = [];
+          for (let p = posGlobalInicioArea(o); p <= posGlobalFinArea(o); p++) {
+            const n = C[d][t][p];
+            if (!n || fijos.has(nt(n)) || !puedeIrAArea(db.criterio(n), u)) continue;
+            cands.push({ n, p });
+          }
+          cands.sort((a, b) => {
+            const sa = db.esSuplente(a.n) ? 0 : 1, sb = db.esSuplente(b.n) ? 0 : 1;
+            if (sa !== sb) return sa - sb;
+            const fa = conPosFija.has(nt(a.n)) ? 1 : 0, fb = conPosFija.has(nt(b.n)) ? 1 : 0;
+            if (fa !== fb) return fa - fb;
+            return db.antiguedad(a.n) - db.antiguedad(b.n);
+          });
+          for (const c of cands) {
+            const S = (t !== N && esDoble(d, c.n)) ? [M, T] : [t];
+            for (let q = posGlobalInicioArea(u); q <= posGlobalFinArea(u); q++) {
+              if (S.some(tt => C[d][tt][q])) continue;
+              if (!intercambioValido(d, S, c.p, q, false)) continue;
+              aplicarIntercambio(d, S, c.p, q);
+              hecho = { n: c.n, o };
+              reg("unidad a cero", d, t, c.n, o, u);
+              break;
+            }
+            if (hecho) break;
+          }
+          if (hecho) break;
+        }
+        if (!hecho) continue;
+        // El resto de la semana, los días que en u hay hueco y el origen se queda con 2 o más
+        for (let d2 = 0; d2 < 7; d2++) {
+          if (d2 === d) continue;
+          for (const t2 of (t === N ? [N] : [M, T])) {
+            const p2 = posDe(d2, t2, hecho.n);
+            if (!p2 || areaDe(p2) !== hecho.o) continue;
+            if (cuentaUnidad(d2, t2, hecho.o) - 1 < 2) continue;
+            const S = (t2 !== N && esDoble(d2, hecho.n)) ? [M, T] : [t2];
+            if (S.length === 2 && t2 === T) continue; // ya tratado al mirar la mañana
+            for (let q = posGlobalInicioArea(u); q <= posGlobalFinArea(u); q++) {
+              if (S.some(tt => C[d2][tt][q])) continue;
+              if (!intercambioValido(d2, S, p2, q, true)) continue;
+              aplicarIntercambio(d2, S, p2, q);
+              reg("unidad a cero (resto de semana)", d2, t2, hecho.n, hecho.o, u);
+              break;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  /* ---------- 3) Repetir el paso 1 ---------- */
+  cubrirRojos();
+
+  /* ---------- 4) Una unidad por semana ---------- */
+  // Coste = suma, por persona y ámbito (día/noche), de unidades distintas en la semana.
+  function costePersonas(nombres) {
+    let c = 0;
+    for (const nn of nombres) {
+      c += Object.keys(unidadesSemana(nn, false)).length;
+      c += Object.keys(unidadesSemana(nn, true)).length;
+    }
+    return c;
+  }
+  for (let vuelta = 0; vuelta < 6; vuelta++) {
+    let mejoras = 0;
+    // personas en más de una unidad
+    const todas = new Set();
+    for (let d = 0; d < 7; d++) for (let t = 0; t < 3; t++) for (let p = 1; p <= nPos; p++) if (C[d][t][p]) todas.add(nt(C[d][t][p]));
+    for (const nn of todas) {
+      if (fijos.has(nn)) continue;
+      for (const noche of [false, true]) {
+        const cnt = unidadesSemana(nn, noche);
+        if (Object.keys(cnt).length <= 1) continue;
+        const principal = unidadPrincipal(nn, noche);
+        for (let d = 0; d < 7; d++) {
+          for (const t of (noche ? [N] : [M, T])) {
+            const p = posDe(d, t, nn);
+            if (!p || areaDe(p) === principal) continue;
+            const nombre = C[d][t][p];
+            const opciones = (t === N) ? [[N]] : (esDoble(d, nombre) ? [[M, T]] : [[t], [M, T]]);
+            let aplicado = false;
+            for (const S of opciones) {
+              if (aplicado) break;
+              for (let q = posGlobalInicioArea(principal); q <= posGlobalFinArea(principal) && !aplicado; q++) {
+                if (!intercambioValido(d, S, p, q, true)) continue;
+                const afectados = new Set([nn]);
+                for (const tt of S) { if (C[d][tt][p]) afectados.add(nt(C[d][tt][p])); if (C[d][tt][q]) afectados.add(nt(C[d][tt][q])); }
+                const antes = costePersonas(afectados);
+                aplicarIntercambio(d, S, p, q);
+                const despues = costePersonas(afectados);
+                if (despues < antes) {
+                  aplicado = true; mejoras++;
+                  const otros = [...afectados].filter(x => x !== nn);
+                  reg("una unidad por semana", d, t, nombre, areaDe(p), principal + (otros.length ? " (intercambio)" : ""));
+                } else {
+                  aplicarIntercambio(d, S, p, q); // deshacer
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    if (mejoras === 0) break;
+  }
+  return log;
+}
+
 function construirAsignacionSemanal(planilla, db, historico, fechaLunes) {
   const asig = nuevaMatriz();
   asig.fechaLunes = fechaLunes;
@@ -2088,6 +2452,9 @@ function generarCronograma(planilla, db, historicoInicial, fechaLunesInicio, num
     ajustarParciales(asig, planilla, db);
     // Los antiguos/as vuelven a su posición si algún ajuste los ha desplazado
     reafirmarAntiguos(asig, semana, db, asignEst);
+    // Repaso final: cubrir rojos con extras, rescatar unidades a cero y
+    // agrupar a cada persona en una sola unidad durante la semana.
+    afinarCobertura(asig, semana, db, asignEst);
     const avisos = construirAvisosDecalaje(asig, planilla, db);
     const filasHist = filasHistoricoDeSemana(asig);
     historico = historico.concat(filasHist); // acumular para que la siguiente rote
@@ -2562,7 +2929,7 @@ function exportarCronogramaXLSX(resultado, db, ENGINE) {
     posGlobalAArea, nombreAreaCortoDePosGlobal,
     ProfesionalesDB, obtenerProfesionalesDelDia,
     extraerSemana, calcularEstadisticasSemana,
-    construirAsignacionSemanal, generarCronograma,
+    construirAsignacionSemanal, generarCronograma, afinarCobertura,
     ajustarTurnosDobles, ajustarParciales, construirAvisosDecalaje,
     filasHistoricoDeSemana, regenerarInformeMensual, parsearAntiguedad,
     analizarImportacionRotaciones, filasHistoricoDesdeRotaciones,
