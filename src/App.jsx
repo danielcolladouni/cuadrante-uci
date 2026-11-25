@@ -3730,7 +3730,7 @@ function estModMes(e, anio, mes) {
   return Object.keys(c).sort((a, b) => c[b] - c[a])[0];
 }
 function estEnMes(e, anio, mes) {
-  if (Array.isArray(e.dias) && e.dias.length) return estDiasMes(e, anio, mes).length > 0;
+  if (e.origen === "CAL_MASTER" && Array.isArray(e.dias) && e.dias.length) return estDiasMes(e, anio, mes).length > 0;
   const ini = `${anio}-${String(mes + 1).padStart(2, "0")}-01`;
   const fin = `${anio}-${String(mes + 1).padStart(2, "0")}-${String(new Date(anio, mes + 1, 0).getDate()).padStart(2, "0")}`;
   return e.inicio <= fin && e.fin >= ini;
@@ -3741,7 +3741,7 @@ function estNormTxt(v) { return String(v == null ? "" : v).normalize("NFD").repl
 function estModalidad(v) {
   const t = estNormTxt(v);
   if (!t) return "";
-  const noche = /NIT|NOCHE|NOCT/.test(t);
+  const noche = /NIT|NOCHE|NOCT|\bTN\b/.test(t);
   if (t.includes("12")) return noche ? "NIT_12H" : "DIA_12H";
   if (t.includes("10")) return noche ? "NIT_10H" : "DIA_12H";
   if (noche || t === "TN" || t === "N") return "NIT_10H";
@@ -3769,8 +3769,19 @@ function estFecha(v) {
   return "";
 }
 const estTexto = (v) => (v == null ? "" : String(typeof v === "number" ? Math.round(v) : v).replace(/\s+/g, " ").trim());
+/* ---------- Excel de estudiantes ----------
+   Entiende dos formatos:
+   1) El Excel que llevaba la coordinadora a mano (PERIODE, INFERMERA, TORN,
+      NOM, COGNOM 1/2, ESCOLA, CURS, MAIL).
+   2) Las ofertas de plazas que envían las universidades (UDPT, UIC…):
+      ÀREA, UNITAT, TORN, horario, TUTORA CLÍNICA (1)/(2), CURS, PRACTICUM,
+      DATA INICI/FI, CENTRE, TUTORA ACADÈMICA, NOM E, COGNOM 1/2 E, correo y
+      teléfono. De estas SOLO se cogen los estudiantes del área de CRÍTICS.
+      Si el archivo trae una hoja de horarios de críticos («horaris 12h
+      critics»), se añaden los días concretos de cada estudiante. */
 function estLeerExcel(wb) {
   const filas = [], errores = [];
+  let excluidos = 0;
   for (const hoja of wb.SheetNames) {
     const rows = XLSX.utils.sheet_to_json(wb.Sheets[hoja], { header: 1, raw: true, defval: "" });
     let h = -1, col = {};
@@ -3778,42 +3789,128 @@ function estLeerExcel(wb) {
       const c = {};
       rows[r].forEach((v, i) => {
         const t = estNormTxt(v);
+        if (!t) return;
         if (t.startsWith("PERIODE") || t.startsWith("PERIODO")) { if (c.inicio == null) c.inicio = i; else if (c.fin == null) c.fin = i; }
-        else if (t.startsWith("INICI")) c.inicio = i;
-        else if (t.startsWith("FIN") || t.startsWith("FI ")) c.fin = i;
-        else if (t.startsWith("INFERMER") || t.startsWith("ENFERMER") || t.startsWith("TUTOR")) c.tutora = i;
+        else if (t.startsWith("DATA INICI") || t.startsWith("FECHA INICIO") || t.startsWith("INICI")) c.inicio = i;
+        else if (t.startsWith("DATA FI") || t.startsWith("FECHA FIN") || t === "FIN" || t.startsWith("FIN ") || t.startsWith("FI ")) c.fin = i;
+        else if (t.includes("ACADEM")) c.tutoraAcad = i;
+        else if (t.startsWith("TUTORA CLINICA (2)") || t.startsWith("TUTOR CLINICO (2)")) c.tutora2 = i;
+        else if (t.startsWith("INFERMER") || t.startsWith("ENFERMER") || t.startsWith("TUTOR")) { if (c.tutora == null) c.tutora = i; }
+        else if (t.startsWith("HORARI INICI") || t.startsWith("HORARIO INICIO")) c.horaIni = i;
         else if (t.startsWith("TORN") || t.startsWith("TURNO") || t.startsWith("MODALIDAD")) c.modalidad = i;
         else if (t.startsWith("COGNOM 1") || t.startsWith("APELLIDO 1") || t === "COGNOM" || t === "APELLIDO") c.apellido1 = i;
         else if (t.startsWith("COGNOM 2") || t.startsWith("APELLIDO 2")) c.apellido2 = i;
-        else if (t.startsWith("NOM") || t.startsWith("NOMBRE")) c.nombre = i;
-        else if (t.startsWith("ESCOLA") || t.startsWith("ESCUELA") || t.startsWith("UNIVERS")) c.escuela = i;
+        else if (t === "NOM" || t.startsWith("NOM ") || t.startsWith("NOMBRE")) c.nombre = i;
+        else if (t.startsWith("ESCOLA") || t.startsWith("ESCUELA") || t.startsWith("UNIVERS") || t === "CENTRE" || t === "CENTRO") c.escuela = i;
         else if (t.startsWith("CURS")) c.curso = i;
-        else if (t.startsWith("MAIL") || t.startsWith("CORREU") || t.startsWith("CONTACT") || t.startsWith("TELEF")) c.contacto = i;
+        else if (t.startsWith("PRACTICUM")) c.practicum = i;
+        else if (t.startsWith("MAIL") || t.startsWith("CORREU") || t.startsWith("CORREO") || t.startsWith("CONTACT")) c.contacto = i;
+        else if (t.startsWith("TELEF")) c.telefono = i;
+        else if (t === "AREA" || t.startsWith("AREA ")) c.area = i;
+        else if (t.startsWith("UNITAT") || t.startsWith("UNIDAD") || t.startsWith("SERVEI")) c.unidad = i;
         else if (t.startsWith("NOTA") || t.startsWith("OBSERV")) c.notas = i;
       });
       if (c.inicio != null && c.fin != null && c.nombre != null) { h = r; col = c; }
     }
-    if (h < 0) { errores.push(`Hoja «${hoja}»: no se encuentran las columnas de periodo y nombre.`); continue; }
+    if (h < 0) continue;   // hoja sin listado de estudiantes (p.ej. hojas de horarios)
     for (let r = h + 1; r < rows.length; r++) {
       const row = rows[r] || [];
       const g = (k) => (col[k] != null ? row[col[k]] : "");
       const nombre = estTexto(g("nombre"));
       const inicio = estFecha(g("inicio")), fin = estFecha(g("fin"));
-      if (!nombre && !inicio) continue;                 // filas vacías o títulos («PRACTIQUES 2026»)
-      if (!nombre) continue;
+      if (!nombre) continue;                         // filas vacías o títulos («PRACTIQUES 2026»)
+      // Solo el área de Crítics cuando el archivo trae área o unidad
+      if (col.area != null || col.unidad != null) {
+        const zona = estNormTxt(g("area") + " " + g("unidad"));
+        if (!zona.includes("CRITIC")) { excluidos++; continue; }
+      }
       const fallo = !inicio ? "falta la fecha de inicio" : !fin ? "falta la fecha de fin" : fin < inicio ? "el fin es anterior al inicio" : "";
       if (fallo) { errores.push(`${nombre} ${estTexto(g("apellido1"))} (fila ${r + 1}): ${fallo}.`); continue; }
       const curso = estCurso(g("curso"));
+      const horaIni = g("horaIni");
+      const empiezaNoche = (horaIni instanceof Date ? horaIni.getHours() : typeof horaIni === "number" ? Math.round(horaIni * 24) : parseInt(String(horaIni), 10)) >= 19;
+      let modalidad = estModalidad(g("modalidad"));
+      if (modalidad === "DIA_12H" && empiezaNoche) modalidad = "NIT_12H";
+      const tutoras = [estTexto(g("tutora")), estTexto(g("tutora2"))].filter(Boolean).join(" / ");
+      const notas = [estTexto(g("notas")), g("practicum") ? "Pràcticum " + estTexto(g("practicum")) : "", g("tutoraAcad") ? "Tutora académica: " + estTexto(g("tutoraAcad")) : ""].filter(Boolean).join(" · ");
       filas.push({
         nombre, apellido1: estTexto(g("apellido1")), apellido2: estTexto(g("apellido2")),
         curso, tipo: estTipoDeCurso(curso), escuela: estTexto(g("escuela")).toUpperCase(),
-        tutora: estTexto(g("tutora")), modalidad: estModalidad(g("modalidad")),
-        inicio, fin, contacto: estTexto(g("contacto")), notas: estTexto(g("notas")),
+        tutora: tutoras, modalidad, inicio, fin,
+        contacto: [estTexto(g("contacto")), estTexto(g("telefono"))].filter(Boolean).join(" · "), notas,
       });
     }
   }
-  return { filas, errores };
+  // Horarios día a día (hojas «horaris … critics»)
+  const asignados = estLeerHorarios(wb, filas);
+  return { filas, errores, excluidos, conHorario: asignados };
 }
+
+// Hoja(s) de horarios de críticos: una fila por estudiante (HORARI, ÀREA,
+// ESTUDIANT, TUTORA CLÍNICA) y una columna por día con «12» los días que va.
+// Las fechas salen de una fila de fechas encima o, si la cabecera trae solo
+// números de día, se deducen a partir de la fecha de inicio del estudiante.
+function estLeerHorarios(wb, filas) {
+  let asignados = 0;
+  const clave = (e) => estNormTxt(e.tutora.split("/")[0]) + "|" + estNormTxt(e.nombre).split(" ")[0];
+  const porTutora = new Map(filas.map(e => [clave(e), e]));
+  const porNombre = new Map(filas.map(e => [estNormTxt(estNombre(e)), e]));
+  for (const hoja of wb.SheetNames) {
+    if (!estNormTxt(hoja).includes("CRITIC")) continue;
+    const rows = XLSX.utils.sheet_to_json(wb.Sheets[hoja], { header: 1, raw: true, defval: "" });
+    let fechasCol = null, numsCol = null, cEst = -1, cTut = -1, cHor = -1, cArea = -1;
+    for (let r = 0; r < rows.length; r++) {
+      const row = rows[r] || [];
+      const iEst = row.findIndex(v => estNormTxt(v).startsWith("ESTUDIANT"));
+      if (iEst >= 0) {   // cabecera de un bloque
+        cEst = iEst;
+        cTut = row.findIndex(v => estNormTxt(v).startsWith("TUTOR"));
+        cHor = row.findIndex(v => estNormTxt(v).startsWith("HORARI"));
+        cArea = row.findIndex(v => estNormTxt(v).startsWith("AREA"));
+        numsCol = {}; fechasCol = {};
+        row.forEach((v, i) => { if (i > cEst && typeof v === "number" && v >= 1 && v <= 31) numsCol[i] = v; });
+        for (let k = r - 1; k >= Math.max(0, r - 3); k--) (rows[k] || []).forEach((v, i) => {
+          if (v instanceof Date && !isNaN(v) && fechasCol[i] == null) fechasCol[i] = estFecha(v);
+        });
+        continue;
+      }
+      if (cEst < 0 || !numsCol) continue;
+      const nombre = estTexto(row[cEst]);
+      if (!nombre) continue;
+      if (cArea >= 0 && row[cArea] && !estNormTxt(row[cArea]).includes("CRITIC")) continue;
+      const tut = cTut >= 0 ? estNormTxt(row[cTut]) : "";
+      const est = porTutora.get(tut + "|" + estNormTxt(nombre).split(" ")[0]) || porNombre.get(estNormTxt(nombre));
+      if (!est) continue;
+      const hor = estNormTxt(cHor >= 0 ? row[cHor] : "");
+      const noche = /DE (19|20|21|22)/.test(hor) || /NIT|NOCHE/.test(hor);
+      // fechas de este bloque
+      let fechas = { ...fechasCol };
+      if (!Object.keys(fechas).length && Object.keys(numsCol).length) {
+        let [y, m] = est.inicio.split("-").map(Number); let prev = 0;
+        for (const i of Object.keys(numsCol).map(Number).sort((a, b) => a - b)) {
+          const d = numsCol[i];
+          if (d < prev) { m++; if (m > 12) { m = 1; y++; } }
+          prev = d;
+          fechas[i] = `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+        }
+      }
+      const dias = [];
+      for (const [i, f] of Object.entries(fechas)) {
+        const v = row[i];
+        const n = typeof v === "number" ? v : parseFloat(String(v).replace(",", "."));
+        if (!n || isNaN(n)) continue;
+        const t = n >= 11 ? (noche ? "NIT_12H" : "DIA_12H") : n >= 9 ? "NIT_10H" : (noche ? "NIT_10H" : est.modalidad === "TARDE" ? "TARDE" : "MANANA");
+        dias.push({ f, t });
+      }
+      if (dias.length) {
+        est.dias = dias.sort((a, b) => a.f.localeCompare(b.f));
+        asignados++;
+      }
+    }
+  }
+  return asignados;
+}
+
 /* ---------- Calendario del máster («CALENDARIO UCI 26-27») ----------
    Una hoja por mes. Título en A1 («GENER 2027»). Por cada semana: una fila con
    los números de día (columnas B..H = lunes..domingo) y debajo filas
@@ -3944,7 +4041,7 @@ function EstCalendarioMaster({ lista, anio, mes, onEditar }) {
   return (
     <div className="est-card">
       <div className="est-card-head">
-        <h2>Máster UCI · calendario de {EST_MESES_LARGO[mes]}</h2>
+        <h2>Calendario de turnos · {EST_MESES_LARGO[mes]}</h2>
         <div className="est-leyenda">{EST_MODALIDADES.filter(m => m.id && est.some(e => estDiasMes(e, anio, mes).some(d => d.t === m.id))).map(m => <span key={m.id}><i style={{ background: m.color }} />{m.label}</span>)}</div>
       </div>
       <div className="est-scroll">
@@ -3970,7 +4067,7 @@ function EstCalendarioMaster({ lista, anio, mes, onEditar }) {
         <tbody>
           {resumen.map(({ e, n, c }) => (
             <tr key={e.id}>
-              <td><b>{estNombre(e)}</b></td>
+              <td><b>{estNombre(e)}</b> <span className="est-tag" style={{ background: EST_COLOR[e.tipo] }}>{e.tipo === "MASTER" ? "Máster" : "Grado " + (e.curso || "")}</span></td>
               <td className="est-num"><b>{n}</b></td>
               <td>{Object.keys(c).sort((a, b) => (orden[a] ?? 9) - (orden[b] ?? 9)).map(t => { const m = estMod(t); return (
                 <span key={t} className="est-turno" style={{ background: m.color, color: t === "NIT_12H" ? "#fff" : "#1d2530", marginRight: 4 }}>{m.label} · {c[t]}</span>
@@ -4027,7 +4124,7 @@ function EstudiantesPanel() {
   // Periodos (mismas fechas de inicio y fin) visibles: los del mes elegido o todos
   const periodos = useMemo(() => {
     const q = estNormTxt(busca);
-    const base = (lista || []).filter(e => !(Array.isArray(e.dias) && e.dias.length))
+    const base = (lista || []).filter(e => e.origen !== "CAL_MASTER")
       .filter(e => verTodos || estEnMes(e, anio, mesSel))
       .filter(e => !q || estNormTxt([estNombre(e), e.tutora, e.escuela, e.contacto].join(" ")).includes(q));
     const g = new Map();
@@ -4073,15 +4170,30 @@ function EstudiantesPanel() {
         return;
       }
       const wb = XLSX.read(buf, { cellDates: true });
-      const { filas, errores } = estLeerExcel(wb);
-      // no duplicar: mismo nombre, primer apellido e inicio
-      const clave = (e) => estNormTxt(e.nombre + "|" + e.apellido1 + "|" + e.inicio);
-      const ya = new Set((lista || []).map(clave));
-      const nuevas = filas.filter(e => !ya.has(clave(e)));
+      const { filas, errores, excluidos, conHorario } = estLeerExcel(wb);
+      if (!filas.length && !errores.length) { setAviso(`«${f.name}»: no se ha encontrado ningún estudiante de Crítics.`); return; }
+      // No duplicar: si el estudiante ya está (mismo correo, o mismo nombre y
+      // primer apellido con fechas que se solapan) se actualiza con lo nuevo.
+      const correo = (e) => ((e.contacto || "").match(/[^\s·]+@[^\s·]+/) || [""])[0].toLowerCase();
+      const mismo = (a, b) => (correo(a) && correo(a) === correo(b)) ||
+        (estNormTxt(a.nombre) === estNormTxt(b.nombre) && estNormTxt(a.apellido1) === estNormTxt(b.apellido1) && a.inicio <= b.fin && b.inicio <= a.fin);
+      const existentes = (lista || []).filter(e => e.origen !== "CAL_MASTER");
+      const nuevas = [], actualizar = [];
+      for (const e of filas) {
+        const prev = existentes.find(x => mismo(x, e));
+        if (!prev) { nuevas.push(e); continue; }
+        const merged = { ...prev };
+        for (const k of ["nombre", "apellido1", "apellido2", "curso", "tipo", "escuela", "tutora", "modalidad", "inicio", "fin", "contacto", "notas"]) if (e[k]) merged[k] = e[k];
+        if (e.dias && e.dias.length) merged.dias = e.dias;
+        actualizar.push(merged);
+      }
       if (nuevas.length) await importarEstudiantes(nuevas);
+      for (const e of actualizar) await guardarEstudiante(e);
       await recargar();
-      let msg = `«${f.name}»: ${nuevas.length} estudiantes importados`;
-      if (filas.length - nuevas.length) msg += `, ${filas.length - nuevas.length} ya estaban`;
+      let msg = `«${f.name}»: ${nuevas.length} estudiantes nuevos`;
+      if (actualizar.length) msg += `, ${actualizar.length} ya estaban y se han actualizado`;
+      if (excluidos) msg += `, ${excluidos} de otras áreas ignorados (solo se cogen los de Crítics)`;
+      if (conHorario) msg += `, ${conHorario} con horario día a día`;
       msg += ".";
       if (errores.length) msg += ` ${errores.length} filas sin importar — ${errores.slice(0, 4).join(" ")}${errores.length > 4 ? " …" : ""}`;
       setAviso(msg);
