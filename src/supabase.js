@@ -369,13 +369,16 @@ export async function guardarAliasTodos(aliasArray) {
    tipo: GRADO | MASTER · curso: 1º..4º | Máster
    modalidad (turno): DIA_12H | NIT_12H | NIT_10H | MANANA | TARDE | "" (sin indicar)
    ============================================================ */
-const CAMPOS_EST = "id, nombre, apellido1, apellido2, tipo, curso, escuela, tutora, modalidad, inicio, fin, contacto, notas";
+const CAMPOS_EST = "id, nombre, apellido1, apellido2, tipo, curso, escuela, tutora, modalidad, inicio, fin, contacto, notas, dias, origen";
 function filaEst(e) {
   return {
     nombre: e.nombre || "", apellido1: e.apellido1 || "", apellido2: e.apellido2 || "",
     tipo: e.tipo === "MASTER" ? "MASTER" : "GRADO", curso: e.curso || "", escuela: e.escuela || "",
     tutora: e.tutora || "", modalidad: e.modalidad || "", inicio: e.inicio, fin: e.fin,
     contacto: e.contacto || "", notas: e.notas || "",
+    // dias: [{ f: "2027-01-12", t: "MANANA" }, ...] solo para quien viene por días sueltos
+    // (calendario del máster); origen: "" (manual / Excel de prácticas) | "CAL_MASTER"
+    dias: Array.isArray(e.dias) && e.dias.length ? e.dias : null, origen: e.origen || "",
   };
 }
 
@@ -406,4 +409,12 @@ export async function importarEstudiantes(lista) {
     const { error } = await supabase.from("estudiantes").insert(filas.slice(i, i + 500));
     if (error) throw new Error("No se pudieron importar los estudiantes: " + error.message);
   }
+}
+
+// Reimportar el calendario del máster: borra lo importado antes de ese mismo
+// calendario (origen CAL_MASTER) que empieza dentro de los meses del archivo.
+export async function borrarEstudiantesCalendario(desde, hasta) {
+  const { error } = await supabase.from("estudiantes").delete()
+    .eq("origen", "CAL_MASTER").gte("inicio", desde).lte("inicio", hasta);
+  if (error) throw new Error("No se pudo reemplazar el calendario anterior: " + error.message);
 }

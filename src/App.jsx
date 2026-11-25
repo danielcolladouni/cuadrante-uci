@@ -10,7 +10,7 @@ import {
   cargarAlias, guardarAliasTodos,
   cargarReglas, guardarReglas,
   fijarColectivo,
-  cargarEstudiantes, guardarEstudiante, borrarEstudiante, importarEstudiantes,
+  cargarEstudiantes, guardarEstudiante, borrarEstudiante, importarEstudiantes, borrarEstudiantesCalendario,
 } from "./supabase.js";
 
 /* ============================================================
@@ -3719,7 +3719,18 @@ const estTipoDeCurso = (c) => (c === "Máster" ? "MASTER" : "GRADO");
 const estNombre = (e) => [e.nombre, e.apellido1, e.apellido2].filter(Boolean).join(" ");
 const estFechaCorta = (iso) => { const [y, m, d] = iso.split("-"); return `${+d} ${EST_MESES[+m - 1].toLowerCase()} ${y}`; };
 
+const estPref = (anio, mes) => `${anio}-${String(mes + 1).padStart(2, "0")}-`;
+// Días de un estudiante del calendario del máster dentro de un mes
+const estDiasMes = (e, anio, mes) => (Array.isArray(e.dias) ? e.dias.filter(d => d.f.startsWith(estPref(anio, mes))) : []);
+// Turno de un estudiante en un mes: el suyo, o el más frecuente de sus días ese mes
+function estModMes(e, anio, mes) {
+  const ds = estDiasMes(e, anio, mes);
+  if (!ds.length) return e.modalidad || "";
+  const c = {}; for (const d of ds) c[d.t] = (c[d.t] || 0) + 1;
+  return Object.keys(c).sort((a, b) => c[b] - c[a])[0];
+}
 function estEnMes(e, anio, mes) {
+  if (Array.isArray(e.dias) && e.dias.length) return estDiasMes(e, anio, mes).length > 0;
   const ini = `${anio}-${String(mes + 1).padStart(2, "0")}-01`;
   const fin = `${anio}-${String(mes + 1).padStart(2, "0")}-${String(new Date(anio, mes + 1, 0).getDate()).padStart(2, "0")}`;
   return e.inicio <= fin && e.fin >= ini;
@@ -3803,6 +3814,101 @@ function estLeerExcel(wb) {
   }
   return { filas, errores };
 }
+/* ---------- Calendario del máster («CALENDARIO UCI 26-27») ----------
+   Una hoja por mes. Título en A1 («GENER 2027»). Por cada semana: una fila con
+   los números de día (columnas B..H = lunes..domingo) y debajo filas
+   «TORN MATÍ / TORN TARDA / TORN NIT» (las filas sin etiqueta siguen al turno de
+   arriba) con el nombre del estudiante en la columna del día. El COLOR de la
+   celda dice la jornada, según la leyenda de la propia hoja:
+   naranja = 12 h · verde = 7,33 h (TM o TT) · amarillo = 10 h (TN). */
+const EST_MESES_CAL = { GENER: 0, ENERO: 0, JANUARY: 0, FEBRER: 1, FEBRERO: 1, FEBRUARY: 1, MARC: 2, MARZO: 2, MARCH: 2,
+  ABRIL: 3, APRIL: 3, MAIG: 4, MAYO: 4, MAY: 4, JUNY: 5, JUNIO: 5, JUNE: 5, JULIOL: 6, JULIO: 6, JULY: 6,
+  AGOST: 7, AGOSTO: 7, AUGUST: 7, SETEMBRE: 8, SEPTIEMBRE: 8, SEPTEMBER: 8, OCTUBRE: 9, OCTOBER: 9,
+  NOVEMBRE: 10, NOVIEMBRE: 10, NOVEMBER: 10, DESEMBRE: 11, DICIEMBRE: 11, DECEMBER: 11 };
+function estEsCalendario(wb) {
+  return wb.SheetNames.some(n => {
+    const ws = wb.Sheets[n]; let c = 0;
+    for (let r = 1; r <= 40; r++) { const v = ws["A" + r]; if (v && /^TORN\b/.test(estNormTxt(v.v))) c++; }
+    return c >= 2;
+  });
+}
+function estMesDeHoja(ws, nombreHoja) {
+  for (const txt of [ws.A1 && ws.A1.v, nombreHoja]) {
+    const t = estNormTxt(txt).replace(/[^A-Z0-9 ]/g, " ");
+    const y = (t.match(/(20\d\d)/) || [])[1];
+    const m = t.split(" ").map(w => EST_MESES_CAL[w]).find(x => x != null);
+    if (y && m != null) return { anio: +y, mes: m };
+  }
+  return null;
+}
+function estLeerCalendarioMaster(wb) {
+  const COLS = ["B", "C", "D", "E", "F", "G", "H"];
+  const porNombre = new Map();
+  const errores = [];
+  let desde = "", hasta = "";
+  for (const nombreHoja of wb.SheetNames) {
+    const ws = wb.Sheets[nombreHoja];
+    const mm = estMesDeHoja(ws, nombreHoja);
+    if (!mm) continue;
+    const rango = XLSX.utils.decode_range(ws["!ref"] || "A1:A1");
+    // Leyenda de colores de la hoja (p.ej. K10 «12h» en naranja)
+    const leyenda = {};
+    for (let r = 0; r <= rango.e.r; r++) for (let c = 8; c <= rango.e.c; c++) {
+      const cel = ws[XLSX.utils.encode_cell({ r, c })];
+      if (!cel || cel.v == null) continue;
+      const rgb = cel.s && cel.s.fgColor && cel.s.fgColor.rgb;
+      const t = estNormTxt(cel.v);
+      if (rgb && /12 ?H/.test(t)) leyenda[rgb.slice(-6).toUpperCase()] = 12;
+      else if (rgb && /7[,.]33|TM|TT/.test(t)) leyenda[rgb.slice(-6).toUpperCase()] = 7;
+      else if (rgb && /10 ?H|TN/.test(t)) leyenda[rgb.slice(-6).toUpperCase()] = 10;
+    }
+    if (!Object.keys(leyenda).length) Object.assign(leyenda, { FF9900: 12, "00FF00": 7, FFFF00: 10 });
+    let dias = null, seccion = "";
+    for (let r = 1; r <= rango.e.r + 1; r++) {
+      // ¿fila de números de día?
+      const nums = COLS.map(c => { const v = ws[c + r] && ws[c + r].v; return typeof v === "number" && v >= 1 && v <= 31 ? v : null; });
+      if (nums.some(n => n != null)) { dias = nums; seccion = ""; continue; }
+      const a = estNormTxt(ws["A" + r] && ws["A" + r].v);
+      if (a.startsWith("TORN") || a.startsWith("TURNO")) seccion = /NIT|NOCHE/.test(a) ? "NIT" : /TARD/.test(a) ? "TARDA" : /MATI|MANANA/.test(a) ? "MATI" : "DIA";
+      if (!dias || !seccion) continue;
+      COLS.forEach((c, i) => {
+        const cel = ws[c + r];
+        if (!cel || typeof cel.v !== "string" || !cel.v.trim() || dias[i] == null) return;
+        const nombre = cel.v.replace(/\s+/g, " ").trim();
+        const rgb = ((cel.s && cel.s.fgColor && cel.s.fgColor.rgb) || "").slice(-6).toUpperCase();
+        const h = leyenda[rgb];
+        const t = h === 12 ? (seccion === "NIT" ? "NIT_12H" : "DIA_12H")
+          : h === 10 ? "NIT_10H"
+          : h === 7 ? (seccion === "TARDA" ? "TARDE" : seccion === "NIT" ? "NIT_10H" : "MANANA")
+          : seccion === "NIT" ? "NIT_10H" : seccion === "TARDA" ? "TARDE" : seccion === "MATI" ? "MANANA" : "DIA_12H";
+        const f = `${mm.anio}-${String(mm.mes + 1).padStart(2, "0")}-${String(dias[i]).padStart(2, "0")}`;
+        const k = estNormTxt(nombre);
+        if (!porNombre.has(k)) porNombre.set(k, { nombre, dias: [] });
+        const est = porNombre.get(k);
+        if (!est.dias.some(d => d.f === f && d.t === t)) est.dias.push({ f, t });
+      });
+    }
+    const ini = `${mm.anio}-${String(mm.mes + 1).padStart(2, "0")}-01`;
+    const fin = `${mm.anio}-${String(mm.mes + 1).padStart(2, "0")}-${String(new Date(mm.anio, mm.mes + 1, 0).getDate()).padStart(2, "0")}`;
+    if (!desde || ini < desde) desde = ini;
+    if (!hasta || fin > hasta) hasta = fin;
+  }
+  const filas = [...porNombre.values()].map(x => {
+    x.dias.sort((a, b) => a.f.localeCompare(b.f));
+    const cuenta = {}; for (const d of x.dias) cuenta[d.t] = (cuenta[d.t] || 0) + 1;
+    const partes = x.nombre.split(" ");
+    return {
+      nombre: partes[0], apellido1: partes.slice(1).join(" "), apellido2: "",
+      tipo: "MASTER", curso: "Máster", escuela: "MÁSTER UCI", tutora: "",
+      modalidad: Object.keys(cuenta).sort((a, b) => cuenta[b] - cuenta[a])[0] || "",
+      inicio: x.dias[0].f, fin: x.dias[x.dias.length - 1].f, contacto: "", notas: "",
+      dias: x.dias, origen: "CAL_MASTER",
+    };
+  });
+  if (!filas.length) errores.push("No se ha encontrado ningún estudiante en el calendario.");
+  return { filas, errores, desde, hasta };
+}
+
 function estExportarExcel(lista) {
   const cab = ["INICIO", "FIN", "ENFERMERA TUTORA", "TURNO", "NOMBRE", "APELLIDO 1", "APELLIDO 2", "ESCUELA", "CURSO", "CONTACTO", "NOTAS"];
   const filas = lista.slice().sort((a, b) => (a.inicio + a.fin).localeCompare(b.inicio + b.fin) || estNombre(a).localeCompare(estNombre(b)))
@@ -3816,6 +3922,67 @@ function estExportarExcel(lista) {
 }
 
 const EST_VACIO = { nombre: "", apellido1: "", apellido2: "", curso: "4º", escuela: "", tutora: "", modalidad: "DIA_12H", inicio: "", fin: "", contacto: "", notas: "" };
+
+function EstCalendarioMaster({ lista, anio, mes, onEditar }) {
+  const est = lista.filter(e => estDiasMes(e, anio, mes).length > 0);
+  if (!est.length) return null;
+  const nDias = new Date(anio, mes + 1, 0).getDate();
+  const offset = (new Date(anio, mes, 1).getDay() + 6) % 7;   // lunes = 0
+  const porDia = {};
+  for (const e of est) for (const d of estDiasMes(e, anio, mes)) {
+    (porDia[d.f] = porDia[d.f] || []).push({ e, t: d.t });
+  }
+  const orden = { MANANA: 0, DIA_12H: 1, TARDE: 2, NIT_12H: 3, NIT_10H: 4 };
+  const celdas = [];
+  for (let i = 0; i < offset; i++) celdas.push(null);
+  for (let d = 1; d <= nDias; d++) celdas.push(d);
+  const resumen = est.map(e => {
+    const ds = estDiasMes(e, anio, mes); const c = {};
+    for (const d of ds) c[d.t] = (c[d.t] || 0) + 1;
+    return { e, n: ds.length, c };
+  }).sort((a, b) => b.n - a.n || estNombre(a.e).localeCompare(estNombre(b.e)));
+  return (
+    <div className="est-card">
+      <div className="est-card-head">
+        <h2>Máster UCI · calendario de {EST_MESES_LARGO[mes]}</h2>
+        <div className="est-leyenda">{EST_MODALIDADES.filter(m => m.id && est.some(e => estDiasMes(e, anio, mes).some(d => d.t === m.id))).map(m => <span key={m.id}><i style={{ background: m.color }} />{m.label}</span>)}</div>
+      </div>
+      <div className="est-scroll">
+        <div className="est-cal">
+          {["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"].map(d => <div key={d} className="est-cal-dow">{d}</div>)}
+          {celdas.map((d, i) => {
+            if (d == null) return <div key={"v" + i} className="est-cal-dia is-vacio" />;
+            const f = `${anio}-${String(mes + 1).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+            const items = (porDia[f] || []).slice().sort((a, b) => (orden[a.t] ?? 9) - (orden[b.t] ?? 9));
+            return (
+              <div key={f} className={"est-cal-dia" + (i % 7 >= 5 ? " is-finde" : "")}>
+                <div className="est-cal-num">{d}{items.length > 0 && <span>{items.length}</span>}</div>
+                {items.map((x, j) => { const m = estMod(x.t); return (
+                  <div key={j} className="est-cal-chip" style={{ background: m.color, color: x.t === "NIT_12H" ? "#fff" : "#1d2530" }} title={`${estNombre(x.e)} · ${m.label}`}>{estNombre(x.e)}</div>
+                ); })}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+      <table className="est-tabla est-resumen-master">
+        <thead><tr><th>Estudiante</th><th className="est-num">Turnos en {EST_MESES_LARGO[mes]}</th><th>Reparto</th><th></th></tr></thead>
+        <tbody>
+          {resumen.map(({ e, n, c }) => (
+            <tr key={e.id}>
+              <td><b>{estNombre(e)}</b></td>
+              <td className="est-num"><b>{n}</b></td>
+              <td>{Object.keys(c).sort((a, b) => (orden[a] ?? 9) - (orden[b] ?? 9)).map(t => { const m = estMod(t); return (
+                <span key={t} className="est-turno" style={{ background: m.color, color: t === "NIT_12H" ? "#fff" : "#1d2530", marginRight: 4 }}>{m.label} · {c[t]}</span>
+              ); })}</td>
+              <td className="est-nowrap"><button className="est-link" onClick={() => onEditar(e)}>Editar</button></td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
 
 function EstudiantesPanel() {
   const hoy = new Date();
@@ -3849,17 +4016,19 @@ function EstudiantesPanel() {
     for (const e of mesActual.est) {
       const k = e.curso || "Sin curso";
       if (!g.has(k)) g.set(k, { curso: k, tipo: e.tipo, total: 0, mods: {} });
-      const x = g.get(k); x.total++; x.mods[e.modalidad || ""] = (x.mods[e.modalidad || ""] || 0) + 1;
+      const md = estModMes(e, anio, mesSel);
+      const x = g.get(k); x.total++; x.mods[md] = (x.mods[md] || 0) + 1;
     }
     const orden = ["4º", "3º", "2º", "1º", "Máster", "Sin curso"];
     return [...g.values()].sort((a, b) => orden.indexOf(a.curso) - orden.indexOf(b.curso));
-  }, [mesActual]);
-  const modsUsadas = EST_MODALIDADES.filter(m => mesActual.est.some(e => (e.modalidad || "") === m.id));
+  }, [mesActual, anio, mesSel]);
+  const modsUsadas = EST_MODALIDADES.filter(m => mesActual.est.some(e => estModMes(e, anio, mesSel) === m.id));
 
   // Periodos (mismas fechas de inicio y fin) visibles: los del mes elegido o todos
   const periodos = useMemo(() => {
     const q = estNormTxt(busca);
-    const base = (lista || []).filter(e => verTodos || estEnMes(e, anio, mesSel))
+    const base = (lista || []).filter(e => !(Array.isArray(e.dias) && e.dias.length))
+      .filter(e => verTodos || estEnMes(e, anio, mesSel))
       .filter(e => !q || estNormTxt([estNombre(e), e.tutora, e.escuela, e.contacto].join(" ")).includes(q));
     const g = new Map();
     for (const e of base) {
@@ -3890,7 +4059,20 @@ function EstudiantesPanel() {
     ev.target.value = "";
     if (!f) return;
     try {
-      const wb = XLSX.read(await f.arrayBuffer(), { cellDates: true });
+      const buf = await f.arrayBuffer();
+      const wbCal = XLSX.read(buf, { cellStyles: true });
+      if (estEsCalendario(wbCal)) {
+        // Calendario del máster: sustituye lo importado antes de ese calendario
+        const { filas, errores, desde, hasta } = estLeerCalendarioMaster(wbCal);
+        if (!filas.length) { setAviso(errores.join(" ")); return; }
+        await borrarEstudiantesCalendario(desde, hasta);
+        await importarEstudiantes(filas);
+        await recargar();
+        const turnos = filas.reduce((n, e) => n + e.dias.length, 0);
+        setAviso(`Calendario del máster «${f.name}»: ${filas.length} estudiantes y ${turnos} turnos entre ${estFechaCorta(desde)} y ${estFechaCorta(hasta)}. Si ya se había importado, se ha actualizado.`);
+        return;
+      }
+      const wb = XLSX.read(buf, { cellDates: true });
       const { filas, errores } = estLeerExcel(wb);
       // no duplicar: mismo nombre, primer apellido e inicio
       const clave = (e) => estNormTxt(e.nombre + "|" + e.apellido1 + "|" + e.inicio);
@@ -3966,7 +4148,7 @@ function EstudiantesPanel() {
         </div>
         {mesActual.total > 0 && (<>
           <div className="est-mods">
-            {modsUsadas.map(m => { const n = mesActual.est.filter(e => (e.modalidad || "") === m.id).length; return (
+            {modsUsadas.map(m => { const n = mesActual.est.filter(e => estModMes(e, anio, mesSel) === m.id).length; return (
               <div key={m.id} className="est-mod" style={{ flex: n, background: m.color }} title={`${m.label}: ${n}`}><span>{m.label} · {n}</span></div>
             ); })}
           </div>
@@ -3986,6 +4168,9 @@ function EstudiantesPanel() {
           </div>
         </>)}
       </div>
+
+      {/* Calendario del máster (estudiantes que vienen por días sueltos) */}
+      <EstCalendarioMaster lista={lista} anio={anio} mes={mesSel} onEditar={e => { setForm({ ...EST_VACIO, ...e }); setAviso(""); }} />
 
       {/* Periodos con parejas tutora - estudiante */}
       <div className="est-card">
@@ -6621,6 +6806,14 @@ td.data-cell:has(.nota-edit) { overflow: visible; }
 .est-turno { display: inline-block; font-size: 11.5px; font-weight: 650; color: #1d2530; border-radius: 999px; padding: 2px 9px; white-space: nowrap; }
 .est-contacto { font-size: 12.5px; color: var(--ink-soft); word-break: break-all; }
 .est-lista { table-layout: fixed; }
+.est-cal { display: grid; grid-template-columns: repeat(7, minmax(110px, 1fr)); gap: 4px; min-width: 780px; margin-bottom: 16px; }
+.est-cal-dow { font-size: 11.5px; font-weight: 650; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; padding: 2px 6px; }
+.est-cal-dia { border: 1px solid var(--line); border-radius: 8px; padding: 5px; min-height: 74px; display: flex; flex-direction: column; gap: 3px; background: var(--surface); }
+.est-cal-dia.is-vacio { border: 0; background: transparent; }
+.est-cal-dia.is-finde { background: var(--panel); }
+.est-cal-num { font-size: 12px; font-weight: 650; color: var(--ink-soft); display: flex; justify-content: space-between; }
+.est-cal-num span { font-weight: 600; color: var(--muted); font-size: 11px; }
+.est-cal-chip { font-size: 11px; font-weight: 600; border-radius: 5px; padding: 2px 5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 @media (max-width: 640px) {
   .est-periodo .est-lista, .est-periodo .est-lista tbody { display: block; }
   .est-periodo .est-lista thead, .est-periodo .est-lista colgroup { display: none; }
