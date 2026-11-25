@@ -4021,7 +4021,7 @@ function estExportarExcel(lista) {
 
 const EST_VACIO = { nombre: "", apellido1: "", apellido2: "", curso: "4º", escuela: "", tutora: "", modalidad: "DIA_12H", inicio: "", fin: "", contacto: "", notas: "", tutora_prof: "", tutora_prof2: "" };
 
-function EstCalendarioMaster({ lista, anio, mes, onEditar, onCalendario }) {
+function EstCalendarioMaster({ lista, anio, mes, onEditar, onCalendario, apodoEnf }) {
   const est = lista.filter(e => estDiasMes(e, anio, mes).length > 0);
   if (!est.length) return null;
   const nDias = new Date(anio, mes + 1, 0).getDate();
@@ -4064,11 +4064,14 @@ function EstCalendarioMaster({ lista, anio, mes, onEditar, onCalendario }) {
         </div>
       </div>
       <table className="est-tabla est-resumen-master">
-        <thead><tr><th>Estudiante</th><th className="est-num">Turnos en {EST_MESES_LARGO[mes]}</th><th>Reparto</th><th></th></tr></thead>
+        <thead><tr><th>Estudiante</th><th>Enfermera referente</th><th className="est-num">Turnos en {EST_MESES_LARGO[mes]}</th><th>Reparto</th><th></th></tr></thead>
         <tbody>
           {resumen.map(({ e, n, c }) => (
             <tr key={e.id}>
               <td><b>{estNombre(e)}</b> <span className="est-tag" style={{ background: EST_COLOR[e.tipo] }}>{e.tipo === "MASTER" ? "Máster" : "Grado " + (e.curso || "")}</span></td>
+              <td className="est-tutora">{e.tutora_prof
+                ? <span className="est-vinc">✓ {[e.tutora_prof, e.tutora_prof2].filter(Boolean).map(apodoEnf).join(" / ")}</span>
+                : <span className="est-falta">sin vincular</span>}</td>
               <td className="est-num"><b>{n}</b></td>
               <td>{Object.keys(c).sort((a, b) => (orden[a] ?? 9) - (orden[b] ?? 9)).map(t => { const m = estMod(t); return (
                 <span key={t} className="est-turno" style={{ background: m.color, color: t === "NIT_12H" ? "#fff" : "#1d2530", marginRight: 4 }}>{m.label} · {c[t]}</span>
@@ -4146,10 +4149,9 @@ function estMesesDe(inicio, fin) {
 // web muestra ese y NO lo recalcula: se congela al generarlo.)
 async function estCalcularCalendario(est, enfermeras) {
   const refs = [est.tutora_prof, est.tutora_prof2].filter(Boolean);
-  if (!refs.length) {
-    if (Array.isArray(est.dias) && est.dias.length) return { dias: est.dias.map(d => ({ ...d })), hasta: est.fin, fuente: "calendario" };
-    return { dias: [], hasta: "", fuente: "sin-enfermera" };
-  }
+  // Sin enfermera vinculada no hay calendario de prácticas (tampoco para los de
+  // máster: sus días del calendario del máster solo se muestran como referencia)
+  if (!refs.length) return { dias: [], hasta: "", fuente: "sin-enfermera" };
   const [filas, hasta] = await Promise.all([cargarTurnosEnfermeras(refs, est.inicio, est.fin), ultimoDiaCronogramaEnfermeria()]);
   const porDia = new Map();   // fecha -> prof -> Set(letras)
   for (const r of filas) {
@@ -4256,7 +4258,7 @@ function EstCalendarioPracticas({ est, enfermeras, onCerrar, onGuardado }) {
         </div>
         {err && <div className="est-alerta">{err}</div>}
         {!cal && !err && <p className="est-muted">Calculando…</p>}
-        {cal && cal.fuente === "sin-enfermera" && <div className="est-aviso">Este estudiante aún no tiene enfermera referente vinculada. Pulsa «Editar» y elígela de la plantilla de enfermería.</div>}
+        {cal && cal.fuente === "sin-enfermera" && <div className="est-aviso est-prev">Este estudiante aún no tiene enfermera referente vinculada, así que todavía no tiene calendario de prácticas. Pulsa «Editar» y elígela de la plantilla de enfermería.</div>}
         {cal && cal.fuente !== "sin-enfermera" && (<>
           <div className="est-kpis">
             <div className="est-kpi"><b>{cal.dias.length}</b><span>días de prácticas</span></div>
@@ -4333,7 +4335,7 @@ function EstudiantesPanel() {
   const apodoEnf = (n) => { const p = enfermeras.find(x => x.nombre === n); return p ? (p.apodo || p.nombre) : n; };
   // Genera y congela el calendario de quien tiene enfermera vinculada y aún no lo tiene
   async function generarPendientes() {
-    const pend = (lista || []).filter(e => e.tutora_prof && !e.calendario && e.origen !== "CAL_MASTER");
+    const pend = (lista || []).filter(e => e.tutora_prof && !e.calendario);
     if (!pend.length) { setAviso("No hay estudiantes con enfermera vinculada pendientes de generar calendario."); return; }
     if (!window.confirm(`Se generarán y fijarán los calendarios de ${pend.length} estudiantes con el cronograma de enfermería actual. ¿Continuar?`)) return;
     let ok = 0, vacios = 0;
@@ -4356,7 +4358,8 @@ function EstudiantesPanel() {
       await guardarEstudiante({ ...e, tutora_prof: a, tutora_prof2: b || "" }); ok++;
     }
     await recargar();
-    setAviso(`Enfermeras vinculadas: ${ok}.` + (sin.length ? ` Sin coincidencia clara en la plantilla (vincúlalas con «Editar»): ${sin.slice(0, 8).join("; ")}${sin.length > 8 ? "…" : ""}.` : "") + (!pend.length ? " No había estudiantes pendientes de vincular." : ""));
+    setAviso(`Enfermeras vinculadas: ${ok}.` + (sin.length ? ` Sin coincidencia clara en la plantilla (vincúlalas con «Editar»): ${sin.slice(0, 8).join("; ")}${sin.length > 8 ? "…" : ""}.` : "") + (!pend.length ? " No había estudiantes con tutora pendientes de vincular." : "")
+      + ((lista || []).some(e => !e.tutora_prof && !e.tutora) ? ` ${(lista || []).filter(e => !e.tutora_prof && !e.tutora).length} estudiantes no traen ninguna tutora en su archivo (p.ej. los del máster): vincúlalos a mano con «Editar».` : ""));
   }
 
   const porMes = useMemo(() => Array.from({ length: 12 }, (_, m) => {
@@ -4543,7 +4546,7 @@ function EstudiantesPanel() {
       </div>
 
       {/* Calendario del máster (estudiantes que vienen por días sueltos) */}
-      <EstCalendarioMaster lista={lista} anio={anio} mes={mesSel} onEditar={e => { setForm({ ...EST_VACIO, ...e }); setAviso(""); }} onCalendario={setCalEst} />
+      <EstCalendarioMaster lista={lista} anio={anio} mes={mesSel} onEditar={e => { setForm({ ...EST_VACIO, ...e }); setAviso(""); }} onCalendario={setCalEst} apodoEnf={apodoEnf} />
 
       {/* Periodos con parejas tutora - estudiante */}
       <div className="est-card">
