@@ -11,6 +11,7 @@ import {
   cargarReglas, guardarReglas,
   fijarColectivo,
   cargarEstudiantes, guardarEstudiante, borrarEstudiante, importarEstudiantes, borrarEstudiantesCalendario,
+  cargarEnfermerasReferentes, cargarTurnosEnfermeras, ultimoDiaCronogramaEnfermeria,
 } from "./supabase.js";
 
 /* ============================================================
@@ -4018,9 +4019,9 @@ function estExportarExcel(lista) {
   XLSX.writeFile(wb, "Estudiantes_practicas.xlsx");
 }
 
-const EST_VACIO = { nombre: "", apellido1: "", apellido2: "", curso: "4º", escuela: "", tutora: "", modalidad: "DIA_12H", inicio: "", fin: "", contacto: "", notas: "" };
+const EST_VACIO = { nombre: "", apellido1: "", apellido2: "", curso: "4º", escuela: "", tutora: "", modalidad: "DIA_12H", inicio: "", fin: "", contacto: "", notas: "", tutora_prof: "", tutora_prof2: "" };
 
-function EstCalendarioMaster({ lista, anio, mes, onEditar }) {
+function EstCalendarioMaster({ lista, anio, mes, onEditar, onCalendario }) {
   const est = lista.filter(e => estDiasMes(e, anio, mes).length > 0);
   if (!est.length) return null;
   const nDias = new Date(anio, mes + 1, 0).getDate();
@@ -4072,11 +4073,238 @@ function EstCalendarioMaster({ lista, anio, mes, onEditar }) {
               <td>{Object.keys(c).sort((a, b) => (orden[a] ?? 9) - (orden[b] ?? 9)).map(t => { const m = estMod(t); return (
                 <span key={t} className="est-turno" style={{ background: m.color, color: t === "NIT_12H" ? "#fff" : "#1d2530", marginRight: 4 }}>{m.label} · {c[t]}</span>
               ); })}</td>
-              <td className="est-nowrap"><button className="est-link" onClick={() => onEditar(e)}>Editar</button></td>
+              <td className="est-nowrap">{onCalendario && <button className="est-link" onClick={() => onCalendario(e)}>Calendario</button>}<button className="est-link" onClick={() => onEditar(e)}>Editar</button></td>
             </tr>
           ))}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+/* ---------- Enfermera referente y calendario de prácticas ----------
+   La supervisora vincula cada estudiante a una enfermera de la plantilla de
+   enfermería (y opcionalmente a una segunda). El calendario de prácticas del
+   estudiante son los días de su periodo en que esa enfermera trabaja según el
+   cronograma de enfermería guardado (histórico: semanas generadas y semanas
+   reales sincronizadas con INF_PLANING SETMANAL). */
+const EST_STOP = new Set(["DE", "DEL", "LA", "LAS", "LOS", "EL", "I", "Y"]);
+function estPalabras(t) {
+  return estNormTxt(String(t || "").replace(/M[ªa]\.?\s/gi, "MARIA ")).replace(/[^A-Z ]/g, " ")
+    .split(" ").filter(w => w.length >= 2 && !EST_STOP.has(w)).map(w => w.replace(/([A-Z])\1/g, "$1"));
+}
+// Dos palabras «son la misma»: iguales, una prefijo de la otra (ANABEL/ANABELEN)
+// o a una letra de distancia (MONTSERRATE/MONSERRATE).
+function estPalabraIgual(a, b) {
+  if (a === b) return true;
+  if (Math.min(a.length, b.length) >= 4 && (a.startsWith(b) || b.startsWith(a))) return true;
+  if (Math.min(a.length, b.length) < 5 || Math.abs(a.length - b.length) > 1) return false;
+  let i = 0, j = 0, dif = 0;
+  while (i < a.length && j < b.length) {
+    if (a[i] === b[j]) { i++; j++; continue; }
+    if (++dif > 1) return false;
+    if (a.length > b.length) i++; else if (b.length > a.length) j++; else { i++; j++; }
+  }
+  return dif + (a.length - i) + (b.length - j) <= 1;
+}
+// Propone las enfermeras de la plantilla que corresponden al texto «tutora» del
+// Excel (p.ej. «ALBA MEDINA PLACERES», «LAIA CADAFALCH/ANA RUIZ»).
+function estAutoEnfermeras(texto, enfermeras) {
+  const out = [];
+  for (const parte of String(texto || "").split("/")) {
+    const ws = estPalabras(parte);
+    if (!ws.length) continue;
+    let mejor = null, mejorS = 0, empate = false;
+    for (const p of enfermeras) {
+      const pal = estPalabras(p.nombre + " " + (p.apodo || ""));
+      const sc = ws.filter(w => pal.some(x => estPalabraIgual(w, x))).length;
+      if (sc > mejorS) { mejor = p; mejorS = sc; empate = false; }
+      else if (sc === mejorS && sc > 0) empate = true;
+    }
+    if (mejor && !empate && mejorS >= Math.min(2, ws.length)) out.push(mejor.nombre);
+  }
+  return [...new Set(out)].slice(0, 2);
+}
+// Turno de una enfermera un día a partir de sus filas del histórico (M/T/N)
+function estTurnoEnfermera(letras, turnoPlantilla) {
+  if (letras.has("N")) return /12/.test(turnoPlantilla || "") ? "NIT_12H" : "NIT_10H";
+  if (letras.has("M") && letras.has("T")) return "DIA_12H";
+  if (letras.has("M")) return /12/.test(turnoPlantilla || "") ? "DIA_12H" : "MANANA";
+  if (letras.has("T")) return /12/.test(turnoPlantilla || "") ? "DIA_12H" : "TARDE";
+  return "";
+}
+const EST_DOW = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"];
+function estIso(d) { return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; }
+function estMesesDe(inicio, fin) {
+  const out = []; let [y, m] = inicio.split("-").map(Number); const [y2, m2] = fin.split("-").map(Number);
+  while (y < y2 || (y === y2 && m <= m2)) { out.push([y, m - 1]); m++; if (m > 12) { m = 1; y++; } }
+  return out;
+}
+
+// Calcula los días de prácticas de un estudiante a partir del cronograma de
+// enfermería guardado en ese momento. (Si ya tiene un calendario generado, la
+// web muestra ese y NO lo recalcula: se congela al generarlo.)
+async function estCalcularCalendario(est, enfermeras) {
+  const refs = [est.tutora_prof, est.tutora_prof2].filter(Boolean);
+  if (!refs.length) {
+    if (Array.isArray(est.dias) && est.dias.length) return { dias: est.dias.map(d => ({ ...d })), hasta: est.fin, fuente: "calendario" };
+    return { dias: [], hasta: "", fuente: "sin-enfermera" };
+  }
+  const [filas, hasta] = await Promise.all([cargarTurnosEnfermeras(refs, est.inicio, est.fin), ultimoDiaCronogramaEnfermeria()]);
+  const porDia = new Map();   // fecha -> prof -> Set(letras)
+  for (const r of filas) {
+    if (!porDia.has(r.f)) porDia.set(r.f, new Map());
+    const m = porDia.get(r.f); if (!m.has(r.prof)) m.set(r.prof, new Set()); m.get(r.prof).add(r.turno);
+  }
+  const turnoPl = (n) => (enfermeras.find(p => p.nombre === n) || {}).turno || "";
+  const dias = [];
+  for (const [f, m] of [...porDia.entries()].sort()) {
+    const prof = refs.find(r => m.has(r));          // primero la referente principal
+    const t = estTurnoEnfermera(m.get(prof), turnoPl(prof));
+    if (t) dias.push({ f, t, prof });
+  }
+  return { dias, hasta, fuente: "cronograma" };
+}
+
+function estHtmlCalendario(est, cal, apodo) {
+  const esc = (x) => String(x || "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const porF = new Map(cal.dias.map(d => [d.f, d]));
+  let html = "";
+  for (const [y, m] of estMesesDe(est.inicio, est.fin)) {
+    const n = new Date(y, m + 1, 0).getDate(), off = (new Date(y, m, 1).getDay() + 6) % 7;
+    html += `<section><h2>${EST_MESES_LARGO[m].replace(/^./, c => c.toUpperCase())} ${y}</h2><div class="g">` + EST_DOW.map(d => `<div class="h">${d}</div>`).join("");
+    for (let i = 0; i < off; i++) html += `<div></div>`;
+    for (let d = 1; d <= n; d++) {
+      const f = `${y}-${String(m + 1).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+      const x = porF.get(f), fuera = f < est.inicio || f > est.fin, pend = !fuera && cal.hasta && f > cal.hasta;
+      const mm = x ? estMod(x.t) : null;
+      html += `<div class="d${fuera ? " o" : ""}${pend ? " p" : ""}" ${mm ? `style="background:${mm.color};color:${x.t === "NIT_12H" ? "#fff" : "#1d2530"}"` : ""}><b>${d}</b>${mm ? `<span>${esc(mm.label)}</span>` : pend ? "<span>pendiente</span>" : ""}</div>`;
+    }
+    html += `</div></section>`;
+  }
+  return `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><title>Calendario de prácticas · ${esc(estNombre(est))}</title>
+<style>body{font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;color:#1d2530;margin:28px}h1{font-size:20px;margin:0 0 4px}p{margin:0 0 4px;color:#555;font-size:13px}
+section{break-inside:avoid;margin-top:18px}h2{font-size:15px;margin:0 0 6px}.g{display:grid;grid-template-columns:repeat(7,1fr);gap:3px}
+.h{font-size:11px;font-weight:700;color:#777;text-transform:uppercase;padding:2px 4px}.d{border:1px solid #ddd;border-radius:6px;min-height:46px;padding:4px;font-size:11px;display:flex;flex-direction:column;gap:2px;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+.d b{font-size:12px}.d.o{background:#f4f4f4;color:#bbb;border-color:#eee}.d.p{background:repeating-linear-gradient(45deg,#fafafa,#fafafa 4px,#f0f0f0 4px,#f0f0f0 8px);color:#999}</style></head><body>
+<h1>Calendario de prácticas</h1><p><b>${esc(estNombre(est))}</b>${est.curso ? " · " + esc(est.curso) : ""}${est.escuela ? " · " + esc(est.escuela) : ""}</p>
+<p>Del ${esc(estFechaCorta(est.inicio))} al ${esc(estFechaCorta(est.fin))}${apodo ? " · Enfermera referente: " + esc(apodo) : ""} · ${cal.dias.length} días</p>${html}</body></html>`;
+}
+
+function EstCalendarioPracticas({ est, enfermeras, onCerrar, onGuardado }) {
+  const [cal, setCal] = useState(null);
+  const [err, setErr] = useState("");
+  const [ocupado, setOcupado] = useState(false);
+  const [ultimo, setUltimo] = useState("");
+  const congelado = !!(est.calendario && Array.isArray(est.calendario.dias));
+  useEffect(() => {
+    setErr("");
+    if (congelado) { setCal({ ...est.calendario, fuente: "guardado" }); ultimoDiaCronogramaEnfermeria().then(setUltimo).catch(() => {}); }
+    else estCalcularCalendario(est, enfermeras).then(c => { setCal(c); setUltimo(c.hasta || ""); }).catch(e => setErr(e.message));
+  }, [est, enfermeras, congelado]);
+  // Guardar (congelar) el calendario. modo: "nuevo" | "completar" (solo añade días posteriores) | "regenerar"
+  async function generar(modo) {
+    if (modo === "regenerar" && !window.confirm("Se recalculará TODO el calendario con el cronograma actual y se perderá el que se entregó al estudiante. ¿Seguro?")) return;
+    setOcupado(true); setErr("");
+    try {
+      const nuevo = await estCalcularCalendario(est, enfermeras);
+      let dias = nuevo.dias;
+      if (modo === "completar" && congelado) {
+        const corte = est.calendario.hasta || "";
+        dias = [...est.calendario.dias, ...nuevo.dias.filter(d => d.f > corte)];
+      }
+      const calendario = { generado: new Date().toISOString(), hasta: nuevo.hasta || "", dias: dias.map(d => ({ f: d.f, t: d.t, prof: d.prof || "" })) };
+      const guardado = await guardarEstudiante({ ...est, calendario });
+      onGuardado && onGuardado(guardado);
+    } catch (e) { setErr(e.message); }
+    finally { setOcupado(false); }
+  }
+  const apodoDe = (n) => { const p = enfermeras.find(x => x.nombre === n); return p ? (p.apodo || p.nombre) : n; };
+  const apodos = [est.tutora_prof, est.tutora_prof2].filter(Boolean).map(apodoDe).join(" / ");
+  const porF = new Map((cal ? cal.dias : []).map(d => [d.f, d]));
+  const cuenta = {}; (cal ? cal.dias : []).forEach(d => { cuenta[d.t] = (cuenta[d.t] || 0) + 1; });
+  const pendiente = cal && cal.hasta && cal.hasta < est.fin;
+  const hayMasCronograma = congelado && pendiente && ultimo && ultimo > cal.hasta;
+
+  function imprimir() {
+    const w = window.open("", "_blank");
+    if (!w) return;
+    w.document.write(estHtmlCalendario(est, cal, apodos)); w.document.close();
+    setTimeout(() => w.print(), 300);
+  }
+  function excel() {
+    const filas = [["Calendario de prácticas · " + estNombre(est)], [`Del ${estFechaCorta(est.inicio)} al ${estFechaCorta(est.fin)}` + (apodos ? ` · Enfermera referente: ${apodos}` : "")], [], ["Fecha", "Día", "Turno"]];
+    for (const d of cal.dias) {
+      const dt = new Date(d.f + "T12:00:00");
+      filas.push([d.f.split("-").reverse().join("/"), EST_DOW[(dt.getDay() + 6) % 7], estMod(d.t).label]);
+    }
+    filas.push([], ["Total días", cal.dias.length]);
+    const ws = XLSX.utils.aoa_to_sheet(filas); ws["!cols"] = [{ wch: 12 }, { wch: 6 }, { wch: 14 }];
+    const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, "Calendario");
+    XLSX.writeFile(wb, `Calendario_practicas_${estNombre(est).replace(/\s+/g, "_")}.xlsx`);
+  }
+
+  return (
+    <div className="est-modal" onClick={onCerrar}>
+      <div className="est-modal-card est-modal-ancho" onClick={ev => ev.stopPropagation()}>
+        <div className="est-card-head">
+          <div>
+            <h2>Calendario de prácticas · {estNombre(est)}</h2>
+            <p className="est-muted">Del {estFechaCorta(est.inicio)} al {estFechaCorta(est.fin)}{apodos ? ` · Enfermera referente: ${apodos}` : ""}</p>
+          </div>
+          <button className="est-btn" onClick={onCerrar}>Cerrar</button>
+        </div>
+        {err && <div className="est-alerta">{err}</div>}
+        {!cal && !err && <p className="est-muted">Calculando…</p>}
+        {cal && cal.fuente === "sin-enfermera" && <div className="est-aviso">Este estudiante aún no tiene enfermera referente vinculada. Pulsa «Editar» y elígela de la plantilla de enfermería.</div>}
+        {cal && cal.fuente !== "sin-enfermera" && (<>
+          <div className="est-kpis">
+            <div className="est-kpi"><b>{cal.dias.length}</b><span>días de prácticas</span></div>
+            {Object.keys(cuenta).map(t => <div key={t} className="est-kpi"><b>{cuenta[t]}</b><span>{estMod(t).label}</span></div>)}
+          </div>
+          {congelado
+            ? <div className="est-aviso est-ok">Calendario generado el {new Date(est.calendario.generado).toLocaleDateString("es-ES")} y guardado. Es el que tiene el estudiante: los cambios posteriores del cronograma de enfermería no lo modifican (si un día su enfermera no está, se le reasigna en la unidad).</div>
+            : cal.fuente === "cronograma" && <div className="est-aviso est-prev">Vista previa sin guardar. Pulsa <b>Generar calendario</b> para fijarlo: a partir de ese momento ya no cambiará.</div>}
+          {pendiente && <div className="est-aviso">{congelado ? "Al generarlo solo había" : "Ahora mismo solo hay"} cronograma de enfermería hasta el {estFechaCorta(cal.hasta)}. {hayMasCronograma ? "Ya hay cronogramas de semanas posteriores: pulsa «Completar días pendientes» para añadirlos sin tocar los ya fijados." : "Los días posteriores se podrán completar cuando se generen esos cronogramas."}</div>}
+          <div className="est-scroll">
+            {estMesesDe(est.inicio, est.fin).map(([y, m]) => {
+              const n = new Date(y, m + 1, 0).getDate(), off = (new Date(y, m, 1).getDay() + 6) % 7;
+              const celdas = [...Array(off).fill(null), ...Array.from({ length: n }, (_, i) => i + 1)];
+              return (
+                <div key={y + "-" + m} className="est-pc-mes">
+                  <h3>{EST_MESES_LARGO[m].replace(/^./, c => c.toUpperCase())} {y}</h3>
+                  <div className="est-cal est-pc">
+                    {EST_DOW.map(d => <div key={d} className="est-cal-dow">{d}</div>)}
+                    {celdas.map((d, i) => {
+                      if (d == null) return <div key={"v" + i} className="est-cal-dia is-vacio" />;
+                      const f = `${y}-${String(m + 1).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+                      const x = porF.get(f); const fuera = f < est.inicio || f > est.fin; const pend = !fuera && cal.hasta && f > cal.hasta;
+                      const mm = x ? estMod(x.t) : null;
+                      return (
+                        <div key={f} className={"est-cal-dia" + (fuera ? " is-fuera" : "") + (pend ? " is-pend" : "")}
+                          style={mm ? { background: mm.color, borderColor: mm.color, color: x.t === "NIT_12H" ? "#fff" : "#1d2530" } : undefined}
+                          title={x && x.prof ? `Con ${apodoDe(x.prof)}` : undefined}>
+                          <div className="est-cal-num" style={mm ? { color: "inherit" } : undefined}>{d}</div>
+                          {mm && <div className="est-pc-t">{mm.label}</div>}
+                          {pend && !mm && <div className="est-pc-p">pendiente</div>}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          <div className="est-modal-btns">
+            {congelado && <button className="est-btn est-btn-del" disabled={ocupado} onClick={() => generar("regenerar")}>Regenerar desde cero</button>}
+            <span style={{ flex: 1 }} />
+            {!congelado && cal.fuente === "cronograma" && <button className="est-btn est-btn-primary" disabled={ocupado || !cal.dias.length} onClick={() => generar("nuevo")}>{ocupado ? "Guardando…" : "Generar calendario"}</button>}
+            {hayMasCronograma && <button className="est-btn est-btn-primary" disabled={ocupado} onClick={() => generar("completar")}>{ocupado ? "Guardando…" : "Completar días pendientes"}</button>}
+            <button className="est-btn" onClick={excel} disabled={!cal.dias.length}>Descargar Excel</button>
+            <button className="est-btn" onClick={imprimir} disabled={!cal.dias.length}>Imprimir / PDF</button>
+          </div>
+        </>)}
+      </div>
     </div>
   );
 }
@@ -4091,6 +4319,8 @@ function EstudiantesPanel() {
   const [verTodos, setVerTodos] = useState(false);
   const [busca, setBusca] = useState("");
   const [form, setForm] = useState(null);
+  const [enfermeras, setEnfermeras] = useState([]);
+  const [calEst, setCalEst] = useState(null);       // estudiante cuyo calendario se muestra
   const [guardando, setGuardando] = useState(false);
   const fileRef = useRef(null);
 
@@ -4099,6 +4329,35 @@ function EstudiantesPanel() {
     catch (e) { setError(e.message); setLista([]); }
   }, []);
   useEffect(() => { recargar(); }, [recargar]);
+  useEffect(() => { cargarEnfermerasReferentes().then(setEnfermeras).catch(() => setEnfermeras([])); }, []);
+  const apodoEnf = (n) => { const p = enfermeras.find(x => x.nombre === n); return p ? (p.apodo || p.nombre) : n; };
+  // Genera y congela el calendario de quien tiene enfermera vinculada y aún no lo tiene
+  async function generarPendientes() {
+    const pend = (lista || []).filter(e => e.tutora_prof && !e.calendario && e.origen !== "CAL_MASTER");
+    if (!pend.length) { setAviso("No hay estudiantes con enfermera vinculada pendientes de generar calendario."); return; }
+    if (!window.confirm(`Se generarán y fijarán los calendarios de ${pend.length} estudiantes con el cronograma de enfermería actual. ¿Continuar?`)) return;
+    let ok = 0, vacios = 0;
+    for (const e of pend) {
+      const c = await estCalcularCalendario(e, enfermeras);
+      if (!c.dias.length) { vacios++; continue; }
+      await guardarEstudiante({ ...e, calendario: { generado: new Date().toISOString(), hasta: c.hasta || "", dias: c.dias.map(d => ({ f: d.f, t: d.t, prof: d.prof || "" })) } });
+      ok++;
+    }
+    await recargar();
+    setAviso(`Calendarios generados: ${ok}.` + (vacios ? ` ${vacios} sin días todavía (su periodo aún no tiene cronograma de enfermería).` : ""));
+  }
+  // Vincula automáticamente con la plantilla a quien aún no tiene enfermera referente
+  async function vincularTodas() {
+    const pend = (lista || []).filter(e => !e.tutora_prof && e.tutora);
+    let ok = 0; const sin = [];
+    for (const e of pend) {
+      const [a, b] = estAutoEnfermeras(e.tutora, enfermeras);
+      if (!a) { sin.push(`${estNombre(e)} (${e.tutora})`); continue; }
+      await guardarEstudiante({ ...e, tutora_prof: a, tutora_prof2: b || "" }); ok++;
+    }
+    await recargar();
+    setAviso(`Enfermeras vinculadas: ${ok}.` + (sin.length ? ` Sin coincidencia clara en la plantilla (vincúlalas con «Editar»): ${sin.slice(0, 8).join("; ")}${sin.length > 8 ? "…" : ""}.` : "") + (!pend.length ? " No había estudiantes pendientes de vincular." : ""));
+  }
 
   const porMes = useMemo(() => Array.from({ length: 12 }, (_, m) => {
     const est = (lista || []).filter(e => estEnMes(e, anio, m));
@@ -4217,6 +4476,8 @@ function EstudiantesPanel() {
           <button className="est-btn" onClick={() => fileRef.current && fileRef.current.click()}>Importar Excel</button>
           <input ref={fileRef} type="file" accept=".xlsx,.xls,.xlsm,.csv" style={{ display: "none" }} onChange={importar} />
           <button className="est-btn" onClick={() => estExportarExcel(lista)} disabled={!lista.length}>Exportar Excel</button>
+          <button className="est-btn" onClick={generarPendientes} disabled={!lista.length || !enfermeras.length} title="Genera y fija el calendario de prácticas de los estudiantes con enfermera vinculada que aún no lo tienen">Generar calendarios</button>
+          <button className="est-btn" onClick={vincularTodas} disabled={!lista.length || !enfermeras.length} title="Relaciona el nombre de la tutora de cada estudiante con la plantilla de enfermería">Vincular enfermeras</button>
           <button className="est-btn est-btn-primary" onClick={() => { setForm({ ...EST_VACIO }); setAviso(""); }}>+ Añadir estudiante</button>
         </div>
       </div>
@@ -4282,7 +4543,7 @@ function EstudiantesPanel() {
       </div>
 
       {/* Calendario del máster (estudiantes que vienen por días sueltos) */}
-      <EstCalendarioMaster lista={lista} anio={anio} mes={mesSel} onEditar={e => { setForm({ ...EST_VACIO, ...e }); setAviso(""); }} />
+      <EstCalendarioMaster lista={lista} anio={anio} mes={mesSel} onEditar={e => { setForm({ ...EST_VACIO, ...e }); setAviso(""); }} onCalendario={setCalEst} />
 
       {/* Periodos con parejas tutora - estudiante */}
       <div className="est-card">
@@ -4305,18 +4566,25 @@ function EstudiantesPanel() {
                 </header>
                 <div className="est-scroll">
                   <table className="est-tabla est-lista">
-                    <colgroup><col style={{ width: "23%" }} /><col style={{ width: "11%" }} /><col style={{ width: "25%" }} /><col style={{ width: "8%" }} /><col style={{ width: "7%" }} /><col /><col style={{ width: "64px" }} /></colgroup>
+                    <colgroup><col style={{ width: "23%" }} /><col style={{ width: "11%" }} /><col style={{ width: "25%" }} /><col style={{ width: "8%" }} /><col style={{ width: "7%" }} /><col /><col style={{ width: "150px" }} /></colgroup>
                     <thead><tr><th>Enfermera tutora</th><th>Turno</th><th>Estudiante</th><th>Escuela</th><th>Curso</th><th>Contacto</th><th></th></tr></thead>
                     <tbody>
                       {p.est.map(e => { const m = estMod(e.modalidad); return (
                         <tr key={e.id}>
-                          <td className="est-tutora est-c-tut">{e.tutora || <span className="est-falta">sin tutora</span>}</td>
+                          <td className="est-tutora est-c-tut">
+                            {e.tutora_prof
+                              ? <span className="est-vinc" title={[e.tutora_prof, e.tutora_prof2].filter(Boolean).join(" / ")}>✓ {[e.tutora_prof, e.tutora_prof2].filter(Boolean).map(apodoEnf).join(" / ")}</span>
+                              : (e.tutora ? <>{e.tutora} <span className="est-falta">· sin vincular</span></> : <span className="est-falta">sin tutora</span>)}
+                          </td>
                           <td className="est-c-tur"><span className="est-turno" style={{ background: m.color, color: m.id === "NIT_12H" ? "#fff" : "#1d2530" }}>{m.label}</span></td>
                           <td className="est-c-est"><b>{estNombre(e)}</b></td>
                           <td className="est-c-esc">{e.escuela}</td>
                           <td className="est-c-cur">{e.curso}</td>
                           <td className="est-contacto est-c-con">{e.contacto}</td>
-                          <td className="est-nowrap est-c-edi"><button className="est-link" onClick={() => { setForm({ ...EST_VACIO, ...e }); setAviso(""); }}>Editar</button></td>
+                          <td className="est-nowrap est-c-edi">
+                            <button className="est-link" onClick={() => setCalEst(e)} title={e.calendario ? "Calendario generado y guardado" : "Aún sin generar"}>{e.calendario ? "✓ Calendario" : "Calendario"}</button>
+                            <button className="est-link" onClick={() => { setForm({ ...EST_VACIO, ...e }); setAviso(""); }}>Editar</button>
+                          </td>
                         </tr>
                       ); })}
                     </tbody>
@@ -4327,6 +4595,9 @@ function EstudiantesPanel() {
           </div>
         )}
       </div>
+
+      {calEst && <EstCalendarioPracticas est={calEst} enfermeras={enfermeras} onCerrar={() => setCalEst(null)}
+        onGuardado={async (g) => { await recargar(); setCalEst(g && g.id ? g : null); }} />}
 
       {form && (
         <div className="est-modal" onClick={() => !guardando && setForm(null)}>
@@ -4339,7 +4610,19 @@ function EstudiantesPanel() {
               <label>Curso<select value={form.curso} onChange={ev => setForm({ ...form, curso: ev.target.value })}>{EST_CURSOS.map(c => <option key={c}>{c}</option>)}</select></label>
               <label>Escuela<input value={form.escuela} onChange={ev => setForm({ ...form, escuela: ev.target.value.toUpperCase() })} placeholder="UDPT, UIC, EUIT…" /></label>
               <label>Turno<select value={form.modalidad || ""} onChange={ev => setForm({ ...form, modalidad: ev.target.value })}>{EST_MODALIDADES.map(m => <option key={m.id} value={m.id}>{m.label}</option>)}</select></label>
-              <label className="est-form-full">Enfermera tutora<input value={form.tutora} onChange={ev => setForm({ ...form, tutora: ev.target.value })} placeholder="Si son dos, sepáralas con /" /></label>
+              <label className="est-form-full">Tutora (tal como viene en el Excel)<input value={form.tutora} onChange={ev => setForm({ ...form, tutora: ev.target.value })} placeholder="Si son dos, sepáralas con /" /></label>
+              {[["tutora_prof", "Enfermera referente (plantilla de enfermería)"], ["tutora_prof2", "Segunda enfermera referente (opcional)"]].map(([k, lab]) => (
+                <label key={k} className="est-form-full">{lab}
+                  <div className="est-fila">
+                    <select value={form[k] || ""} onChange={ev => setForm({ ...form, [k]: ev.target.value })}>
+                      <option value="">— Sin vincular —</option>
+                      {enfermeras.slice().sort((a, b) => (a.apodo || a.nombre).localeCompare(b.apodo || b.nombre)).map(p => <option key={p.nombre} value={p.nombre}>{(p.apodo || p.nombre) + " · " + p.nombre + (p.turno ? " · " + p.turno : "")}</option>)}
+                    </select>
+                    {k === "tutora_prof" && !form.tutora_prof && form.tutora && (() => { const [a, b] = estAutoEnfermeras(form.tutora, enfermeras); return a ? (
+                      <button type="button" className="est-btn" onClick={() => setForm({ ...form, tutora_prof: a, tutora_prof2: form.tutora_prof2 || b || "" })}>Usar {apodoEnf(a)}{b ? " / " + apodoEnf(b) : ""}</button>) : null; })()}
+                  </div>
+                </label>
+              ))}
               <label>Inicio<input type="date" value={form.inicio} onChange={ev => setForm({ ...form, inicio: ev.target.value })} /></label>
               <label>Fin<input type="date" value={form.fin} onChange={ev => setForm({ ...form, fin: ev.target.value })} /></label>
               <label className="est-form-full">Contacto (correo o teléfono)<input value={form.contacto} onChange={ev => setForm({ ...form, contacto: ev.target.value })} /></label>
@@ -6918,6 +7201,19 @@ td.data-cell:has(.nota-edit) { overflow: visible; }
 .est-turno { display: inline-block; font-size: 11.5px; font-weight: 650; color: #1d2530; border-radius: 999px; padding: 2px 9px; white-space: nowrap; }
 .est-contacto { font-size: 12.5px; color: var(--ink-soft); word-break: break-all; }
 .est-lista { table-layout: fixed; }
+.est-vinc { color: var(--accent-deep); font-weight: 600; }
+.est-aviso.est-ok { background: #eaf5f1; border-color: #bfe0d4; color: #1f5b4c; }
+.est-aviso.est-prev { background: #fff6e6; border-color: #f0d9a8; color: #7a5513; }
+.est-fila { display: flex; gap: 8px; align-items: center; }
+.est-fila select { flex: 1; min-width: 0; }
+.est-modal-ancho { width: min(980px, 100%); max-height: 92vh; overflow: auto; }
+.est-pc-mes h3 { margin: 6px 0 6px; font-size: 14.5px; font-weight: 650; }
+.est-pc { min-width: 640px; grid-template-columns: repeat(7, minmax(80px, 1fr)); }
+.est-pc .est-cal-dia { min-height: 54px; }
+.est-cal-dia.is-fuera { background: var(--panel); opacity: .45; }
+.est-cal-dia.is-pend { background: repeating-linear-gradient(45deg, var(--surface), var(--surface) 5px, var(--panel) 5px, var(--panel) 10px); }
+.est-pc-t { font-size: 11.5px; font-weight: 650; margin-top: auto; }
+.est-pc-p { font-size: 10.5px; color: var(--muted); margin-top: auto; }
 .est-cal { display: grid; grid-template-columns: repeat(7, minmax(110px, 1fr)); gap: 4px; min-width: 780px; margin-bottom: 16px; }
 .est-cal-dow { font-size: 11.5px; font-weight: 650; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; padding: 2px 6px; }
 .est-cal-dia { border: 1px solid var(--line); border-radius: 8px; padding: 5px; min-height: 74px; display: flex; flex-direction: column; gap: 3px; background: var(--surface); }

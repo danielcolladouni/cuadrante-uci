@@ -171,7 +171,9 @@ export async function guardarProfesionales(profs) {
 function filaAppARegistro(f) {
   return {
     fecha_serial: f.fechaSerial,
-    fecha: (f.fecha instanceof Date ? f.fecha : new Date(f.fecha)).toISOString().slice(0, 10),
+    // Fecha a partir de fecha_serial (días desde 1970-01-01): toISOString() la
+    // desplazaba un día hacia atrás por la zona horaria.
+    fecha: new Date(f.fechaSerial * 86400000).toISOString().slice(0, 10),
     mes: f.mes,
     prof_norm: f.profNorm,
     prof: f.prof,
@@ -369,7 +371,7 @@ export async function guardarAliasTodos(aliasArray) {
    tipo: GRADO | MASTER · curso: 1º..4º | Máster
    modalidad (turno): DIA_12H | NIT_12H | NIT_10H | MANANA | TARDE | "" (sin indicar)
    ============================================================ */
-const CAMPOS_EST = "id, nombre, apellido1, apellido2, tipo, curso, escuela, tutora, modalidad, inicio, fin, contacto, notas, dias, origen";
+const CAMPOS_EST = "id, nombre, apellido1, apellido2, tipo, curso, escuela, tutora, modalidad, inicio, fin, contacto, notas, dias, origen, tutora_prof, tutora_prof2, calendario";
 function filaEst(e) {
   return {
     nombre: e.nombre || "", apellido1: e.apellido1 || "", apellido2: e.apellido2 || "",
@@ -379,6 +381,10 @@ function filaEst(e) {
     // dias: [{ f: "2027-01-12", t: "MANANA" }, ...] solo para quien viene por días sueltos
     // (calendario del máster); origen: "" (manual / Excel de prácticas) | "CAL_MASTER"
     dias: Array.isArray(e.dias) && e.dias.length ? e.dias : null, origen: e.origen || "",
+    // Enfermera(s) referente(s): nombre exacto en la plantilla de enfermería
+    tutora_prof: e.tutora_prof || "", tutora_prof2: e.tutora_prof2 || "",
+    // Calendario de prácticas generado y congelado (no lo tocan los cronogramas posteriores)
+    calendario: e.calendario && Array.isArray(e.calendario.dias) ? e.calendario : null,
   };
 }
 
@@ -417,4 +423,42 @@ export async function borrarEstudiantesCalendario(desde, hasta) {
   const { error } = await supabase.from("estudiantes").delete()
     .eq("origen", "CAL_MASTER").gte("inicio", desde).lte("inicio", hasta);
   if (error) throw new Error("No se pudo reemplazar el calendario anterior: " + error.message);
+}
+
+/* ---------- Datos de ENFERMERÍA que necesita el apartado Estudiantes ----------
+   (se leen siempre del colectivo ENF, sea cual sea el apartado activo) */
+export async function cargarEnfermerasReferentes() {
+  const { data, error } = await supabase.from("profesionales")
+    .select("nombre, apodo, turno").eq("colectivo", "ENF").order("nombre", { ascending: true });
+  if (error) throw new Error("No se pudo cargar la plantilla de enfermería: " + error.message);
+  return data || [];
+}
+
+// Turnos que trabaja cada enfermera entre dos fechas (ISO), según el histórico
+// de enfermería: cronogramas generados y semanas reales sincronizadas.
+export async function cargarTurnosEnfermeras(nombres, desdeISO, hastaISO) {
+  const serial = (iso) => Math.round(Date.UTC(+iso.slice(0, 4), +iso.slice(5, 7) - 1, +iso.slice(8, 10)) / 86400000);
+  const out = [];
+  const lista = [...new Set(nombres.filter(Boolean))];
+  if (!lista.length) return out;
+  const PAGE = 1000;
+  for (let from = 0; ; from += PAGE) {
+    const { data, error } = await supabase.from("historico")
+      .select("fecha_serial, prof, turno, origen")
+      .eq("colectivo", "ENF").in("prof", lista)
+      .gte("fecha_serial", serial(desdeISO)).lte("fecha_serial", serial(hastaISO))
+      .order("fecha_serial", { ascending: true }).range(from, from + PAGE - 1);
+    if (error) throw new Error("No se pudo leer el cronograma de enfermería: " + error.message);
+    out.push(...(data || []));
+    if (!data || data.length < PAGE) break;
+  }
+  return out.map(r => ({ f: new Date(r.fecha_serial * 86400000).toISOString().slice(0, 10), prof: r.prof, turno: r.turno }));
+}
+
+// Último día con cronograma de enfermería guardado
+export async function ultimoDiaCronogramaEnfermeria() {
+  const { data, error } = await supabase.from("historico").select("fecha_serial")
+    .eq("colectivo", "ENF").order("fecha_serial", { ascending: false }).limit(1);
+  if (error || !data || !data.length) return "";
+  return new Date(data[0].fecha_serial * 86400000).toISOString().slice(0, 10);
 }
