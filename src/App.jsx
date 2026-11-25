@@ -9,7 +9,7 @@ import {
   cargarAnotaciones, guardarAnotaciones,
   cargarAlias, guardarAliasTodos,
   cargarReglas, guardarReglas,
-  fijarColectivo,
+  fijarColectivo, colectivoActual,
   cargarEstudiantes, guardarEstudiante, borrarEstudiante, importarEstudiantes, borrarEstudiantesCalendario,
   cargarEnfermerasReferentes, cargarTurnosEnfermeras, ultimoDiaCronogramaEnfermeria,
 } from "./supabase.js";
@@ -343,6 +343,16 @@ function parsearHoraAMinutos(s) {
   }
   if (isNaN(+t)) return -1;
   return (+t) * 60;
+}
+
+/* Categorías (col A de la planilla) que entran en el cronograma según el colectivo.
+   Enfermería: todas las INF_* excepto COOR_INF.
+   TCAE: sólo TCAI_UCI y TCAI_HOSP_SS (TCAI_ADM queda fuera). */
+const CATEGORIAS_TCAE = ["TCAI_UCI", "TCAI_HOSP_SS"];
+function categoriaIncluida(cat) {
+  const c = String(cat == null ? "" : cat).trim().toUpperCase();
+  if (colectivoActual() === "TCAE") return CATEGORIAS_TCAE.includes(c);
+  return c.substring(0, 3) === "INF" && c !== "COOR_INF";
 }
 
 // Parsea "8-14 MMORALES" / "* 8-20 APELLIDO APELLIDO, NOMBRE" -> {horario, nombre}
@@ -757,7 +767,7 @@ function extraerNombresSinVincular(planilla, db, fechaLunesInicio, numSemanas) {
           else if (u.indexOf("TURNO DE NOCHE") >= 0) seccion = "NOCHE";
         }
         const cat = cel(1) == null ? "" : String(cel(1));
-        if (cat.substring(0, 3) !== "INF" || cat === "COOR_INF") continue;
+        if (!categoriaIncluida(cat)) continue;
         const kSerial = toSerial(cel(11));
         if (kSerial == null || fechaSerial < kSerial || fechaSerial > kSerial + 6) continue;
         const celda = cel(colDia);
@@ -799,8 +809,7 @@ function obtenerProfesionalesDelDia(planilla, db, fechaObj) {
     }
 
     const cat = cell(1) == null ? "" : String(cell(1));
-    if (cat.substring(0, 3) !== "INF") continue;
-    if (cat === "COOR_INF") continue;
+    if (!categoriaIncluida(cat)) continue;
 
     const fechaCell = cell(11); // col K = lunes de la semana representada
     const fSerial = toSerial(fechaCell);
