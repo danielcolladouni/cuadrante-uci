@@ -10,6 +10,7 @@ import {
   cargarAlias, guardarAliasTodos,
   cargarReglas, guardarReglas,
   fijarColectivo,
+  cargarEstudiantes, guardarEstudiante, borrarEstudiante, importarEstudiantes,
 } from "./supabase.js";
 
 /* ============================================================
@@ -3177,6 +3178,7 @@ export default function App() {
     if (!usuarioId) { setColectivo(null); return; }
     if (!colectivo) return;
     fijarColectivo(colectivo);
+    if (colectivo === "EST") return;   // Estudiantes no usa plantilla/histórico de cronograma
     (async () => {
       setCargandoDatos(true);
       setError("");
@@ -3522,6 +3524,16 @@ export default function App() {
   );
 
   // Pantalla de inicio: elegir el grupo profesional con el que se va a trabajar
+  if (colectivo === "EST") {
+    return (
+      <div className="app">
+        <style>{CSS}</style>
+        {cabecera}
+        <EstudiantesPanel />
+      </div>
+    );
+  }
+
   if (!colectivo) {
     return (
       <div className="app">
@@ -3659,12 +3671,14 @@ function SelectorColectivo({ nombre, onElegir }) {
       icono: <path d="M16 7v18M7 16h18" stroke="currentColor" strokeWidth="2.6" strokeLinecap="round" /> },
     { id: "TCAE", titulo: "TCAE", desc: "Cuadrante y rotación de las técnicas auxiliares en cuidados de enfermería.",
       icono: <g fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><circle cx="16" cy="11" r="4.5" /><path d="M7.5 25c1.2-4.6 4.4-7 8.5-7s7.3 2.4 8.5 7" /></g> },
+    { id: "EST", titulo: "Estudiantes", desc: "Asignación de estudiantes de enfermería de grado y de máster universitario.",
+      icono: <g fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M3.5 12.5 16 7l12.5 5.5L16 18z" /><path d="M9 15.5v5.2c0 1.6 3.1 3.3 7 3.3s7-1.7 7-3.3v-5.2" /><path d="M28.5 12.5v7" /></g> },
   ];
   return (
     <div className="selector-wrap">
       <div className="selector-head">
         <h1>{nombre ? "Hola, " + nombre : "Hola"}</h1>
-        <p>¿Con qué grupo profesional vas a trabajar?</p>
+        <p>¿Con qué apartado vas a trabajar?</p>
       </div>
       <div className="selector-grid">
         {opciones.map(o => (
@@ -3676,7 +3690,374 @@ function SelectorColectivo({ nombre, onElegir }) {
           </button>
         ))}
       </div>
-      <p className="selector-nota">Cada grupo tiene su propia plantilla, histórico de rotación y estructura de la unidad. Puedes cambiar de grupo en cualquier momento desde la barra superior.</p>
+      <p className="selector-nota">Cada apartado guarda sus datos por separado. Puedes cambiar de apartado en cualquier momento desde la barra superior.</p>
+    </div>
+  );
+}
+
+/* ============================================================
+   APARTADO ESTUDIANTES
+   Sustituye el Excel «Infermeras pràctiques» que la coordinadora llevaba a
+   mano: periodo de prácticas, enfermera tutora, turno, estudiante, escuela,
+   curso y contacto. Muestra cuántos estudiantes hay cada mes (grado / máster,
+   curso y turno) y los periodos con sus parejas tutora–estudiante.
+   ============================================================ */
+const EST_MODALIDADES = [
+  { id: "DIA_12H", label: "Día 12 h", color: "#f0b44c" },
+  { id: "NIT_12H", label: "Noche 12 h", color: "#5b6fb3" },
+  { id: "NIT_10H", label: "Noche 10 h", color: "#8fa6dd" },
+  { id: "MANANA", label: "Mañana", color: "#f5d77a" },
+  { id: "TARDE", label: "Tarde", color: "#86c08a" },
+  { id: "", label: "Sin indicar", color: "#cfd5dd" },
+];
+const EST_CURSOS = ["1º", "2º", "3º", "4º", "Máster"];
+const EST_COLOR = { GRADO: "#2f7d6b", MASTER: "#c27c2c" };
+const EST_MESES = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"];
+const EST_MESES_LARGO = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"];
+const estMod = (id) => EST_MODALIDADES.find(m => m.id === (id || "")) || EST_MODALIDADES[EST_MODALIDADES.length - 1];
+const estTipoDeCurso = (c) => (c === "Máster" ? "MASTER" : "GRADO");
+const estNombre = (e) => [e.nombre, e.apellido1, e.apellido2].filter(Boolean).join(" ");
+const estFechaCorta = (iso) => { const [y, m, d] = iso.split("-"); return `${+d} ${EST_MESES[+m - 1].toLowerCase()} ${y}`; };
+
+function estEnMes(e, anio, mes) {
+  const ini = `${anio}-${String(mes + 1).padStart(2, "0")}-01`;
+  const fin = `${anio}-${String(mes + 1).padStart(2, "0")}-${String(new Date(anio, mes + 1, 0).getDate()).padStart(2, "0")}`;
+  return e.inicio <= fin && e.fin >= ini;
+}
+
+/* ---------- Lectura de Excel (formato de la coordinadora o plantilla) ---------- */
+function estNormTxt(v) { return String(v == null ? "" : v).normalize("NFD").replace(/[̀-ͯ]/g, "").toUpperCase().replace(/\s+/g, " ").trim(); }
+function estModalidad(v) {
+  const t = estNormTxt(v);
+  if (!t) return "";
+  const noche = /NIT|NOCHE|NOCT/.test(t);
+  if (t.includes("12")) return noche ? "NIT_12H" : "DIA_12H";
+  if (t.includes("10")) return noche ? "NIT_10H" : "DIA_12H";
+  if (noche || t === "TN" || t === "N") return "NIT_10H";
+  if (/MAN|MATI/.test(t) || t === "TM" || t === "M") return "MANANA";
+  if (/TARD/.test(t) || t === "TT" || t === "T") return "TARDE";
+  if (/DIA/.test(t)) return "DIA_12H";
+  return "";
+}
+function estCurso(v) {
+  const t = estNormTxt(v);
+  if (!t) return "";
+  if (t.startsWith("MAST")) return "Máster";
+  if (/QUART|CUART|4/.test(t)) return "4º";
+  if (/TERCER|3/.test(t)) return "3º";
+  if (/SEGON|SEGUN|2/.test(t)) return "2º";
+  if (/PRIMER|1/.test(t)) return "1º";
+  return "";
+}
+function estFecha(v) {
+  if (v instanceof Date && !isNaN(v)) return `${v.getFullYear()}-${String(v.getMonth() + 1).padStart(2, "0")}-${String(v.getDate()).padStart(2, "0")}`;
+  if (typeof v === "number" && v > 20000) { const d = new Date(Math.round((v - 25569) * 86400000)); return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`; }
+  const s = String(v || "").trim();
+  let m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/); if (m) return `${m[1]}-${m[2].padStart(2, "0")}-${m[3].padStart(2, "0")}`;
+  m = s.match(/^(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{2,4})$/); if (m) { const y = m[3].length === 2 ? "20" + m[3] : m[3]; return `${y}-${m[2].padStart(2, "0")}-${m[1].padStart(2, "0")}`; }
+  return "";
+}
+const estTexto = (v) => (v == null ? "" : String(typeof v === "number" ? Math.round(v) : v).replace(/\s+/g, " ").trim());
+function estLeerExcel(wb) {
+  const filas = [], errores = [];
+  for (const hoja of wb.SheetNames) {
+    const rows = XLSX.utils.sheet_to_json(wb.Sheets[hoja], { header: 1, raw: true, defval: "" });
+    let h = -1, col = {};
+    for (let r = 0; r < Math.min(rows.length, 15) && h < 0; r++) {
+      const c = {};
+      rows[r].forEach((v, i) => {
+        const t = estNormTxt(v);
+        if (t.startsWith("PERIODE") || t.startsWith("PERIODO")) { if (c.inicio == null) c.inicio = i; else if (c.fin == null) c.fin = i; }
+        else if (t.startsWith("INICI")) c.inicio = i;
+        else if (t.startsWith("FIN") || t.startsWith("FI ")) c.fin = i;
+        else if (t.startsWith("INFERMER") || t.startsWith("ENFERMER") || t.startsWith("TUTOR")) c.tutora = i;
+        else if (t.startsWith("TORN") || t.startsWith("TURNO") || t.startsWith("MODALIDAD")) c.modalidad = i;
+        else if (t.startsWith("COGNOM 1") || t.startsWith("APELLIDO 1") || t === "COGNOM" || t === "APELLIDO") c.apellido1 = i;
+        else if (t.startsWith("COGNOM 2") || t.startsWith("APELLIDO 2")) c.apellido2 = i;
+        else if (t.startsWith("NOM") || t.startsWith("NOMBRE")) c.nombre = i;
+        else if (t.startsWith("ESCOLA") || t.startsWith("ESCUELA") || t.startsWith("UNIVERS")) c.escuela = i;
+        else if (t.startsWith("CURS")) c.curso = i;
+        else if (t.startsWith("MAIL") || t.startsWith("CORREU") || t.startsWith("CONTACT") || t.startsWith("TELEF")) c.contacto = i;
+        else if (t.startsWith("NOTA") || t.startsWith("OBSERV")) c.notas = i;
+      });
+      if (c.inicio != null && c.fin != null && c.nombre != null) { h = r; col = c; }
+    }
+    if (h < 0) { errores.push(`Hoja «${hoja}»: no se encuentran las columnas de periodo y nombre.`); continue; }
+    for (let r = h + 1; r < rows.length; r++) {
+      const row = rows[r] || [];
+      const g = (k) => (col[k] != null ? row[col[k]] : "");
+      const nombre = estTexto(g("nombre"));
+      const inicio = estFecha(g("inicio")), fin = estFecha(g("fin"));
+      if (!nombre && !inicio) continue;                 // filas vacías o títulos («PRACTIQUES 2026»)
+      if (!nombre) continue;
+      const fallo = !inicio ? "falta la fecha de inicio" : !fin ? "falta la fecha de fin" : fin < inicio ? "el fin es anterior al inicio" : "";
+      if (fallo) { errores.push(`${nombre} ${estTexto(g("apellido1"))} (fila ${r + 1}): ${fallo}.`); continue; }
+      const curso = estCurso(g("curso"));
+      filas.push({
+        nombre, apellido1: estTexto(g("apellido1")), apellido2: estTexto(g("apellido2")),
+        curso, tipo: estTipoDeCurso(curso), escuela: estTexto(g("escuela")).toUpperCase(),
+        tutora: estTexto(g("tutora")), modalidad: estModalidad(g("modalidad")),
+        inicio, fin, contacto: estTexto(g("contacto")), notas: estTexto(g("notas")),
+      });
+    }
+  }
+  return { filas, errores };
+}
+function estExportarExcel(lista) {
+  const cab = ["INICIO", "FIN", "ENFERMERA TUTORA", "TURNO", "NOMBRE", "APELLIDO 1", "APELLIDO 2", "ESCUELA", "CURSO", "CONTACTO", "NOTAS"];
+  const filas = lista.slice().sort((a, b) => (a.inicio + a.fin).localeCompare(b.inicio + b.fin) || estNombre(a).localeCompare(estNombre(b)))
+    .map(e => [e.inicio.split("-").reverse().join("/"), e.fin.split("-").reverse().join("/"), e.tutora, e.modalidad ? estMod(e.modalidad).label : "",
+      e.nombre, e.apellido1, e.apellido2, e.escuela, e.curso, e.contacto, e.notas]);
+  const ws = XLSX.utils.aoa_to_sheet([cab, ...filas]);
+  ws["!cols"] = [10, 10, 34, 11, 16, 14, 14, 9, 8, 32, 24].map(w => ({ wch: w }));
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Estudiantes");
+  XLSX.writeFile(wb, "Estudiantes_practicas.xlsx");
+}
+
+const EST_VACIO = { nombre: "", apellido1: "", apellido2: "", curso: "4º", escuela: "", tutora: "", modalidad: "DIA_12H", inicio: "", fin: "", contacto: "", notas: "" };
+
+function EstudiantesPanel() {
+  const hoy = new Date();
+  const [lista, setLista] = useState(null);
+  const [error, setError] = useState("");
+  const [aviso, setAviso] = useState("");
+  const [anio, setAnio] = useState(hoy.getFullYear());
+  const [mesSel, setMesSel] = useState(hoy.getMonth());
+  const [verTodos, setVerTodos] = useState(false);
+  const [busca, setBusca] = useState("");
+  const [form, setForm] = useState(null);
+  const [guardando, setGuardando] = useState(false);
+  const fileRef = useRef(null);
+
+  const recargar = useCallback(async () => {
+    try { setLista(await cargarEstudiantes()); setError(""); }
+    catch (e) { setError(e.message); setLista([]); }
+  }, []);
+  useEffect(() => { recargar(); }, [recargar]);
+
+  const porMes = useMemo(() => Array.from({ length: 12 }, (_, m) => {
+    const est = (lista || []).filter(e => estEnMes(e, anio, m));
+    return { m, est, total: est.length, grado: est.filter(e => e.tipo === "GRADO").length, master: est.filter(e => e.tipo === "MASTER").length };
+  }), [lista, anio]);
+  const maxMes = Math.max(1, ...porMes.map(x => x.total));
+  const mesActual = porMes[mesSel];
+
+  // Desglose del mes: curso x turno
+  const desglose = useMemo(() => {
+    const g = new Map();
+    for (const e of mesActual.est) {
+      const k = e.curso || "Sin curso";
+      if (!g.has(k)) g.set(k, { curso: k, tipo: e.tipo, total: 0, mods: {} });
+      const x = g.get(k); x.total++; x.mods[e.modalidad || ""] = (x.mods[e.modalidad || ""] || 0) + 1;
+    }
+    const orden = ["4º", "3º", "2º", "1º", "Máster", "Sin curso"];
+    return [...g.values()].sort((a, b) => orden.indexOf(a.curso) - orden.indexOf(b.curso));
+  }, [mesActual]);
+  const modsUsadas = EST_MODALIDADES.filter(m => mesActual.est.some(e => (e.modalidad || "") === m.id));
+
+  // Periodos (mismas fechas de inicio y fin) visibles: los del mes elegido o todos
+  const periodos = useMemo(() => {
+    const q = estNormTxt(busca);
+    const base = (lista || []).filter(e => verTodos || estEnMes(e, anio, mesSel))
+      .filter(e => !q || estNormTxt([estNombre(e), e.tutora, e.escuela, e.contacto].join(" ")).includes(q));
+    const g = new Map();
+    for (const e of base) {
+      const k = e.inicio + "|" + e.fin;
+      if (!g.has(k)) g.set(k, { inicio: e.inicio, fin: e.fin, est: [] });
+      g.get(k).est.push(e);
+    }
+    return [...g.values()].sort((a, b) => (verTodos ? b.inicio.localeCompare(a.inicio) : a.inicio.localeCompare(b.inicio)))
+      .map(p => ({ ...p, est: p.est.sort((a, b) => (a.modalidad || "").localeCompare(b.modalidad || "") || a.tutora.localeCompare(b.tutora)),
+        escuelas: [...new Set(p.est.map(e => e.escuela).filter(Boolean))], cursos: [...new Set(p.est.map(e => e.curso).filter(Boolean))] }));
+  }, [lista, anio, mesSel, verTodos, busca]);
+
+  async function guardar() {
+    if (!form.nombre.trim()) { setAviso("Escribe el nombre del estudiante."); return; }
+    if (!form.inicio || !form.fin) { setAviso("Indica la fecha de inicio y de fin."); return; }
+    if (form.fin < form.inicio) { setAviso("La fecha de fin es anterior a la de inicio."); return; }
+    setGuardando(true);
+    try { await guardarEstudiante({ ...form, tipo: estTipoDeCurso(form.curso) }); setForm(null); setAviso(""); await recargar(); }
+    catch (e) { setAviso(e.message); }
+    finally { setGuardando(false); }
+  }
+  async function borrar(e) {
+    if (!window.confirm(`¿Borrar a ${estNombre(e)}?`)) return;
+    try { await borrarEstudiante(e.id); setForm(null); await recargar(); } catch (err) { setError(err.message); }
+  }
+  async function importar(ev) {
+    const f = ev.target.files && ev.target.files[0];
+    ev.target.value = "";
+    if (!f) return;
+    try {
+      const wb = XLSX.read(await f.arrayBuffer(), { cellDates: true });
+      const { filas, errores } = estLeerExcel(wb);
+      // no duplicar: mismo nombre, primer apellido e inicio
+      const clave = (e) => estNormTxt(e.nombre + "|" + e.apellido1 + "|" + e.inicio);
+      const ya = new Set((lista || []).map(clave));
+      const nuevas = filas.filter(e => !ya.has(clave(e)));
+      if (nuevas.length) await importarEstudiantes(nuevas);
+      await recargar();
+      let msg = `«${f.name}»: ${nuevas.length} estudiantes importados`;
+      if (filas.length - nuevas.length) msg += `, ${filas.length - nuevas.length} ya estaban`;
+      msg += ".";
+      if (errores.length) msg += ` ${errores.length} filas sin importar — ${errores.slice(0, 4).join(" ")}${errores.length > 4 ? " …" : ""}`;
+      setAviso(msg);
+    } catch (e) { setAviso(e.message); }
+  }
+
+  if (lista === null) return <div className="est-wrap"><p className="est-muted">Cargando estudiantes…</p></div>;
+  const titMes = EST_MESES_LARGO[mesSel].replace(/^./, c => c.toUpperCase()) + " " + anio;
+
+  return (
+    <div className="est-wrap">
+      {error && <div className="est-alerta">{error}</div>}
+
+      <div className="est-top">
+        <div className="est-anio">
+          <button onClick={() => setAnio(anio - 1)} aria-label="Año anterior">‹</button>
+          <span>{anio}</span>
+          <button onClick={() => setAnio(anio + 1)} aria-label="Año siguiente">›</button>
+        </div>
+        <div className="est-acciones">
+          <button className="est-btn" onClick={() => fileRef.current && fileRef.current.click()}>Importar Excel</button>
+          <input ref={fileRef} type="file" accept=".xlsx,.xls,.xlsm,.csv" style={{ display: "none" }} onChange={importar} />
+          <button className="est-btn" onClick={() => estExportarExcel(lista)} disabled={!lista.length}>Exportar Excel</button>
+          <button className="est-btn est-btn-primary" onClick={() => { setForm({ ...EST_VACIO }); setAviso(""); }}>+ Añadir estudiante</button>
+        </div>
+      </div>
+      {aviso && !form && <div className="est-aviso">{aviso}</div>}
+
+      {lista.length === 0 && (
+        <div className="est-card est-vacio">
+          <h2>Aún no hay estudiantes</h2>
+          <p>Importa el Excel de prácticas (el de periodos, enfermera, torn, nombre, escuela y curso) o añade estudiantes uno a uno.</p>
+        </div>
+      )}
+
+      {/* Estudiantes por mes */}
+      <div className="est-card">
+        <div className="est-card-head">
+          <h2>Estudiantes por mes · {anio}</h2>
+          <div className="est-leyenda"><span><i style={{ background: EST_COLOR.GRADO }} />Grado</span><span><i style={{ background: EST_COLOR.MASTER }} />Máster</span></div>
+        </div>
+        <div className="est-barras">
+          {porMes.map(x => (
+            <button key={x.m} className={"est-barra" + (x.m === mesSel ? " is-sel" : "")} onClick={() => setMesSel(x.m)}
+              title={`${EST_MESES_LARGO[x.m]}: ${x.total} (${x.grado} de grado, ${x.master} de máster)`}>
+              <span className="est-barra-n">{x.total || ""}</span>
+              <span className="est-barra-col">
+                {x.master > 0 && <span style={{ height: `${(x.master / maxMes) * 100}%`, background: EST_COLOR.MASTER }} />}
+                {x.grado > 0 && <span style={{ height: `${(x.grado / maxMes) * 100}%`, background: EST_COLOR.GRADO }} />}
+              </span>
+              <span className="est-barra-m">{EST_MESES[x.m]}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Resumen del mes */}
+      <div className="est-card">
+        <div className="est-card-head"><h2>{titMes}</h2><span className="est-muted">Pulsa otro mes en el gráfico para cambiar</span></div>
+        <div className="est-kpis">
+          <div className="est-kpi"><b>{mesActual.total}</b><span>estudiantes</span></div>
+          <div className="est-kpi"><b style={{ color: EST_COLOR.GRADO }}>{mesActual.grado}</b><span>de grado</span></div>
+          <div className="est-kpi"><b style={{ color: EST_COLOR.MASTER }}>{mesActual.master}</b><span>de máster</span></div>
+        </div>
+        {mesActual.total > 0 && (<>
+          <div className="est-mods">
+            {modsUsadas.map(m => { const n = mesActual.est.filter(e => (e.modalidad || "") === m.id).length; return (
+              <div key={m.id} className="est-mod" style={{ flex: n, background: m.color }} title={`${m.label}: ${n}`}><span>{m.label} · {n}</span></div>
+            ); })}
+          </div>
+          <div className="est-scroll">
+            <table className="est-tabla">
+              <thead><tr><th>Curso</th><th className="est-num">Total</th>{modsUsadas.map(m => <th key={m.id} className="est-num"><i style={{ background: m.color }} />{m.label}</th>)}</tr></thead>
+              <tbody>
+                {desglose.map(g => (
+                  <tr key={g.curso}>
+                    <td><span className="est-tag" style={{ background: EST_COLOR[g.tipo] }}>{g.tipo === "MASTER" ? "Máster" : "Grado"}</span> {g.tipo === "MASTER" ? "" : g.curso === "Sin curso" ? "sin curso" : `${g.curso} curso`}</td>
+                    <td className="est-num"><b>{g.total}</b></td>
+                    {modsUsadas.map(m => <td key={m.id} className="est-num">{g.mods[m.id] || ""}</td>)}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>)}
+      </div>
+
+      {/* Periodos con parejas tutora - estudiante */}
+      <div className="est-card">
+        <div className="est-card-head">
+          <h2>{verTodos ? "Todos los periodos de prácticas" : `Periodos de prácticas en ${EST_MESES_LARGO[mesSel]}`}</h2>
+          <div className="est-filtros">
+            <input className="est-busca" placeholder="Buscar estudiante, enfermera o escuela…" value={busca} onChange={ev => setBusca(ev.target.value)} />
+            <label className="est-check"><input type="checkbox" checked={verTodos} onChange={ev => setVerTodos(ev.target.checked)} />Ver todos</label>
+          </div>
+        </div>
+        {periodos.length === 0 ? <p className="est-muted">No hay estudiantes {verTodos ? "que coincidan con la búsqueda" : "en este mes"}.</p> : (
+          <div className="est-periodos">
+            {periodos.map(p => (
+              <section key={p.inicio + p.fin} className="est-periodo">
+                <header>
+                  <div>
+                    <div className="est-periodo-fechas">{estFechaCorta(p.inicio)} <span>→</span> {estFechaCorta(p.fin)}</div>
+                    <div className="est-periodo-meta">{p.est.length} estudiante{p.est.length === 1 ? "" : "s"}{p.escuelas.length ? " · " + p.escuelas.join(", ") : ""}{p.cursos.length ? " · " + p.cursos.join(", ") : ""}</div>
+                  </div>
+                </header>
+                <div className="est-scroll">
+                  <table className="est-tabla est-lista">
+                    <colgroup><col style={{ width: "23%" }} /><col style={{ width: "11%" }} /><col style={{ width: "25%" }} /><col style={{ width: "8%" }} /><col style={{ width: "7%" }} /><col /><col style={{ width: "64px" }} /></colgroup>
+                    <thead><tr><th>Enfermera tutora</th><th>Turno</th><th>Estudiante</th><th>Escuela</th><th>Curso</th><th>Contacto</th><th></th></tr></thead>
+                    <tbody>
+                      {p.est.map(e => { const m = estMod(e.modalidad); return (
+                        <tr key={e.id}>
+                          <td className="est-tutora est-c-tut">{e.tutora || <span className="est-falta">sin tutora</span>}</td>
+                          <td className="est-c-tur"><span className="est-turno" style={{ background: m.color, color: m.id === "NIT_12H" ? "#fff" : "#1d2530" }}>{m.label}</span></td>
+                          <td className="est-c-est"><b>{estNombre(e)}</b></td>
+                          <td className="est-c-esc">{e.escuela}</td>
+                          <td className="est-c-cur">{e.curso}</td>
+                          <td className="est-contacto est-c-con">{e.contacto}</td>
+                          <td className="est-nowrap est-c-edi"><button className="est-link" onClick={() => { setForm({ ...EST_VACIO, ...e }); setAviso(""); }}>Editar</button></td>
+                        </tr>
+                      ); })}
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {form && (
+        <div className="est-modal" onClick={() => !guardando && setForm(null)}>
+          <div className="est-modal-card" onClick={ev => ev.stopPropagation()}>
+            <h2>{form.id ? "Editar estudiante" : "Añadir estudiante"}</h2>
+            <div className="est-form">
+              <label>Nombre<input value={form.nombre} onChange={ev => setForm({ ...form, nombre: ev.target.value })} /></label>
+              <label>Primer apellido<input value={form.apellido1} onChange={ev => setForm({ ...form, apellido1: ev.target.value })} /></label>
+              <label>Segundo apellido<input value={form.apellido2} onChange={ev => setForm({ ...form, apellido2: ev.target.value })} /></label>
+              <label>Curso<select value={form.curso} onChange={ev => setForm({ ...form, curso: ev.target.value })}>{EST_CURSOS.map(c => <option key={c}>{c}</option>)}</select></label>
+              <label>Escuela<input value={form.escuela} onChange={ev => setForm({ ...form, escuela: ev.target.value.toUpperCase() })} placeholder="UDPT, UIC, EUIT…" /></label>
+              <label>Turno<select value={form.modalidad || ""} onChange={ev => setForm({ ...form, modalidad: ev.target.value })}>{EST_MODALIDADES.map(m => <option key={m.id} value={m.id}>{m.label}</option>)}</select></label>
+              <label className="est-form-full">Enfermera tutora<input value={form.tutora} onChange={ev => setForm({ ...form, tutora: ev.target.value })} placeholder="Si son dos, sepáralas con /" /></label>
+              <label>Inicio<input type="date" value={form.inicio} onChange={ev => setForm({ ...form, inicio: ev.target.value })} /></label>
+              <label>Fin<input type="date" value={form.fin} onChange={ev => setForm({ ...form, fin: ev.target.value })} /></label>
+              <label className="est-form-full">Contacto (correo o teléfono)<input value={form.contacto} onChange={ev => setForm({ ...form, contacto: ev.target.value })} /></label>
+              <label className="est-form-full">Notas<input value={form.notas} onChange={ev => setForm({ ...form, notas: ev.target.value })} /></label>
+            </div>
+            {aviso && <div className="est-aviso">{aviso}</div>}
+            <div className="est-modal-btns">
+              {form.id && <button className="est-btn est-btn-del" disabled={guardando} onClick={() => borrar(form)}>Borrar</button>}
+              <span style={{ flex: 1 }} />
+              <button className="est-btn" disabled={guardando} onClick={() => setForm(null)}>Cancelar</button>
+              <button className="est-btn est-btn-primary" disabled={guardando} onClick={guardar}>{guardando ? "Guardando…" : "Guardar"}</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -3697,13 +4078,14 @@ function Header({ colectivo, onCambiarColectivo, email, apodo, abierto, onToggle
           <div className="brand-sub">
             {colectivo === "TCAE" ? "Rotación de TCAE · planificación semanal"
               : colectivo === "ENF" ? "Rotación de enfermería · planificación semanal"
+              : colectivo === "EST" ? "Asignación de estudiantes de grado y máster"
               : "Planificación semanal de la unidad"}
           </div>
         </div>
         {colectivo && (
           <button className="colectivo-chip" onClick={onCambiarColectivo} title="Cambiar de grupo profesional">
-            <span className={"colectivo-dot " + (colectivo === "TCAE" ? "is-tcae" : "is-enf")} />
-            {colectivo === "TCAE" ? "TCAE" : "Enfermería"}
+            <span className={"colectivo-dot " + (colectivo === "TCAE" ? "is-tcae" : colectivo === "EST" ? "is-est" : "is-enf")} />
+            {colectivo === "TCAE" ? "TCAE" : colectivo === "EST" ? "Estudiantes" : "Enfermería"}
             <span className="colectivo-cambiar">Cambiar</span>
           </button>
         )}
@@ -6130,7 +6512,7 @@ td.data-cell:has(.nota-edit) { overflow: visible; }
 
 /* ---------- Pantalla de arranque ---------- */
 /* ---------- Selector de grupo profesional ---------- */
-.selector-wrap { max-width: 760px; margin: 0 auto; padding: 56px 22px 40px; }
+.selector-wrap { max-width: 980px; margin: 0 auto; padding: 56px 22px 40px; }
 .selector-head h1 { margin: 0 0 6px; font-size: 24px; font-weight: 680; letter-spacing: -.02em; }
 .selector-head p { margin: 0 0 26px; color: var(--muted); font-size: 15px; }
 .selector-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
@@ -6163,6 +6545,101 @@ td.data-cell:has(.nota-edit) { overflow: visible; }
 .colectivo-dot { width: 8px; height: 8px; border-radius: 50%; }
 .colectivo-dot.is-enf { background: var(--accent); }
 .colectivo-dot.is-tcae { background: #7a66b3; }
+.colectivo-dot.is-est { background: #c27c2c; }
+.selector-card.is-est .selector-icon { background: #fbefe0; color: #8a5518; }
+.selector-card.is-est .selector-go { color: #8a5518; }
+.selector-grid { grid-template-columns: repeat(3, 1fr); }
+@media (max-width: 760px) { .selector-grid { grid-template-columns: 1fr; } }
+.est-wrap { max-width: 1080px; margin: 0 auto; padding: 24px 22px 48px; display: flex; flex-direction: column; gap: 16px; }
+.est-top { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+.est-anio { display: inline-flex; align-items: center; gap: 4px; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 3px; }
+.est-anio span { font-weight: 680; font-size: 16px; padding: 0 10px; font-variant-numeric: tabular-nums; }
+.est-anio button { border: 0; background: transparent; font-size: 18px; width: 30px; height: 30px; border-radius: 7px; cursor: pointer; color: var(--ink-soft); }
+.est-anio button:hover { background: var(--panel); }
+.est-acciones { display: flex; gap: 8px; flex-wrap: wrap; }
+.est-card { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 20px 22px; box-shadow: var(--shadow); }
+.est-card-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; margin-bottom: 14px; flex-wrap: wrap; }
+.est-card h2, .est-modal-card h2 { margin: 0; font-size: 16.5px; font-weight: 660; letter-spacing: -.01em; }
+.est-muted { color: var(--muted); font-size: 13px; margin: 0; }
+.est-pista { margin-top: 8px; }
+.est-alerta { background: #fdecec; border: 1px solid #f3c2c2; color: #8a1f1f; border-radius: 10px; padding: 10px 14px; font-size: 13.5px; }
+.est-aviso { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; font-size: 13px; color: var(--ink-soft); }
+.est-leyenda { display: flex; gap: 14px; font-size: 12.5px; color: var(--ink-soft); }
+.est-leyenda i, .est-tabla th i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+.est-barras { display: grid; grid-template-columns: repeat(12, 1fr); gap: 8px; height: 200px; align-items: end; }
+.est-barra { display: flex; flex-direction: column; align-items: center; justify-content: flex-end; height: 100%; border: 0; background: transparent; cursor: pointer; padding: 4px 0; border-radius: 8px; font: inherit; }
+.est-barra:hover { background: var(--panel); }
+.est-barra.is-sel { background: var(--accent-wash); }
+.est-barra-n { font-size: 12.5px; font-weight: 650; height: 18px; font-variant-numeric: tabular-nums; }
+.est-barra-col { width: 62%; max-width: 34px; flex: 1; display: flex; flex-direction: column; justify-content: flex-end; gap: 2px; }
+.est-barra-col span { display: block; width: 100%; border-radius: 4px; }
+.est-barra-m { font-size: 12px; color: var(--ink-soft); margin-top: 6px; }
+.est-barra.is-sel .est-barra-m { color: var(--ink); font-weight: 650; }
+.est-kpis { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 16px; }
+.est-kpi { background: var(--panel); border-radius: 12px; padding: 12px 14px; display: flex; flex-direction: column; }
+.est-kpi b { font-size: 28px; font-weight: 700; line-height: 1.1; font-variant-numeric: tabular-nums; }
+.est-kpi span { font-size: 12.5px; color: var(--muted); }
+.est-mods { display: flex; gap: 3px; height: 30px; border-radius: 8px; overflow: hidden; margin-bottom: 16px; }
+.est-mod { display: flex; align-items: center; justify-content: center; min-width: 0; }
+.est-mod span { font-size: 12px; font-weight: 600; color: #1d2530; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding: 0 6px; }
+.est-tabla { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+.est-tabla th { text-align: left; font-size: 12px; font-weight: 600; color: var(--muted); padding: 8px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.est-tabla td { padding: 9px 10px; border-bottom: 1px solid var(--line); }
+.est-tabla tr:last-child td { border-bottom: 0; }
+.est-num { text-align: center; font-variant-numeric: tabular-nums; }
+.est-tag { display: inline-block; color: #fff; font-size: 11px; font-weight: 650; border-radius: 999px; padding: 2px 8px; margin-right: 4px; }
+.est-scroll { overflow-x: auto; }
+.est-nowrap { white-space: nowrap; }
+.est-link { border: 0; background: transparent; color: var(--accent); font: inherit; font-size: 12.5px; font-weight: 600; cursor: pointer; padding: 2px 6px; }
+.est-del { color: #b33; }
+.est-modal { position: fixed; inset: 0; background: rgba(20,30,48,.35); display: grid; place-items: center; z-index: 50; padding: 16px; }
+.est-modal-card { background: var(--surface); border-radius: 14px; padding: 22px; width: min(560px, 100%); box-shadow: 0 10px 40px rgba(20,30,48,.25); display: flex; flex-direction: column; gap: 14px; }
+.est-form { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.est-form label { display: flex; flex-direction: column; gap: 4px; font-size: 12.5px; color: var(--ink-soft); font-weight: 600; }
+.est-form input, .est-form select { font: inherit; font-size: 14px; font-weight: 400; color: var(--ink); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; background: var(--surface); }
+.est-form-full { grid-column: 1 / -1; }
+.est-modal-btns { display: flex; justify-content: flex-end; gap: 8px; }
+.est-btn { font: inherit; font-size: 13px; font-weight: 580; padding: 8px 14px; border-radius: 8px; border: 1px solid var(--line-strong); background: var(--surface); color: var(--ink); cursor: pointer; white-space: nowrap; }
+.est-btn:hover { background: var(--panel); }
+.est-btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.est-btn-primary:hover { background: var(--accent-deep); }
+.est-btn:disabled { opacity: .6; cursor: default; }
+.est-btn-del { color: #b33; border-color: #e6c3c3; }
+.est-vacio p { margin: 6px 0 0; color: var(--ink-soft); font-size: 14px; }
+.est-filtros { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.est-busca { font: inherit; font-size: 13px; border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; width: 260px; max-width: 100%; }
+.est-check { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--ink-soft); cursor: pointer; }
+.est-periodos { display: flex; flex-direction: column; gap: 14px; }
+.est-periodo { border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+.est-periodo header { background: var(--panel); padding: 10px 14px; border-bottom: 1px solid var(--line); }
+.est-periodo-fechas { font-weight: 660; font-size: 14.5px; }
+.est-periodo-fechas span { color: var(--muted); margin: 0 4px; }
+.est-periodo-meta { font-size: 12.5px; color: var(--muted); margin-top: 2px; }
+.est-periodo .est-tabla th, .est-periodo .est-tabla td { padding-left: 14px; }
+.est-tutora { font-size: 12.5px; text-transform: uppercase; letter-spacing: .01em; color: var(--ink-soft); }
+.est-falta { color: #b33; text-transform: none; font-style: italic; }
+.est-turno { display: inline-block; font-size: 11.5px; font-weight: 650; color: #1d2530; border-radius: 999px; padding: 2px 9px; white-space: nowrap; }
+.est-contacto { font-size: 12.5px; color: var(--ink-soft); word-break: break-all; }
+.est-lista { table-layout: fixed; }
+@media (max-width: 640px) {
+  .est-periodo .est-lista, .est-periodo .est-lista tbody { display: block; }
+  .est-periodo .est-lista thead, .est-periodo .est-lista colgroup { display: none; }
+  .est-periodo .est-lista tr { display: grid; grid-template-columns: auto auto 1fr auto; grid-template-areas: "est est est tur" "tut tut tut edi" "esc cur . ." "con con con con"; gap: 3px 10px; padding: 11px 14px; border-bottom: 1px solid var(--line); align-items: center; }
+  .est-periodo .est-lista tr:last-child { border-bottom: 0; }
+  .est-periodo .est-lista td { padding: 0 !important; border: 0; }
+  .est-c-est { grid-area: est; } .est-c-tur { grid-area: tur; justify-self: end; } .est-c-tut { grid-area: tut; }
+  .est-c-edi { grid-area: edi; justify-self: end; } .est-c-esc { grid-area: esc; font-size: 12.5px; color: var(--muted); }
+  .est-c-cur { grid-area: cur; font-size: 12.5px; color: var(--muted); } .est-c-con { grid-area: con; }
+  .est-c-tut::before { content: "Tutora: "; text-transform: none; color: var(--muted); }
+  .est-busca { width: 100%; }
+}
+@media (max-width: 640px) {
+  .est-barras { gap: 3px; height: 170px; }
+  .est-barra-m { font-size: 10.5px; }
+  .est-kpi b { font-size: 22px; }
+  .est-form { grid-template-columns: 1fr; }
+  .est-tabla { font-size: 12.5px; }
+}
 .colectivo-cambiar { font-weight: 520; color: var(--muted); background: var(--surface); border: 1px solid var(--line); border-radius: 999px; padding: 2px 8px; font-size: 11.5px; }
 @media (max-width: 560px) { .colectivo-cambiar { display: none; } .colectivo-chip { margin-left: 8px; } }
 .bootscreen { display: grid; place-items: center; height: 100vh; color: var(--muted); font-size: 14px; }

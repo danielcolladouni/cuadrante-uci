@@ -22,9 +22,10 @@ export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
      las claves de siempre; TCAE las mismas con el prefijo "tcae:".
 */
 let COLECTIVO = "ENF";
-export function fijarColectivo(c) { COLECTIVO = c === "TCAE" ? "TCAE" : "ENF"; }
+export function fijarColectivo(c) { COLECTIVO = (c === "TCAE" || c === "EST") ? c : "ENF"; }
 export function colectivoActual() { return COLECTIVO; }
-function clave(k) { return COLECTIVO === "ENF" ? k : "tcae:" + k; }
+// "EST" = apartado de Estudiantes (asignación de estudiantes de grado y máster)
+function clave(k) { return COLECTIVO === "ENF" ? k : COLECTIVO.toLowerCase() + ":" + k; }
 
 /* ---------- Autenticación ---------- */
 export async function iniciarSesion(email, password) {
@@ -360,4 +361,49 @@ export async function guardarAliasTodos(aliasArray) {
     .from("config_unidad")
     .upsert({ clave: clave("alias_profesionales"), valor }, { onConflict: "clave" });
   if (error) throw error;
+}
+
+/* ============================================================
+   ESTUDIANTES (apartado «Estudiantes»)
+   Tabla "estudiantes": una fila por estudiante y periodo de prácticas.
+   tipo: GRADO | MASTER · curso: 1º..4º | Máster
+   modalidad (turno): DIA_12H | NIT_12H | NIT_10H | MANANA | TARDE | "" (sin indicar)
+   ============================================================ */
+const CAMPOS_EST = "id, nombre, apellido1, apellido2, tipo, curso, escuela, tutora, modalidad, inicio, fin, contacto, notas";
+function filaEst(e) {
+  return {
+    nombre: e.nombre || "", apellido1: e.apellido1 || "", apellido2: e.apellido2 || "",
+    tipo: e.tipo === "MASTER" ? "MASTER" : "GRADO", curso: e.curso || "", escuela: e.escuela || "",
+    tutora: e.tutora || "", modalidad: e.modalidad || "", inicio: e.inicio, fin: e.fin,
+    contacto: e.contacto || "", notas: e.notas || "",
+  };
+}
+
+export async function cargarEstudiantes() {
+  const { data, error } = await supabase
+    .from("estudiantes").select(CAMPOS_EST).order("inicio", { ascending: true });
+  if (error) throw new Error("No se pudieron cargar los estudiantes: " + error.message);
+  return data || [];
+}
+
+export async function guardarEstudiante(est) {
+  const q = est.id
+    ? supabase.from("estudiantes").update(filaEst(est)).eq("id", est.id).select(CAMPOS_EST).single()
+    : supabase.from("estudiantes").insert(filaEst(est)).select(CAMPOS_EST).single();
+  const { data, error } = await q;
+  if (error) throw new Error("No se pudo guardar el estudiante: " + error.message);
+  return data;
+}
+
+export async function borrarEstudiante(id) {
+  const { error } = await supabase.from("estudiantes").delete().eq("id", id);
+  if (error) throw new Error("No se pudo borrar: " + error.message);
+}
+
+export async function importarEstudiantes(lista) {
+  const filas = lista.map(filaEst);
+  for (let i = 0; i < filas.length; i += 500) {
+    const { error } = await supabase.from("estudiantes").insert(filas.slice(i, i + 500));
+    if (error) throw new Error("No se pudieron importar los estudiantes: " + error.message);
+  }
 }
