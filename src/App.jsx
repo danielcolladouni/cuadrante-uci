@@ -9,7 +9,7 @@ import {
   cargarAnotaciones, guardarAnotaciones,
   cargarAlias, guardarAliasTodos,
   cargarReglas, guardarReglas,
-  fijarColectivo, colectivoActual,
+  fijarColectivo,
   cargarEstudiantes, guardarEstudiante, borrarEstudiante, importarEstudiantes, borrarEstudiantesCalendario,
   cargarEnfermerasReferentes, cargarTurnosEnfermeras, ultimoDiaCronogramaEnfermeria,
 } from "./supabase.js";
@@ -87,7 +87,7 @@ function weekdayMonday(f) {
 
 /* ---------- M02_AreasConfig: áreas, mapeo y permisos (CONFIGURABLE) ---------- */
 const AREA = { UCI_A:"UCI A", UCI_B:"UCI B", SEMIS:"SEMIS", REA:"REA", UCCRI:"UCCRI" };
-const CRIT = { SI:"SI", NO:"NO", UCI:"UCI", UCCRI:"UCCRI", SEMIS:"SEMIS" };
+const CRIT = { SI:"SI", NO:"NO", UCI:"UCI", UCCRI:"UCCRI" };
 
 // Catálogo de áreas posibles de la unidad real. La coordinadora activa/desactiva
 // y ajusta el nº de posiciones cada semana. UCCRI Esquerra y Dreta comparten
@@ -101,23 +101,10 @@ const CATALOGO_AREAS = [
   { id: "UCCRI_DRE", nombre: "UCCRI DRETA",    rotacion: "UCCRI",  posDefecto: 2 },
 ];
 
-// Catálogo TCAE (hoja "CRONO TCAIS SEMANAL"): UCI = Control A + Control B,
-// Semis = Crítics II, UCRI = Ripoll Dret. De noche hay menos plazas.
-const CATALOGO_AREAS_TCAE = [
-  { id: "UCI_A",     nombre: "CONTROL A",   rotacion: "UCI A",  posDefecto: 1, posNocheDefecto: 1 },
-  { id: "UCI_B",     nombre: "CONTROL B",   rotacion: "UCI B",  posDefecto: 2, posNocheDefecto: 1 },
-  { id: "SEMIS",     nombre: "CRÍTICS II",  rotacion: "SEMIS",  posDefecto: 3, posNocheDefecto: 2 },
-  { id: "REA",       nombre: "REA",         rotacion: "REA",    posDefecto: 2, posNocheDefecto: 2 },
-  { id: "UCCRI_DRE", nombre: "RIPOLL DRET", rotacion: "UCCRI",  posDefecto: 3, posNocheDefecto: 2 },
-];
-const esTCAE = () => colectivoActual() === "TCAE";
-function catalogoAreas() { return esTCAE() ? CATALOGO_AREAS_TCAE : CATALOGO_AREAS; }
-
 function estructuraPorDefecto() {
-  return catalogoAreas().map(a => ({
+  return CATALOGO_AREAS.map(a => ({
     id: a.id, nombre: a.nombre, rotacion: a.rotacion,
     posiciones: a.posDefecto, activa: true,
-    ...(a.posNocheDefecto != null ? { posicionesNoche: a.posNocheDefecto } : {}),
   }));
 }
 
@@ -125,7 +112,6 @@ function estructuraPorDefecto() {
 // acompaña al número de una posición. Se usa solo si el área no tiene etiquetas
 // personalizadas guardadas en la estructura.
 function etiquetaFijaPosicion(areaId, posLocal) {
-  if (esTCAE()) return null; // TCAE: sin etiquetas clásicas de enfermería
   // "+ revisió carro" en posiciones concretas (acompaña al número)
   const revisioCarro = (
     (areaId === "UCI_A" && posLocal === 2) ||
@@ -172,20 +158,15 @@ function compilarEstructura(config) {
   const activas = (config && config.length ? config : estructuraPorDefecto())
     .filter(a => a.activa && a.posiciones > 0);
   const areas = [];
-  const cerradasNoche = new Set(); // posiciones globales que no existen de noche
   let cursor = 1;
   for (const a of activas) {
     const ini = cursor, fin = cursor + a.posiciones - 1;
-    // Plazas de noche (opcional): si no se indica, las mismas que de día.
-    const pn = a.posicionesNoche == null || a.posicionesNoche === ""
-      ? a.posiciones : Math.max(0, Math.min(a.posiciones, +a.posicionesNoche || 0));
     areas.push({ id: a.id, nombre: a.nombre, rotacion: a.rotacion,
-      posiciones: a.posiciones, posicionesNoche: pn, posIni: ini, posFin: fin,
+      posiciones: a.posiciones, posIni: ini, posFin: fin,
       etiquetas: a.etiquetas || null });
-    for (let k = pn; k < a.posiciones; k++) cerradasNoche.add(ini + k);
     cursor = fin + 1;
   }
-  return { areas, nPosTotal: cursor - 1, cerradasNoche };
+  return { areas, nPosTotal: cursor - 1 };
 }
 
 // --- Estructura ACTIVA (variable de módulo). El motor la fija antes de generar. ---
@@ -193,10 +174,6 @@ let _EST = compilarEstructura(estructuraPorDefecto());
 function fijarEstructura(config) { _EST = compilarEstructura(config); return _EST; }
 function estructuraActiva() { return _EST; }
 function NPOS_TOTAL_actual() { return _EST.nPosTotal; }
-// Marca de celda "posición cerrada" (no existe en ese turno). El motor la ve
-// como ocupada, no se guarda en el histórico y se dibuja en gris.
-const POS_CERRADA = "—";
-function posCerradaNoche(p) { return !!(_EST.cerradasNoche && _EST.cerradasNoche.has(p)); }
 
 // Lista de "áreas" en el sentido antiguo = rotaciones únicas, en orden de recorrido.
 function listaAreasOrdenadas() {
@@ -249,7 +226,6 @@ function puedeIrAArea(criterio, rotacion) {
     case CRIT.NO: return rotacion === AREA.SEMIS || rotacion === AREA.UCCRI;
     case CRIT.UCI: return rotacion === AREA.UCI_A || rotacion === AREA.UCI_B;
     case CRIT.UCCRI: return rotacion === AREA.UCCRI;
-    case CRIT.SEMIS: return rotacion === AREA.SEMIS;
     default: return true; // conservador
   }
 }
@@ -297,7 +273,7 @@ function reglasActivas() { return _REGLAS; }
 function normalizarCriterio(valor) {
   let v = String(valor || "").toUpperCase().trim();
   if (v === "SÍ") v = "SI";
-  if (v === "SI" || v === "NO" || v === "UCI" || v === "UCCRI" || v === "SEMIS") return v;
+  if (v === "SI" || v === "NO" || v === "UCI" || v === "UCCRI") return v;
   return "SI";
 }
 function areaExcedenteRoundRobin(n) {
@@ -367,16 +343,6 @@ function parsearHoraAMinutos(s) {
   }
   if (isNaN(+t)) return -1;
   return (+t) * 60;
-}
-
-/* Categorías (col A de la planilla) que entran en el cronograma según el colectivo.
-   Enfermería: todas las INF_* excepto COOR_INF.
-   TCAE: sólo TCAI_UCI y TCAI_HOSP_SS (TCAI_ADM queda fuera). */
-const CATEGORIAS_TCAE = ["TCAI_UCI", "TCAI_HOSP_SS"];
-function categoriaIncluida(cat) {
-  const c = String(cat == null ? "" : cat).trim().toUpperCase();
-  if (colectivoActual() === "TCAE") return CATEGORIAS_TCAE.includes(c);
-  return c.substring(0, 3) === "INF" && c !== "COOR_INF";
 }
 
 // Parsea "8-14 MMORALES" / "* 8-20 APELLIDO APELLIDO, NOMBRE" -> {horario, nombre}
@@ -791,7 +757,7 @@ function extraerNombresSinVincular(planilla, db, fechaLunesInicio, numSemanas) {
           else if (u.indexOf("TURNO DE NOCHE") >= 0) seccion = "NOCHE";
         }
         const cat = cel(1) == null ? "" : String(cel(1));
-        if (!categoriaIncluida(cat)) continue;
+        if (cat.substring(0, 3) !== "INF" || cat === "COOR_INF") continue;
         const kSerial = toSerial(cel(11));
         if (kSerial == null || fechaSerial < kSerial || fechaSerial > kSerial + 6) continue;
         const celda = cel(colDia);
@@ -833,7 +799,8 @@ function obtenerProfesionalesDelDia(planilla, db, fechaObj) {
     }
 
     const cat = cell(1) == null ? "" : String(cell(1));
-    if (!categoriaIncluida(cat)) continue;
+    if (cat.substring(0, 3) !== "INF") continue;
+    if (cat === "COOR_INF") continue;
 
     const fechaCell = cell(11); // col K = lunes de la semana representada
     const fSerial = toSerial(fechaCell);
@@ -1032,26 +999,15 @@ function posicionSemanaAnterior(historico, nombreProf, fechaLunes, area) {
   return mejorPos;
 }
 
-/* Periodo de rotación. Enfermería rota por MES; TCAE rota cada 2 SEMANAS.
-   Las quincenas TCAE se cuentan de lunes a domingo desde un lunes de
-   referencia (QUINCENA_REF), así son siempre las mismas parejas de semanas. */
-const QUINCENA_REF = diaSerial(new Date(2026, 0, 5)); // lunes 5/1/2026
-function periodoDeSerial(serial) {
-  const q = Math.floor((serial - QUINCENA_REF) / 14);
-  return "Q" + String(q + 10000).padStart(5, "0");
-}
-function periodoDeFecha(f) { return esTCAE() ? periodoDeSerial(diaSerial(f)) : mesKey(f); }
-function periodoDeFila(h) { return esTCAE() ? periodoDeSerial(h.fechaSerial) : h.mes; }
-
 function unidadDelMesActual(historico, nombreProf, fechaLunes) {
   if (!historico || historico.length === 0) return "";
   const lunesSerial = diaSerial(fechaLunes);
-  const mes = periodoDeFecha(fechaLunes);
+  const mes = mesKey(fechaLunes);
   const np = normalizarTexto(nombreProf);
   const conteo = new Map();
   for (const h of historico) {
     if (h.fechaSerial >= lunesSerial) continue;
-    if (periodoDeFila(h) !== mes) continue;
+    if (h.mes !== mes) continue;
     if (h.profNorm !== np) continue;
     conteo.set(h.area, (conteo.get(h.area) || 0) + 1);
   }
@@ -1078,10 +1034,9 @@ function historialMensualProf(historico, profNorm, mesActual) {
   const porMes = new Map();
   for (const h of historico) {
     if (h.profNorm !== profNorm) continue;
-    const per = periodoDeFila(h);
-    if (per >= mesActual) continue; // solo periodos anteriores
-    if (!porMes.has(per)) porMes.set(per, new Map());
-    const m = porMes.get(per);
+    if (h.mes >= mesActual) continue; // solo meses anteriores
+    if (!porMes.has(h.mes)) porMes.set(h.mes, new Map());
+    const m = porMes.get(h.mes);
     m.set(h.area, (m.get(h.area) || 0) + 1);
   }
   const meses = [...porMes.keys()].sort();
@@ -1103,7 +1058,7 @@ function unidadRotacionObligatoria(historico, nombreProf, criterio, esSuplente, 
   if (candidatas.length === 0) return "";
   if (candidatas.length === 1) return candidatas[0];
 
-  const mesActual = periodoDeFecha(fechaLunes);
+  const mesActual = mesKey(fechaLunes);
   const hist = historialMensualProf(historico, normalizarTexto(nombreProf), mesActual);
 
   // ¿Ya hay asignación de unidad ESTE mes en semanas anteriores? Mantenerla
@@ -1185,39 +1140,25 @@ function repartirRotacionBloque(profesionales, capacidad, historico, mesActual) 
   // Los más restringidos (menos unidades posibles) primero
   datos.sort((a, b) => a.cand.length - b.cand.length);
 
-  // TCAE: deshacer grupos. Quienes coincidieron en la misma unidad el periodo
-  // anterior se reparten a unidades DISTINTAS (no saltan juntas en bloque).
-  // llegadas[u][origen] = cuántos del mismo origen van ya a la unidad u.
-  const dispersar = esTCAE();
-  const llegadas = {};
-  const mismoOrigen = (d, u) => (dispersar && d.ultima && llegadas[u] && llegadas[u][d.ultima]) || 0;
-  // Orden de preferencia: 1) que no vaya con sus compañeras de la unidad anterior
-  // (solo TCAE), 2) unidades aún no visitadas del ciclo, 3) la que hace más que no pisa.
-  const pend = (d, u) => (dispersar && !d.pendientes.includes(u) ? 1 : 0); // enfermería: sin cambios
-  const ordenar = (d, op) => op.sort((x, y) => (mismoOrigen(d, x) - mismoOrigen(d, y))
-    || (pend(d, x) - pend(d, y)) || (d.urg[y] - d.urg[x]));
-  const asignar = (d, u) => {
-    asign.set(d.profNorm, u); restante[u]--;
-    if (d.ultima) { llegadas[u] = llegadas[u] || {}; llegadas[u][d.ultima] = (llegadas[u][d.ultima] || 0) + 1; }
-  };
-
   // Fase 1: unidad PENDIENTE (no visitada), distinta de la última y NO prohibida
   for (const d of datos) {
-    const base1 = dispersar ? d.cand : d.pendientes;
-    const op = ordenar(d, base1.filter(u => u !== d.ultima && u !== d.prohibida && restante[u] > 0));
-    if (op.length) asignar(d, op[0]);
+    const op = d.pendientes.filter(u => u !== d.ultima && u !== d.prohibida && restante[u] > 0)
+      .sort((x, y) => d.urg[y] - d.urg[x]);
+    if (op.length) { asign.set(d.profNorm, op[0]); restante[op[0]]--; }
   }
   // Fase 2: cualquier candidata distinta de la última y NO prohibida con hueco
   for (const d of datos) {
     if (asign.has(d.profNorm)) continue;
-    const op = ordenar(d, d.cand.filter(u => u !== d.ultima && u !== d.prohibida && restante[u] > 0));
-    if (op.length) asignar(d, op[0]);
+    const op = d.cand.filter(u => u !== d.ultima && u !== d.prohibida && restante[u] > 0)
+      .sort((x, y) => d.urg[y] - d.urg[x]);
+    if (op.length) { asign.set(d.profNorm, op[0]); restante[op[0]]--; }
   }
   // Fase 3: permitir repetir la última (pero NO la prohibida) si es la única forma
   for (const d of datos) {
     if (asign.has(d.profNorm)) continue;
-    const op = ordenar(d, d.cand.filter(u => u !== d.prohibida && restante[u] > 0));
-    if (op.length) asignar(d, op[0]);
+    const op = d.cand.filter(u => u !== d.prohibida && restante[u] > 0)
+      .sort((x, y) => d.urg[y] - d.urg[x]);
+    if (op.length) { asign.set(d.profNorm, op[0]); restante[op[0]]--; }
   }
   // (Sin Fase 4: nunca se asigna la unidad prohibida. Quien quede sin unidad por
   // capacidad fluye al relleno de huecos / excedente en su unidad de rotación,
@@ -1225,28 +1166,16 @@ function repartirRotacionBloque(profesionales, capacidad, historico, mesActual) 
   return asign;
 }
 // Capacidad (plazas por unidad) de un bloque. esNoche define qué posiciones cuentan.
-function capacidadPorUnidad(esNoche) {
+function capacidadPorUnidad() {
   const cap = {};
-  for (const u of unidadesAbiertasRotacion()) {
-    let n = 0;
-    for (const a of _EST.areas) if (a.rotacion === u) n += esNoche ? a.posicionesNoche : a.posiciones;
-    cap[u] = n;
-  }
+  for (const u of unidadesAbiertasRotacion()) cap[u] = posicionesDeArea(u);
   return cap;
-}
-// Reparte n personas entre unidades en proporción a sus plazas (redondeo al alza).
-function escalarCapacidad(cap, n) {
-  const total = Object.values(cap).reduce((x, y) => x + y, 0);
-  if (total <= 0 || n <= total) return cap;
-  const out = {};
-  for (const u of Object.keys(cap)) out[u] = Math.ceil(cap[u] * n / total);
-  return out;
 }
 // Calcula el reparto del mes para día y noche. Devuelve Map(profNorm -> unidad).
 // Solo incluye fijos (Suplente=No) con bloque dominante claro.
 function calcularRepartoMes(estad, db, historico, fechaLunes) {
   if (!_REGLAS.rotacionMensual) return new Map();
-  const mesActual = periodoDeFecha(fechaLunes);
+  const mesActual = mesKey(fechaLunes);
   // Si ya hay unidad asignada este mes (semanas previas), respetarla luego en
   // intentarAsignarPos vía unidadDelMesActual; aquí repartimos a todos los fijos.
   const dia = [], noche = [];
@@ -1255,15 +1184,8 @@ function calcularRepartoMes(estad, db, historico, fechaLunes) {
     const p = { nombre: e.nombre, profNorm: normalizarTexto(e.nombre), criterio: db.criterio(e.nombre) };
     if (esBloqueNoche(e.bloqueDominante)) noche.push(p); else dia.push(p);
   }
-  let capDia = capacidadPorUnidad(false);
-  let capNoche = capacidadPorUnidad(true);
-  // TCAE: hay muchas más personas que plazas (tiempos parciales que se turnan
-  // la misma plaza). Se escala la capacidad en proporción a las plazas para que
-  // TODOS reciban unidad en el reparto y así se pueda deshacer los grupos.
-  if (esTCAE()) {
-    capDia = escalarCapacidad(capDia, dia.length);
-    capNoche = escalarCapacidad(capNoche, noche.length);
-  }
+  const capDia = capacidadPorUnidad();
+  const capNoche = capacidadPorUnidad();
   const repDia = repartirRotacionBloque(dia, capDia, historico, mesActual);
   const repNoche = repartirRotacionBloque(noche, capNoche, historico, mesActual);
   const total = new Map();
@@ -1291,9 +1213,7 @@ function nuevaMatriz() {
   for (let d = 0; d < 7; d++) {
     celdas.push([]);
     for (let t = 0; t < 3; t++) {
-      const fila = new Array(NPOS_TOTAL_actual() + 1).fill("");
-      if (t === TURNO_IDX.NOCHE) for (let p = 1; p < fila.length; p++) if (posCerradaNoche(p)) fila[p] = POS_CERRADA;
-      celdas[d].push(fila);
+      celdas[d].push(new Array(NPOS_TOTAL_actual() + 1).fill(""));
     }
   }
   return { celdas, excedentes: {} }; // excedentes[d*3+t] = [{nombre, area}]
@@ -1363,7 +1283,7 @@ function posicionAntiguoEstaSemana(historico, nombre, unidad, fechaLunes, ocupad
 
   // ¿Es la primera semana del mes? Entonces empieza ciclo nuevo.
   const lunesPrevio = addDays(fechaLunes, -7);
-  const mismoMes = periodoDeFecha(lunesPrevio) === periodoDeFecha(fechaLunes);
+  const mismoMes = mesKey(lunesPrevio) === mesKey(fechaLunes);
 
   let posPrevia = 0;
   if (mismoMes) posPrevia = posicionSemanaAnterior(historico, nombre, fechaLunes, unidad);
@@ -1384,7 +1304,6 @@ function posicionAntiguoEstaSemana(historico, nombre, unidad, fechaLunes, ocupad
 function asignarEstables(estad, db, historico, fechaLunes) {
   const ocDia = new Array(NPOS_TOTAL_actual() + 1).fill(false);
   const ocNoche = new Array(NPOS_TOTAL_actual() + 1).fill(false);
-  for (let p = 1; p < ocNoche.length; p++) if (posCerradaNoche(p)) ocNoche[p] = true;
   const asignEst = []; // {nombreNorm, posGlobal, bloque}
   const ya = new Array(estad.length).fill(false);
 
@@ -1710,7 +1629,7 @@ function afinarCobertura(asig, semana, db, asignEst) {
   };
   const cuentaUnidad = (d, t, u) => {
     let n = 0;
-    for (let p = posGlobalInicioArea(u); p <= posGlobalFinArea(u); p++) if (C[d][t][p] && C[d][t][p] !== POS_CERRADA) n++;
+    for (let p = posGlobalInicioArea(u); p <= posGlobalFinArea(u); p++) if (C[d][t][p]) n++;
     return n;
   };
   const turnosDe = (t) => (t === N ? [N] : [t]);
@@ -1723,7 +1642,7 @@ function afinarCobertura(asig, semana, db, asignEst) {
       const vistos = new Set();
       for (let p = 1; p <= nPos; p++) {
         const n = C[d][t][p];
-        if (!n || n === POS_CERRADA) continue;
+        if (!n) continue;
         if (vistos.has(nt(n))) { C[d][t][p] = ""; reg("duplicado", d, t, n, areaDe(p), ""); }
         else vistos.add(nt(n));
       }
@@ -1799,7 +1718,6 @@ function afinarCobertura(asig, semana, db, asignEst) {
     const ap = areaDe(p), aq = areaDe(q);
     for (const t of S) {
       const a = C[d][t][p], b = C[d][t][q];
-      if (a === POS_CERRADA || b === POS_CERRADA) return false;
       if (a && (fijos.has(nt(a)) || !puedeIrAArea(db.criterio(a), aq))) return false;
       if (b && (fijos.has(nt(b)) || !puedeIrAArea(db.criterio(b), ap))) return false;
     }
@@ -2394,7 +2312,7 @@ function filasHistoricoDeSemana(asig) {
     for (let t = 0; t < 3; t++) {
       for (let p = 1; p <= NPOS_TOTAL_actual(); p++) {
         const nombre = asig.celdas[d][t][p];
-        if (!nombre || nombre === POS_CERRADA) continue;
+        if (!nombre) continue;
         const { area } = posGlobalAArea(p);
         filas.push({
           fechaSerial: diaSerial(fecha), fecha, mes: mesKey(fecha),
@@ -2872,9 +2790,7 @@ function _gridSemana(sem, db, ENGINE, S, areasLayout) {
         // (12h día verde, 12h noche lila, 7h/10h/parcial blanco)
         for (let d = 0; d < 7; d++) {
           const nombre = sem.asig.celdas[d][b.idx][p];
-          if (nombre === ENGINE.POS_CERRADA) {
-            row.push({ v: "—", s: S.cBlanco, t: "s" }); // plaza que no existe en este turno
-          } else if (!nombre) {
+          if (!nombre) {
             row.push({ v: "", s: S.cVacio });
           } else {
             const tf = turnoMap[d].get(ENGINE.normalizarTexto(nombre));
@@ -3040,11 +2956,11 @@ function exportarCronogramaXLSX(resultado, db, ENGINE) {
 
   return {
     TURNO, COLOR, AREA, CRIT, NPOS_TOTAL_actual,
-    CATALOGO_AREAS, catalogoAreas, POS_CERRADA, estructuraPorDefecto, fijarEstructura, estructuraActiva,
+    CATALOGO_AREAS, estructuraPorDefecto, fijarEstructura, estructuraActiva,
     etiquetaFijaPosicion, etiquetaDePosicion, etiquetasPorDefectoDeArea,
     FONDO, COLOR_LILA, COLOR_BLANCO, fondoPorDefectoDeTurno, normalizarFondo,
     REGLAS_DEFECTO, REGLAS_INFO, fijarReglas, reglasActivas,
-    normalizarTexto, colorPorTurno, fechaCorta, mesKey, addDays, weekdayMonday,
+    normalizarTexto, colorPorTurno, fechaCorta, mesKey, addDays, weekdayMonday, diaSerial,
     posGlobalAArea, nombreAreaCortoDePosGlobal,
     ProfesionalesDB, obtenerProfesionalesDelDia,
     extraerSemana, calcularEstadisticasSemana,
@@ -3384,7 +3300,7 @@ export default function App() {
         // Se excluye SOLO el rango de días que se va a (re)generar ahora; así las
         // semanas anteriores del mismo mes (p.ej. las sincronizadas con la hoja
         // real INF_PLANING SETMANAL) sí cuentan para continuidad y recuento mensual.
-        const desdeGen = diaSerial(lunes);
+        const desdeGen = ENGINE.diaSerial(lunes);
         const hastaGen = desdeGen + ns * 7 - 1;
         const histPrevio = (Array.isArray(historico) ? historico : [])
           .filter(h => h.fechaSerial < desdeGen || h.fechaSerial > hastaGen);
@@ -3667,7 +3583,7 @@ export default function App() {
           {vista === "estructura" && (
             <EditorEstructura
               estructura={estructura || ENGINE.estructuraPorDefecto()}
-              catalogo={ENGINE.catalogoAreas()}
+              catalogo={ENGINE.CATALOGO_AREAS}
               porDefecto={ENGINE.estructuraPorDefecto()}
               saveEstructura={saveEstructura}
               ENGINE={ENGINE}
@@ -3779,6 +3695,218 @@ function SelectorColectivo({ nombre, onElegir }) {
     </div>
   );
 }
+
+/* ============================================================
+   MOTOR DE ROTACIÓN DE TCAE (lógica explicada por la supervisora)
+   ------------------------------------------------------------
+   Ámbitos: UCI (CONTROL A + CONTROL B), SEMIS, REA, UCCRI.
+   Plazas por turno: 2 por ámbito; de DÍA la UCI tiene 3 (1 en
+   control A + 2 en control B). Si sobra alguien, va de tercera a
+   la UCI (excedente).
+   1) FIJAS: rotan cada 15 días (quincena 1-15 y 16-fin de mes).
+      Las que estaban juntas en un ámbito NO saltan juntas: se
+      reparten a ámbitos distintos (rompe los tríos de UCI y evita
+      el cuello de botella 3 -> 2). Nadie repite ámbito dos
+      quincenas seguidas y se prioriza el ámbito donde ha estado
+      menos tiempo. En UCI se alterna control A / control B.
+   2) TP (tiempo parcial, fijas a tiempo parcial): cubren los días
+      libres de las fijas. A cada TP se le asignan las fijas cuyos
+      días libres mejor coinciden con sus días de trabajo y ocupa su
+      plaza esos días (siempre las mismas). Lo que no cuadra, a
+      cualquier hueco.
+   3) SUPLENTES: se colocan al final, en los huecos que quedan. La
+      de jornada completa intenta estar siempre en el mismo ámbito;
+      si hay que mover a alguien, primero la suplente más reciente.
+   4) Criterio por persona: ámbitos permitidos (p.ej. una nueva solo
+      SEMIS) y si rota o no.
+   ============================================================ */
+const ENGINE_TCAE = (function () {
+  const AMBITOS = ["UCI", "SEMIS", "REA", "UCCRI"];
+  const ORDEN_CLASICO = { UCI: "SEMIS", SEMIS: "REA", REA: "UCCRI", UCCRI: "UCI" };
+  const PLAZAS_DEF = {
+    DIA: { UCI: 3, SEMIS: 2, REA: 2, UCCRI: 2 },
+    NOCHE: { UCI: 2, SEMIS: 2, REA: 2, UCCRI: 2 },
+  };
+
+  const pad = (n) => String(n).padStart(2, "0");
+  const iso = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  const quincenaDe = (f) => { const [y, m, d] = f.split("-").map(Number); return `${y}-${pad(m)}-${d <= 15 ? "Q1" : "Q2"}`; };
+  const ambitoPermitido = (p, a) => !p.ambitos || !p.ambitos.length || p.ambitos.includes(a);
+  const bloqueDe = (turno) => (turno === "N" ? "NOCHE" : "DIA");
+
+  /* ---------- 1) Rotación quincenal de las fijas ----------
+     fijas: [{ nombre, bloque: "DIA"|"NOCHE", ambitos?, rota?, ambitoFijo? }]
+     previo: { nombre: ámbito de la quincena anterior }
+     historial: { nombre: { ámbito: nº de quincenas } } (para priorizar donde menos ha estado)
+     plazas: { DIA: {...}, NOCHE: {...} }
+     Devuelve { nombre: ámbito } y, para UCI, el control (A/B) en controlUCI. */
+  function rotarQuincena(fijas, previo, historial, plazas, controlPrevio) {
+    plazas = plazas || PLAZAS_DEF;
+    const res = {}, controlUCI = {};
+    for (const bloque of ["DIA", "NOCHE"]) {
+      const grupo = fijas.filter(p => p.bloque === bloque);
+      if (!grupo.length) continue;
+      // Capacidad objetivo por ámbito, proporcional a las plazas del turno
+      const totalPlazas = AMBITOS.reduce((s, a) => s + plazas[bloque][a], 0);
+      const cap = {};
+      let asignadas = 0;
+      for (const a of AMBITOS) { cap[a] = Math.floor(grupo.length * plazas[bloque][a] / totalPlazas); asignadas += cap[a]; }
+      // el resto, empezando por UCI (allí van las terceras)
+      for (const a of ["UCI", "SEMIS", "REA", "UCCRI"]) { if (asignadas >= grupo.length) break; cap[a]++; asignadas++; }
+      while (asignadas < grupo.length) { cap.UCI++; asignadas++; }
+
+      // Las que no rotan ocupan primero su sitio
+      const ocup = Object.fromEntries(AMBITOS.map(a => [a, 0]));
+      // origen|turno -> Set(destinos ya usados): las que trabajaban juntas (mismo
+      // ámbito y mismo turno; un 12 h cuenta como mañana y tarde) no saltan juntas
+      const destinoPorOrigen = {};
+      const letras = (t) => (t === "D12" ? ["M", "T"] : t === "N12" ? ["N"] : [t || "M"]);
+      const pendientes = [];
+      for (const p of grupo) {
+        if (p.rota === false) {
+          const a = p.ambitoFijo || previo[p.nombre] || (p.ambitos && p.ambitos[0]) || "UCI";
+          res[p.nombre] = a; ocup[a]++;
+        } else pendientes.push(p);
+      }
+      // Orden: primero las más restringidas (menos ámbitos permitidos)
+      pendientes.sort((x, y) => (x.ambitos ? x.ambitos.length : 4) - (y.ambitos ? y.ambitos.length : 4) || x.nombre.localeCompare(y.nombre));
+      for (const p of pendientes) {
+        const origen = previo[p.nombre] || "";
+        const claves = letras(p.turno).map(t => origen + "|" + t);
+        const usado = (a) => claves.some(k => destinoPorOrigen[k] && destinoPorOrigen[k].has(a));
+        const h = (historial && historial[p.nombre]) || {};
+        let mejor = null, mejorS = -Infinity;
+        for (const a of AMBITOS) {
+          if (!ambitoPermitido(p, a)) continue;
+          let s = 0;
+          if (a === origen) s -= 100;                        // no repetir ámbito
+          if (ocup[a] >= cap[a]) s -= 50;                    // ámbito ya lleno
+          if (origen && usado(a)) s -= 30;                   // no saltar juntas al mismo sitio
+          s -= 4 * (h[a] || 0);                              // donde menos ha estado
+          if (origen && ORDEN_CLASICO[origen] === a) s += 1; // desempate: orden clásico
+          if (s > mejorS) { mejorS = s; mejor = a; }
+        }
+        if (!mejor) mejor = origen || "UCI";
+        res[p.nombre] = mejor; ocup[mejor]++;
+        for (const k of claves) (destinoPorOrigen[k] = destinoPorOrigen[k] || new Set()).add(mejor);
+      }
+      // UCI: alternar control A / B. En A hay 1 plaza, en B el resto.
+      const enUci = grupo.filter(p => res[p.nombre] === "UCI")
+        .sort((x, y) => ((controlPrevio && controlPrevio[x.nombre]) === "A" ? 1 : 0) - ((controlPrevio && controlPrevio[y.nombre]) === "A" ? 1 : 0) || x.nombre.localeCompare(y.nombre));
+      enUci.forEach((p, i) => { controlUCI[p.nombre] = i === 0 && (controlPrevio || {})[p.nombre] !== "A" ? "A" : "B"; });
+      if (enUci.length && !enUci.some(p => controlUCI[p.nombre] === "A")) controlUCI[enUci[0].nombre] = "A";
+    }
+    return { ambito: res, controlUCI };
+  }
+
+  /* ---------- 2) Emparejar cada TP con las fijas a las que cubre ----------
+     trabaja: { nombre: Set(claves "fecha|turno") } de todo el periodo.
+     Devuelve { tp: [fijas que cubre, por orden de coincidencia] } */
+  function emparejarTP(tps, fijas, trabaja, clavesPeriodo) {
+    const pares = [];
+    for (const tp of tps) for (const f of fijas) {
+      if (bloqueDe(tp.turno) !== bloqueDe(f.turno)) continue;
+      let n = 0;
+      for (const k of clavesPeriodo) {
+        if (!k.endsWith("|" + (f.turno === "N" ? "N" : k.split("|")[1]))) continue;
+        if (trabaja[tp.nombre] && trabaja[tp.nombre].has(k) && !(trabaja[f.nombre] && trabaja[f.nombre].has(k))) n++;
+      }
+      if (n > 0) pares.push({ tp: tp.nombre, fija: f.nombre, n });
+    }
+    pares.sort((a, b) => b.n - a.n);
+    const out = {}, usadasPorFija = {};
+    for (const p of pares) {
+      // cada fija la cubre preferentemente una sola TP; cada TP hasta 3 fijas
+      if (usadasPorFija[p.fija]) continue;
+      if ((out[p.tp] || []).length >= 3) continue;
+      (out[p.tp] = out[p.tp] || []).push(p.fija); usadasPorFija[p.fija] = p.tp;
+    }
+    return out;
+  }
+
+  /* ---------- 3) Cuadrante de un periodo ----------
+     personal: [{ nombre, tipo: "FIJA"|"TP"|"SUPLENTE", turno: "M"|"T"|"N"|"D12"|"N12",
+                  ambitos?, rota?, ambitoFijo?, jornadaCompleta?, antiguedad? (meses) }]
+     dias: [{ fecha: "2027-01-04", trabajan: { nombre: "M"|"T"|"N"|"D12"|"N12" } }]
+     plan: resultado de rotarQuincena por quincena { "2027-01-Q1": {ambito, controlUCI} }
+     Devuelve por día y turno: { UCI: {A:[], B:[]}, SEMIS:[], REA:[], UCCRI:[], extra:[], avisos:[] } */
+  function generarPeriodo(personal, dias, plan, plazas) {
+    plazas = plazas || PLAZAS_DEF;
+    const porNombre = Object.fromEntries(personal.map(p => [p.nombre, p]));
+    const turnosDe = (t) => (t === "D12" ? ["M", "T"] : t === "N12" ? ["N"] : [t]);
+    // presencia por clave fecha|turno
+    const trabaja = {}; const claves = [];
+    for (const d of dias) for (const t of ["M", "T", "N"]) claves.push(d.fecha + "|" + t);
+    for (const d of dias) for (const [n, t] of Object.entries(d.trabajan)) for (const x of turnosDe(t)) (trabaja[n] = trabaja[n] || new Set()).add(d.fecha + "|" + x);
+    const fijas = personal.filter(p => p.tipo === "FIJA"), tps = personal.filter(p => p.tipo === "TP");
+    const parejas = emparejarTP(tps.map(p => ({ ...p, turno: p.turno === "N12" ? "N" : p.turno })), fijas.map(p => ({ ...p, turno: p.turno === "N12" ? "N" : p.turno })), trabaja, claves);
+    const fijaDeTP = parejas;
+    // casa de cada suplente: ámbito donde más veces ha estado (se va actualizando)
+    const casaSup = {};
+    const salida = {};
+    for (const d of dias) {
+      const q = quincenaDe(d.fecha); const pq = plan[q] || { ambito: {}, controlUCI: {} };
+      salida[d.fecha] = {};
+      for (const t of ["M", "T", "N"]) {
+        const bloque = t === "N" ? "NOCHE" : "DIA";
+        const cap = { ...plazas[bloque] };
+        const huecos = Object.fromEntries(AMBITOS.map(a => [a, []]));
+        const r = { UCI: { A: [], B: [] }, SEMIS: [], REA: [], UCCRI: [], extra: [], avisos: [] };
+        const presentes = personal.filter(p => trabaja[p.nombre] && trabaja[p.nombre].has(d.fecha + "|" + t));
+        const ocupa = (a) => (a === "UCI" ? r.UCI.A.length + r.UCI.B.length : r[a].length);
+        const colocar = (p, a, motivo) => {
+          if (a === "UCI") {
+            const ctl = pq.controlUCI[p.nombre] || (r.UCI.A.length < (bloque === "DIA" ? 1 : 1) ? "A" : "B");
+            (ctl === "A" && r.UCI.A.length < 1 ? r.UCI.A : r.UCI.B).push(p.nombre);
+          } else r[a].push(p.nombre);
+          if (motivo) r.avisos.push(`${p.nombre} → ${a} (${motivo})`);
+        };
+        // a) fijas presentes en su ámbito de la quincena
+        const ausentesPorAmbito = Object.fromEntries(AMBITOS.map(a => [a, []]));
+        for (const f of fijas) {
+          const a = pq.ambito[f.nombre]; if (!a) continue;
+          const esDeEsteBloque = bloqueDe(f.turno === "N12" ? "N" : f.turno) === bloque;
+          if (!esDeEsteBloque) continue;
+          if (presentes.includes(f)) { if (ocupa(a) < cap[a]) colocar(f, a); else r.extra.push(f.nombre); }
+          else ausentesPorAmbito[a].push(f.nombre);
+        }
+        // b) TP: primero a la plaza de la fija que cubre, si está libre ese día
+        const tpsHoy = presentes.filter(p => p.tipo === "TP");
+        const tpPend = [];
+        for (const tp of tpsHoy) {
+          const cubre = (fijaDeTP[tp.nombre] || []).find(fn => Object.values(ausentesPorAmbito).some(l => l.includes(fn)));
+          const a = cubre ? AMBITOS.find(x => ausentesPorAmbito[x].includes(cubre)) : null;
+          if (a && ocupa(a) < cap[a] && ambitoPermitido(tp, a)) { colocar(tp, a); ausentesPorAmbito[a] = ausentesPorAmbito[a].filter(x => x !== cubre); }
+          else tpPend.push(tp);
+        }
+        // c) huecos restantes: TP sin pareja ese día y suplentes (más antiguas eligen primero su casa)
+        const rellenar = (p, preferido) => {
+          const orden = AMBITOS.slice().sort((x, y) => (cap[y] - ocupa(y)) - (cap[x] - ocupa(x)));
+          if (preferido) orden.unshift(preferido);
+          for (const a of orden) if (ambitoPermitido(p, a) && ocupa(a) < cap[a]) { colocar(p, a); return a; }
+          r.extra.push(p.nombre); return "";
+        };
+        for (const tp of tpPend) rellenar(tp, null);
+        const sups = presentes.filter(p => p.tipo === "SUPLENTE")
+          .sort((x, y) => (y.jornadaCompleta ? 1 : 0) - (x.jornadaCompleta ? 1 : 0) || (y.antiguedad || 0) - (x.antiguedad || 0));
+        for (const s of sups) {
+          const a = rellenar(s, casaSup[s.nombre] || s.ambitoFijo || null);
+          if (a && !casaSup[s.nombre]) casaSup[s.nombre] = a;
+        }
+        // d) los sobrantes van de terceras a la UCI
+        for (const n of r.extra.splice(0)) { if (porNombre[n] && ambitoPermitido(porNombre[n], "UCI")) r.UCI.B.push(n); else r.extra.push(n); }
+        // e) en UCI siempre hay alguien en el control A (1 plaza); el resto, en el B
+        if (!r.UCI.A.length && r.UCI.B.length) r.UCI.A.push(r.UCI.B.shift());
+        // f) avisos de huecos
+        for (const a of AMBITOS) if (ocupa(a) < cap[a]) r.avisos.push(`Falta ${cap[a] - ocupa(a)} en ${a}`);
+        salida[d.fecha][t] = r;
+      }
+    }
+    return { cuadrante: salida, parejasTP: fijaDeTP };
+  }
+
+  return { AMBITOS, PLAZAS_DEF, rotarQuincena, emparejarTP, generarPeriodo, quincenaDe };
+})();
 
 /* ============================================================
    APARTADO ESTUDIANTES
@@ -4105,8 +4233,9 @@ function estExportarExcel(lista) {
 
 const EST_VACIO = { nombre: "", apellido1: "", apellido2: "", curso: "4º", escuela: "", tutora: "", modalidad: "DIA_12H", inicio: "", fin: "", contacto: "", notas: "", tutora_prof: "", tutora_prof2: "" };
 
-function EstCalendarioMaster({ lista, anio, mes, onEditar, onCalendario, apodoEnf }) {
+function EstCalendarioMaster({ lista, anio, mes, onEditar, onCalendario, apodoEnf, soloPend }) {
   const est = lista.filter(e => estDiasMes(e, anio, mes).length > 0);
+  const enTabla = (e) => !soloPend || !e.tutora_prof;
   if (!est.length) return null;
   const nDias = new Date(anio, mes + 1, 0).getDate();
   const offset = (new Date(anio, mes, 1).getDay() + 6) % 7;   // lunes = 0
@@ -4150,7 +4279,7 @@ function EstCalendarioMaster({ lista, anio, mes, onEditar, onCalendario, apodoEn
       <table className="est-tabla est-resumen-master">
         <thead><tr><th>Estudiante</th><th>Enfermera referente</th><th className="est-num">Turnos en {EST_MESES_LARGO[mes]}</th><th>Reparto</th><th></th></tr></thead>
         <tbody>
-          {resumen.map(({ e, n, c }) => (
+          {resumen.filter(({ e }) => enTabla(e)).map(({ e, n, c }) => (
             <tr key={e.id}>
               <td><b>{estNombre(e)}</b> <span className="est-tag" style={{ background: EST_COLOR[e.tipo] }}>{e.tipo === "MASTER" ? "Máster" : "Grado " + (e.curso || "")}</span></td>
               <td className="est-tutora">{e.tutora_prof
@@ -4201,14 +4330,21 @@ function estAutoEnfermeras(texto, enfermeras) {
   for (const parte of String(texto || "").split("/")) {
     const ws = estPalabras(parte);
     if (!ws.length) continue;
-    let mejor = null, mejorS = 0, empate = false;
+    // Puntuación: palabra idéntica = 2, parecida (prefijo o una letra) = 1.
+    // Se necesita que coincidan al menos 2 palabras (o la única que haya) y
+    // que la mejor candidata no empate con otra.
+    let mejor = null, mejorS = 0, mejorN = 0, empate = false;
     for (const p of enfermeras) {
       const pal = estPalabras(p.nombre + " " + (p.apodo || ""));
-      const sc = ws.filter(w => pal.some(x => estPalabraIgual(w, x))).length;
-      if (sc > mejorS) { mejor = p; mejorS = sc; empate = false; }
+      let sc = 0, n = 0;
+      for (const w of ws) {
+        if (pal.includes(w)) { sc += 2; n++; }
+        else if (pal.some(x => estPalabraIgual(w, x))) { sc += 1; n++; }
+      }
+      if (sc > mejorS) { mejor = p; mejorS = sc; mejorN = n; empate = false; }
       else if (sc === mejorS && sc > 0) empate = true;
     }
-    if (mejor && !empate && mejorS >= Math.min(2, ws.length)) out.push(mejor.nombre);
+    if (mejor && !empate && mejorN >= Math.min(2, ws.length)) out.push(mejor.nombre);
   }
   return [...new Set(out)].slice(0, 2);
 }
@@ -4407,6 +4543,7 @@ function EstudiantesPanel() {
   const [form, setForm] = useState(null);
   const [enfermeras, setEnfermeras] = useState([]);
   const [calEst, setCalEst] = useState(null);       // estudiante cuyo calendario se muestra
+  const [soloPend, setSoloPend] = useState(false);  // ver solo estudiantes sin enfermera referente
   const [guardando, setGuardando] = useState(false);
   const fileRef = useRef(null);
 
@@ -4471,6 +4608,7 @@ function EstudiantesPanel() {
   const periodos = useMemo(() => {
     const q = estNormTxt(busca);
     const base = (lista || []).filter(e => e.origen !== "CAL_MASTER")
+      .filter(e => !soloPend || !e.tutora_prof)
       .filter(e => verTodos || estEnMes(e, anio, mesSel))
       .filter(e => !q || estNormTxt([estNombre(e), e.tutora, e.escuela, e.contacto].join(" ")).includes(q));
     const g = new Map();
@@ -4482,7 +4620,7 @@ function EstudiantesPanel() {
     return [...g.values()].sort((a, b) => (verTodos ? b.inicio.localeCompare(a.inicio) : a.inicio.localeCompare(b.inicio)))
       .map(p => ({ ...p, est: p.est.sort((a, b) => (a.modalidad || "").localeCompare(b.modalidad || "") || a.tutora.localeCompare(b.tutora)),
         escuelas: [...new Set(p.est.map(e => e.escuela).filter(Boolean))], cursos: [...new Set(p.est.map(e => e.curso).filter(Boolean))] }));
-  }, [lista, anio, mesSel, verTodos, busca]);
+  }, [lista, anio, mesSel, verTodos, busca, soloPend]);
 
   async function guardar() {
     if (!form.nombre.trim()) { setAviso("Escribe el nombre del estudiante."); return; }
@@ -4577,6 +4715,21 @@ function EstudiantesPanel() {
         </div>
       )}
 
+      {/* Estudiantes sin enfermera referente: sin ella no hay calendario de prácticas */}
+      {(() => {
+        const pend = lista.filter(e => !e.tutora_prof && e.fin >= estIso(new Date()));
+        if (!pend.length && !soloPend) return null;
+        const g = pend.filter(e => e.tipo === "GRADO").length, m = pend.length - g;
+        return (
+          <div className={"est-aviso " + (pend.length ? "est-prev" : "est-ok")} style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+            <span style={{ flex: 1 }}>{pend.length
+              ? <><b>{pend.length} estudiantes con prácticas actuales o futuras sin enfermera referente</b> ({g} de grado, {m} de máster). Sin enfermera no se puede generar su calendario: vincúlalos con «Vincular enfermeras» o con «Editar».</>
+              : "Todos los estudiantes con prácticas actuales o futuras tienen enfermera referente."}</span>
+            <button className="est-btn" onClick={() => { const v = !soloPend; setSoloPend(v); if (v) setVerTodos(true); }}>{soloPend ? "Ver todos los estudiantes" : "Ver solo los pendientes"}</button>
+          </div>
+        );
+      })()}
+
       {/* Estudiantes por mes */}
       <div className="est-card">
         <div className="est-card-head">
@@ -4630,7 +4783,7 @@ function EstudiantesPanel() {
       </div>
 
       {/* Calendario del máster (estudiantes que vienen por días sueltos) */}
-      <EstCalendarioMaster lista={lista} anio={anio} mes={mesSel} onEditar={e => { setForm({ ...EST_VACIO, ...e }); setAviso(""); }} onCalendario={setCalEst} apodoEnf={apodoEnf} />
+      <EstCalendarioMaster lista={lista} anio={anio} mes={mesSel} onEditar={e => { setForm({ ...EST_VACIO, ...e }); setAviso(""); }} onCalendario={setCalEst} apodoEnf={apodoEnf} soloPend={soloPend} />
 
       {/* Periodos con parejas tutora - estudiante */}
       <div className="est-card">
@@ -5334,7 +5487,6 @@ function Cronograma({ semana, db, ENGINE, planilla, estructura, cargarAnotacione
   //  - 7h (mañana/tarde), 10h noche y parcial -> BLANCO
   //  - sin cubrir -> rojo
   function cellColor(nombre, d, bloqueIdx) {
-    if (nombre === ENGINE.POS_CERRADA) return { background: "#ececec", color: "#9a9a9a" };
     if (!nombre) return { background: "var(--empty)", color: "transparent" };
     // 1) El color lo manda el FONDO del profesional (configurable en la plantilla).
     const f = db.fondo(nombre);
@@ -5429,9 +5581,9 @@ function Cronograma({ semana, db, ENGINE, planilla, estructura, cargarAnotacione
                           const estaEditando = editando && editando.d === d && editando.t === b.idx && editando.p === p;
                           return (
                             <td key={d} className={"data-cell" + (modoAnotar ? " anotable" : "") + (nota ? " con-nota" : "")} style={st}
-                              title={nombre === ENGINE.POS_CERRADA ? "Plaza que no existe en este turno" : nombre ? (nombre + (et ? " · " + et : "") + (nota ? " · " + nota : "")) : (nota || "Sin cubrir")}
+                              title={nombre ? (nombre + (et ? " · " + et : "") + (nota ? " · " + nota : "")) : (nota || "Sin cubrir")}
                               onClick={modoAnotar && !estaEditando ? () => setEditando({ d, t: b.idx, p }) : undefined}>
-                              {nombre === ENGINE.POS_CERRADA ? "—" : nombre ? db.apodo(nombre) : ""}
+                              {nombre ? db.apodo(nombre) : ""}
                               {etTxt && <span className={"badge badge-" + (et === "doblaje" ? "dbl" : et === "+" ? "plus" : "half")}>{etTxt}</span>}
                               {nota && !estaEditando && <span className="nota-cell">{nota}</span>}
                               {estaEditando && (
@@ -6168,10 +6320,8 @@ function EditorEstructura({ estructura, catalogo, porDefecto, saveEstructura, on
       const guardada = (estructura || []).find(a => a.id === cat.id);
       return guardada
         ? { ...cat, nombre: guardada.nombre || cat.nombre, posiciones: guardada.posiciones,
-            posicionesNoche: guardada.posicionesNoche != null ? guardada.posicionesNoche : (cat.posNocheDefecto != null ? cat.posNocheDefecto : guardada.posiciones),
             activa: guardada.activa, etiquetas: guardada.etiquetas || null, esCatalogo: true }
-        : { ...cat, posiciones: cat.posDefecto, posicionesNoche: cat.posNocheDefecto != null ? cat.posNocheDefecto : cat.posDefecto,
-            activa: false, etiquetas: null, esCatalogo: true };
+        : { ...cat, posiciones: cat.posDefecto, activa: false, etiquetas: null, esCatalogo: true };
     });
     const personalizadas = (estructura || [])
       .filter(a => !catalogo.some(c => c.id === a.id))
@@ -6192,13 +6342,7 @@ function EditorEstructura({ estructura, catalogo, porDefecto, saveEstructura, on
   function setActiva(id, val) { setCampo(id, "activa", val); }
   function setPos(id, val) {
     const n = Math.max(0, Math.min(12, parseInt(val, 10) || 0));
-    setFilas(prev => prev.map(f => f.id === id ? { ...f, posiciones: n,
-      posicionesNoche: Math.min(n, f.posicionesNoche != null ? f.posicionesNoche : n) } : f));
-    marca();
-  }
-  function setPosNoche(id, val) {
-    setFilas(prev => prev.map(f => f.id === id
-      ? { ...f, posicionesNoche: Math.max(0, Math.min(f.posiciones, parseInt(val, 10) || 0)) } : f));
+    setFilas(prev => prev.map(f => f.id === id ? { ...f, posiciones: n } : f));
     marca();
   }
   function setEtiqueta(id, posLocal, texto) {
@@ -6213,7 +6357,7 @@ function EditorEstructura({ estructura, catalogo, porDefecto, saveEstructura, on
     const n = filas.filter(f => !f.esCatalogo).length + 1;
     const id = "CUSTOM_" + Date.now();
     setFilas(prev => [...prev, {
-      id, nombre: "Nueva unidad " + n, rotacion: "UCI A", posiciones: 2, posicionesNoche: 2,
+      id, nombre: "Nueva unidad " + n, rotacion: "UCI A", posiciones: 2,
       activa: true, etiquetas: null, esCatalogo: false,
     }]);
     marca();
@@ -6229,7 +6373,6 @@ function EditorEstructura({ estructura, catalogo, porDefecto, saveEstructura, on
       const config = filas.map(f => ({
         id: f.id, nombre: (f.nombre || "").trim() || f.id, rotacion: f.rotacion,
         posiciones: f.posiciones, activa: f.activa,
-        posicionesNoche: f.posicionesNoche != null ? f.posicionesNoche : f.posiciones,
         etiquetas: f.etiquetas || null,
       }));
       await saveEstructura(config);
@@ -6243,9 +6386,7 @@ function EditorEstructura({ estructura, catalogo, porDefecto, saveEstructura, on
     const def = porDefecto;
     setFilas(catalogo.map(cat => {
       const d = def.find(a => a.id === cat.id);
-      return { ...cat, posiciones: d ? d.posiciones : cat.posDefecto,
-        posicionesNoche: d && d.posicionesNoche != null ? d.posicionesNoche : (d ? d.posiciones : cat.posDefecto),
-        activa: d ? d.activa : false, etiquetas: null, esCatalogo: true };
+      return { ...cat, posiciones: d ? d.posiciones : cat.posDefecto, activa: d ? d.activa : false, etiquetas: null, esCatalogo: true };
     }));
     setAbiertaEtiquetas(null);
     setDirty(true); setMsg("");
@@ -6273,8 +6414,7 @@ function EditorEstructura({ estructura, catalogo, porDefecto, saveEstructura, on
           <span className="est-c-check">Abierta</span>
           <span className="est-c-nombre">Unidad (nombre editable)</span>
           <span className="est-c-rot">Cuenta como</span>
-          <span className="est-c-pos">Día</span>
-          <span className="est-c-pos">Noche</span>
+          <span className="est-c-pos">Posiciones</span>
           <span className="est-c-acciones"></span>
         </div>
         {filas.map(f => (
@@ -6303,13 +6443,6 @@ function EditorEstructura({ estructura, catalogo, porDefecto, saveEstructura, on
                 <input type="number" min="0" max="12" value={f.posiciones}
                   disabled={!f.activa}
                   onChange={e => setPos(f.id, e.target.value)} />
-              </span>
-              <span className="est-c-pos">
-                <input type="number" min="0" max={f.posiciones}
-                  value={f.posicionesNoche != null ? f.posicionesNoche : f.posiciones}
-                  disabled={!f.activa}
-                  title="Plazas que existen en el turno de noche"
-                  onChange={e => setPosNoche(f.id, e.target.value)} />
               </span>
               <span className="est-c-acciones">
                 <button className="minibtn" disabled={!f.activa || f.posiciones === 0}
@@ -6381,7 +6514,7 @@ function EditorEstructura({ estructura, catalogo, porDefecto, saveEstructura, on
    { nombre, turno, apodo, criterio, suplente, antiguedad }
 */
 const OPC_TURNO = ["TM", "TT", "TN", "12H Día", "12H Noche"];
-const OPC_CRITERIO = ["SI", "NO", "UCI", "UCCRI", "SEMIS"];
+const OPC_CRITERIO = ["SI", "NO", "UCI", "UCCRI"];
 const OPC_ANTIG = ["< 3 ANY", "> 3 ANY < 10 ANY", "10 - 20 ANY", "> 20 ANY"];
 
 function filaVacia() {
@@ -7020,7 +7153,6 @@ td.data-cell:has(.nota-edit) { overflow: visible; }
 .crit-NO { background: #f0ede6; color: #7a6a3a; }
 .crit-UCI { background: #e7ecf7; color: #3a4a8e; }
 .crit-UCCRI { background: #f3e7f0; color: #8e3a75; }
-.crit-SEMIS { background: #fbf0e0; color: #8a5a1c; }
 
 .empty-note { padding: 40px; text-align: center; color: var(--muted); background: var(--surface); border: 1px dashed var(--line-strong); border-radius: var(--radius); }
 
@@ -7096,7 +7228,6 @@ td.data-cell:has(.nota-edit) { overflow: visible; }
 .crit-sel.crit-NO { color: #7a6a3a; }
 .crit-sel.crit-UCI { color: #3a4a8e; }
 .crit-sel.crit-UCCRI { color: #8e3a75; }
-.crit-sel.crit-SEMIS { color: #8a5a1c; }
 
 .toggle {
   min-width: 42px; padding: 6px 10px; border-radius: 20px; cursor: pointer;
@@ -7388,7 +7519,7 @@ td.data-cell:has(.nota-edit) { overflow: visible; }
 /* ---------- Editor de estructura ---------- */
 .estructura { max-width: 720px; }
 .est-card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; box-shadow: var(--shadow); }
-.est-row { display: grid; grid-template-columns: 78px 1fr 120px 90px 90px 160px; align-items: center; gap: 10px; padding: 11px 16px; border-bottom: 1px solid var(--line); }
+.est-row { display: grid; grid-template-columns: 78px 1fr 120px 90px 160px; align-items: center; gap: 10px; padding: 11px 16px; border-bottom: 1px solid var(--line); }
 .est-row:last-of-type { border-bottom: none; }
 .est-head-row { background: var(--panel); font-size: 11.5px; font-weight: 620; color: var(--ink-soft); letter-spacing: .02em; text-transform: uppercase; }
 .est-head-row span { font-size: 11px; }
