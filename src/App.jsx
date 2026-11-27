@@ -3183,7 +3183,7 @@ function exportarCronogramaXLSX(resultado, db, ENGINE) {
     resumenHistoricoRotacion, unidadRotacionObligatoria, unidadesCandidatasProf,
     extraerNombresSinVincular,
     turnoNaturalCanon, clasificarJornadaNatural, UMBRAL_H,
-    exportarCronogramaXLSX, posCerrada, posicionesDiaNoche,
+    exportarCronogramaXLSX, posCerrada, posicionesDiaNoche, finAreaEnBloque,
   };
 
 })();
@@ -5768,7 +5768,7 @@ function Cronograma({ semana, db, ENGINE, planilla, estructura, cargarAnotacione
                       if (lista.length > maxExced) maxExced = lista.length;
                     }
                   }
-                  const pFinB = finAreaEnBloque(area, b.idx);   // posiciones de día o de noche
+                  const pFinB = ENGINE.finAreaEnBloque(area, b.idx);   // posiciones de día o de noche
                   const nPosB = Math.max(0, pFinB - area.pIni + 1);
                   if (nPosB === 0 && maxExced === 0) return null;  // cerrada en este bloque
                   const filasArea = nPosB + maxExced;
