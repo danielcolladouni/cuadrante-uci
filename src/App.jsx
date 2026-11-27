@@ -1477,23 +1477,26 @@ function colocarEnDiaTurno(asig, d, turnos, nombre, db, posPreferida, unidadRot)
   if (turnos[0] < 0) return 0;
   const crit = db.criterio(nombre);
   const areas = listaAreasOrdenadas();
-  const t = turnos[0];
+  // Una posición solo vale si está libre en TODOS los turnos que cubre la
+  // persona (un 12 h de día ocupa mañana y tarde). Antes solo se miraba la
+  // mañana y se pisaba a quien ya estaba de tarde en esa posición.
+  const libre = (p) => turnos.every(t => t < 0 || asig.celdas[d][t][p] === "");
   let posElegida = 0;
 
   // 1) Unidad de rotación obligatoria: buscar hueco dentro de esa unidad
   if (unidadRot && puedeIrAArea(crit, unidadRot)) {
     // primero, si la posición preferida cae dentro de la unidad de rotación, reusarla
-    if (posPreferida && posPreferida > 0 && asig.celdas[d][t][posPreferida] === "" &&
+    if (posPreferida && posPreferida > 0 && libre(posPreferida) &&
         posGlobalAArea(posPreferida).area === unidadRot) {
       posElegida = posPreferida;
     }
     for (let p = posGlobalInicioArea(unidadRot); posElegida === 0 && p <= posGlobalFinArea(unidadRot); p++) {
-      if (asig.celdas[d][t][p] === "") posElegida = p;
+      if (libre(p)) posElegida = p;
     }
   }
 
   // 2) Continuidad: repetir la posición preferida si sigue libre y compatible
-  if (posElegida === 0 && posPreferida && posPreferida > 0 && asig.celdas[d][t][posPreferida] === "") {
+  if (posElegida === 0 && posPreferida && posPreferida > 0 && libre(posPreferida)) {
     const rotPref = posGlobalAArea(posPreferida).area;
     if (puedeIrAArea(crit, rotPref)) posElegida = posPreferida;
   }
@@ -1503,7 +1506,7 @@ function colocarEnDiaTurno(asig, d, turnos, nombre, db, posPreferida, unidadRot)
     const area = areas[ai];
     if (!puedeIrAArea(crit, area)) continue;
     for (let p = posGlobalInicioArea(area); p <= posGlobalFinArea(area); p++) {
-      if (asig.celdas[d][t][p] === "") { posElegida = p; break; }
+      if (libre(p)) { posElegida = p; break; }
     }
   }
   if (posElegida > 0) {
@@ -1869,6 +1872,121 @@ function afinarCobertura(asig, semana, db, asignEst) {
   /* ---------- 3) Repetir el paso 1 ---------- */
   cubrirRojos();
 
+  /* ---------- 3b) Rojos en cadena ----------
+     Si queda un rojo en una unidad y los excedentes de ese turno no pueden ir
+     a ella (criterio, o un 12 h que ya tiene la otra mitad del turno en otra
+     posición), se sube al rojo a alguien compatible de otra unidad y el
+     excedente ocupa su sitio. La unidad de origen no pierde a nadie y el rojo
+     queda cubierto. Se prefiere mover a quien esa semana ya está más en la
+     unidad del rojo, luego a suplentes y a quien no tiene posición fija. */
+  function cubrirRojosEnCadena() {
+    let hechos = 0;
+    for (let d = 0; d < 7; d++) {
+      for (const t of [M, T, N]) {
+        for (let guard = 0; guard < 20; guard++) {
+          const pool = exc(d, t).filter(e => e && e.nombre);
+          if (pool.length === 0) break;
+          const huecos = [];
+          for (let p = 1; p <= nPos; p++) if (!C[d][t][p]) huecos.push(p);
+          if (huecos.length === 0) break;
+          huecos.sort((a, b) => cuentaUnidad(d, t, areaDe(a)) - cuentaUnidad(d, t, areaDe(b)) || a - b);
+          let mejor = null, mejorScore = -Infinity;
+          for (const p of huecos) {
+            const u = areaDe(p);
+            for (const e of pool) {
+              const ne = e.nombre;
+              const otroT = t === M ? T : M;
+              const dobleE = t !== N && esDoble(d, ne);
+              // Un 12 h con la otra mitad ya colocada solo puede ir a esa misma columna
+              const fijaE = dobleE ? posDe(d, otroT, ne) : 0;
+              const destinos = [];
+              if (fijaE) destinos.push(fijaE);
+              else for (let q = 1; q <= nPos; q++) destinos.push(q);
+              for (const q of destinos) {
+                if (q === p) continue;
+                const y = C[d][t][q];
+                if (!y || fijos.has(nt(y))) continue;
+                // Si quien sube es un 12 h, solo vale cuando el excedente también es un
+                // 12 h sin posición: el excedente ocupa la columna entera (mañana y
+                // tarde) y el 12 h que sube cubre el rojo y la otra mitad la hace de
+                // extra en esa misma unidad. Así nadie queda partido entre unidades.
+                const dobleY = t !== N && esDoble(d, y);
+                if (dobleY) {
+                  if (!dobleE || fijaE) continue;
+                  if (!C[d][otroT][q] || nt(C[d][otroT][q]) !== nt(y)) continue;
+                  if (!exc(d, otroT).some(x => nt(x.nombre) === nt(ne))) continue;
+                }
+                const v = areaDe(q);
+                if (!puedeIrAArea(db.criterio(y), u)) continue;   // y sube al rojo
+                if (!puedeIrAArea(db.criterio(ne), v)) continue;  // e ocupa el sitio de y
+                // si e es 12 h sin otra mitad colocada, que la columna q esté libre en el otro turno
+                // (así cubre mañana y tarde); si no, cubre solo este turno
+                let sc = 0;
+                if (unidadPrincipal(nt(y), t === N) === u) sc += 4;
+                if (db.esSuplente(y)) sc += 2;
+                if (!conPosFija.has(nt(y))) sc += 1;
+                if (unidadPrincipal(nt(ne), t === N) === v) sc += 2;
+                if (e.area === v) sc += 1;
+                sc -= cuentaUnidad(d, t, u) * 0.1;               // antes la unidad más vacía
+                if (dobleY) sc -= 3;                             // mejor mover a alguien de 7 h
+                if (sc > mejorScore) { mejorScore = sc; mejor = { p, q, y, ne, u, v, dobleE, fijaE, dobleY }; }
+              }
+            }
+          }
+          // Alternativa sin cadena: un 12 h excedente en este turno que tiene la otra
+          // mitad en la columna q puede pasar esa otra mitad a la columna del rojo
+          // (intercambiándola con quien esté allí) y quedarse entero en el rojo.
+          if (!mejor || mejorScore < 4) {
+            let alt = null, altScore = -Infinity;
+            for (const p of huecos) {
+              const u = areaDe(p);
+              for (const e of pool) {
+                const ne = e.nombre;
+                if (t === N || !esDoble(d, ne) || !puedeIrAArea(db.criterio(ne), u)) continue;
+                const otroT = t === M ? T : M;
+                const q = posDe(d, otroT, ne);
+                if (!q || q === p) continue;
+                if (!intercambioValido(d, [otroT], q, p, false)) continue;
+                let sc = 5;
+                if (areaDe(q) === u) sc += 3;                    // sin cambiar a nadie de unidad
+                if (sc > altScore) { altScore = sc; alt = { p, q, ne, u, otroT }; }
+              }
+            }
+            if (alt && (!mejor || altScore > mejorScore)) {
+              const { p, q, ne, u, otroT } = alt;
+              const otro = C[d][otroT][p];
+              aplicarIntercambio(d, [otroT], q, p);
+              C[d][t][p] = ne; quitarDeExc(d, t, ne);
+              reg("rojo (12 h reubicado)", d, t, ne, areaDe(q), u);
+              if (otro) reg("rojo (12 h reubicado)", d, otroT, otro, u, areaDe(q));
+              hechos++;
+              continue;
+            }
+          }
+          if (!mejor) break;
+          const { p, q, y, ne, u, v, dobleE, fijaE, dobleY } = mejor;
+          C[d][t][p] = y;
+          C[d][t][q] = ne;
+          quitarDeExc(d, t, ne);
+          if (dobleY) {
+            const otroT = t === M ? T : M;
+            C[d][otroT][q] = ne; quitarDeExc(d, otroT, ne);
+            if (!C[d][otroT][p]) C[d][otroT][p] = y;            // cubre también la otra mitad
+            else exc(d, otroT).push({ nombre: y, area: u });   // o queda de extra en la misma unidad
+          } else if (dobleE && !fijaE) {
+            const otroT = t === M ? T : M;
+            if (!C[d][otroT][q] && exc(d, otroT).some(x => nt(x.nombre) === nt(ne))) { C[d][otroT][q] = ne; quitarDeExc(d, otroT, ne); }
+          }
+          reg("rojo en cadena", d, t, y, v, u);
+          reg("rojo en cadena", d, t, ne, "excedente", v);
+          hechos++;
+        }
+      }
+    }
+    return hechos;
+  }
+  if (cubrirRojosEnCadena() > 0) cubrirRojos();
+
   /* ---------- 4) Una unidad por semana ---------- */
   // Coste = suma, por persona y ámbito (día/noche), de unidades distintas en la semana.
   function costePersonas(nombres) {
@@ -1904,9 +2022,13 @@ function afinarCobertura(asig, semana, db, asignEst) {
                 const afectados = new Set([nn]);
                 for (const tt of S) { if (C[d][tt][p]) afectados.add(nt(C[d][tt][p])); if (C[d][tt][q]) afectados.add(nt(C[d][tt][q])); }
                 const antes = costePersonas(afectados);
+                const antesInd = new Map([...afectados].map(x => [x, costePersonas([x])]));
                 aplicarIntercambio(d, S, p, q);
                 const despues = costePersonas(afectados);
-                if (despues < antes) {
+                // Nadie puede salir peor parado: si para agrupar a uno se descoloca a
+                // otro que estaba bien (p.ej. una TT toda la semana en su unidad), no se hace.
+                const nadiePeor = [...afectados].every(x => costePersonas([x]) <= antesInd.get(x));
+                if (despues < antes && nadiePeor) {
                   aplicado = true; mejoras++;
                   const otros = [...afectados].filter(x => x !== nn);
                   reg("una unidad por semana", d, t, nombre, areaDe(p), principal + (otros.length ? " (intercambio)" : ""));
@@ -1920,6 +2042,23 @@ function afinarCobertura(asig, semana, db, asignEst) {
       }
     }
     if (mejoras === 0) break;
+  }
+
+  /* ---------- 5) 12 h con una mitad de extra: misma unidad ----------
+     Si un 12 h (o doblaje) cubre una posición en un turno y en el otro queda de
+     extra, ese extra se apunta en la misma unidad: trabaja todo el día allí. */
+  for (let d = 0; d < 7; d++) {
+    for (const [nn, tf] of turnoDia[d]) {
+      if (tf !== TURNO.D12 && tf !== TURNO.DOBLAJE) continue;
+      for (const [t, o] of [[M, T], [T, M]]) {
+        const p = posDe(d, t, nn);
+        if (!p) continue;
+        const e = exc(d, o).find(x => x && x.nombre && nt(x.nombre) === nn);
+        if (!e) continue;
+        const u = areaDe(p);
+        if (e.area !== u && puedeIrAArea(db.criterio(e.nombre), u)) { reg("12h misma unidad", d, o, e.nombre, e.area, u); e.area = u; }
+      }
+    }
   }
   return log;
 }
@@ -2118,7 +2257,8 @@ function construirAvisosDecalaje(asig, planilla, db) {
       if (ocM) {
         const hor = horarioRealDelDia(planilla, db, fecha, ocM);
         if (horarioEmpiezaTarde(hor)) {
-          const cobertor = pickCobertor(dec[d].nm, ocM, usadosTM);
+          const cobertor = pickCobertor(dec[d].nm, ocM, usadosTM,
+            n => unidadDePersonaEn(asig, [[d, TURNO_IDX.NOCHE], [d - 1, TURNO_IDX.NOCHE]], n), posGlobalAArea(p).area);
           if (cobertor) usadosTM.add(normalizarTexto(cobertor));
           avisos.push({ fecha, pos: String(posGlobalAArea(p).posLocal), area: nombreAreaCortoDePosGlobal(p),
             tipo: "TM (07:00-08:00)", cubiertoPor: cobertor, cubierto: !!cobertor });
@@ -2129,7 +2269,8 @@ function construirAvisosDecalaje(asig, planilla, db) {
       if (ocN) {
         const hor = horarioRealDelDia(planilla, db, fecha, ocN);
         if (horarioEmpiezaNocheTarde(hor)) {
-          const cobertor = pickCobertor(dec[d].tn, ocN, usadosNT);
+          const cobertor = pickCobertor(dec[d].tn, ocN, usadosNT,
+            n => unidadDePersonaEn(asig, [[d, TURNO_IDX.TARDE], [d, TURNO_IDX.MANANA]], n), posGlobalAArea(p).area);
           if (cobertor) usadosNT.add(normalizarTexto(cobertor));
           avisos.push({ fecha, pos: String(posGlobalAArea(p).posLocal), area: nombreAreaCortoDePosGlobal(p),
             tipo: "NOCHE (20:00-21:25)", cubiertoPor: cobertor, cubierto: !!cobertor });
@@ -2139,15 +2280,32 @@ function construirAvisosDecalaje(asig, planilla, db) {
   }
   return avisos;
 }
-function pickCobertor(lista, evitar, usados) {
-  const ne = normalizarTexto(evitar);
-  for (const c of lista) {
-    const nc = normalizarTexto(c.nombre);
-    if (nc === ne) continue;
-    if (usados.has(nc)) continue;
-    return c.nombre;
+// Unidad en la que está una persona en alguno de los (día, turno) indicados:
+// por su posición o, si va de extra, por la unidad del extra.
+function unidadDePersonaEn(asig, diasTurnos, nombre) {
+  const nn = normalizarTexto(nombre);
+  for (const [d, t] of diasTurnos) {
+    if (d < 0 || d > 6) continue;
+    const fila = asig.celdas[d][t];
+    for (let p = 1; p < fila.length; p++) if (fila[p] && normalizarTexto(fila[p]) === nn) return posGlobalAArea(p).area;
+    const ex = (asig.excedentes[d * 3 + t] || []).find(e => e && e.nombre && normalizarTexto(e.nombre) === nn);
+    if (ex && ex.area) return ex.area;
   }
   return "";
+}
+// Elige quién cubre un decalaje. Primero alguien de la MISMA unidad que la
+// posición a cubrir; si no hay, cualquiera disponible (como antes).
+function pickCobertor(lista, evitar, usados, unidadDe, unidadObjetivo) {
+  const ne = normalizarTexto(evitar);
+  const libres = lista.filter(c => {
+    const nc = normalizarTexto(c.nombre);
+    return nc !== ne && !usados.has(nc);
+  });
+  if (unidadDe && unidadObjetivo) {
+    const misma = libres.find(c => unidadDe(c.nombre) === unidadObjetivo);
+    if (misma) return misma.nombre;
+  }
+  return libres.length ? libres[0].nombre : "";
 }
 
 /* ---------- M09: registrar en histórico + informe mensual ---------- */
