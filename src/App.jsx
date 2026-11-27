@@ -154,15 +154,27 @@ function etiquetasPorDefectoDeArea(areaId, nPos) {
 }
 
 // Compila una config en un mapa de posiciones globales que usa el motor.
+// Cada unidad tiene posiciones de DÍA (campo `posiciones`, mañana y tarde) y de
+// NOCHE (`posicionesNoche`; si no existe, las mismas que de día). La rejilla usa
+// el mayor de los dos; las posiciones que sobran en un turno quedan CERRADAS en
+// ese turno (nadie se asigna ahí y no cuentan como rojo).
+function posicionesDiaNoche(a) {
+  const dia = Math.max(0, parseInt(a.posiciones, 10) || 0);
+  const nRaw = a.posicionesNoche;
+  const noche = (nRaw === undefined || nRaw === null || nRaw === "") ? dia : Math.max(0, parseInt(nRaw, 10) || 0);
+  return { dia, noche };
+}
 function compilarEstructura(config) {
   const activas = (config && config.length ? config : estructuraPorDefecto())
-    .filter(a => a.activa && a.posiciones > 0);
+    .filter(a => { const { dia, noche } = posicionesDiaNoche(a); return a.activa && Math.max(dia, noche) > 0; });
   const areas = [];
   let cursor = 1;
   for (const a of activas) {
-    const ini = cursor, fin = cursor + a.posiciones - 1;
+    const { dia, noche } = posicionesDiaNoche(a);
+    const n = Math.max(dia, noche);
+    const ini = cursor, fin = cursor + n - 1;
     areas.push({ id: a.id, nombre: a.nombre, rotacion: a.rotacion,
-      posiciones: a.posiciones, posIni: ini, posFin: fin,
+      posiciones: n, posDia: dia, posNoche: noche, posIni: ini, posFin: fin,
       etiquetas: a.etiquetas || null });
     cursor = fin + 1;
   }
@@ -182,11 +194,23 @@ function listaAreasOrdenadas() {
   return out;
 }
 
-// nº de posiciones de una ROTACIÓN (sumando sus áreas: p.ej. UCCRI esq+dre)
-function posicionesDeArea(rotacion) {
+// nº de posiciones de una ROTACIÓN (sumando sus áreas: p.ej. UCCRI esq+dre).
+// esNoche: true = posiciones de noche, false = de día, undefined = rejilla.
+function posicionesDeArea(rotacion, esNoche) {
   let n = 0;
-  for (const a of _EST.areas) if (a.rotacion === rotacion) n += a.posiciones;
+  for (const a of _EST.areas) if (a.rotacion === rotacion)
+    n += esNoche === undefined ? a.posiciones : (esNoche ? a.posNoche : a.posDia);
   return n;
+}
+// ¿La posición global p está cerrada en el turno t (0 mañana, 1 tarde, 2 noche)?
+function posCerrada(p, t) {
+  for (const a of _EST.areas) {
+    if (p >= a.posIni && p <= a.posFin) {
+      const lim = t === 2 ? a.posNoche : a.posDia;
+      return (p - a.posIni + 1) > (lim === undefined ? a.posiciones : lim);
+    }
+  }
+  return false;
 }
 
 // Dada una posición global, su rotación y posición local DENTRO de la rotación.
@@ -297,8 +321,12 @@ function ordenExcedentes() {
 // excedentes tenga hasta ahora, de modo que se complete una vuelta del ciclo
 // antes de poner un segundo en ninguna unidad. Respeta el criterio de acceso.
 // excedentes: [{nombre}]. Devuelve [{nombre, area, ordenEnUnidad}].
-function repartirExcedentes(lista, db) {
-  const orden = ordenExcedentes();
+function repartirExcedentes(lista, db, esNoche) {
+  // Solo unidades con posiciones en ese turno (día o noche): una unidad cerrada
+  // de noche no recibe extras de noche.
+  const ordenTodo = ordenExcedentes();
+  const ordenAbiertas = esNoche === undefined ? ordenTodo : ordenTodo.filter(u => posicionesDeArea(u, !!esNoche) > 0);
+  const orden = ordenAbiertas.length ? ordenAbiertas : ordenTodo;
   const out = [];
   const cont = {};
   for (const u of orden) cont[u] = 0;
@@ -1166,9 +1194,9 @@ function repartirRotacionBloque(profesionales, capacidad, historico, mesActual) 
   return asign;
 }
 // Capacidad (plazas por unidad) de un bloque. esNoche define qué posiciones cuentan.
-function capacidadPorUnidad() {
+function capacidadPorUnidad(esNoche) {
   const cap = {};
-  for (const u of unidadesAbiertasRotacion()) cap[u] = posicionesDeArea(u);
+  for (const u of unidadesAbiertasRotacion()) cap[u] = posicionesDeArea(u, !!esNoche);
   return cap;
 }
 // Calcula el reparto del mes para día y noche. Devuelve Map(profNorm -> unidad).
@@ -1184,8 +1212,8 @@ function calcularRepartoMes(estad, db, historico, fechaLunes) {
     const p = { nombre: e.nombre, profNorm: normalizarTexto(e.nombre), criterio: db.criterio(e.nombre) };
     if (esBloqueNoche(e.bloqueDominante)) noche.push(p); else dia.push(p);
   }
-  const capDia = capacidadPorUnidad();
-  const capNoche = capacidadPorUnidad();
+  const capDia = capacidadPorUnidad(false);
+  const capNoche = capacidadPorUnidad(true);
   const repDia = repartirRotacionBloque(dia, capDia, historico, mesActual);
   const repNoche = repartirRotacionBloque(noche, capNoche, historico, mesActual);
   const total = new Map();
@@ -1304,6 +1332,11 @@ function posicionAntiguoEstaSemana(historico, nombre, unidad, fechaLunes, ocupad
 function asignarEstables(estad, db, historico, fechaLunes) {
   const ocDia = new Array(NPOS_TOTAL_actual() + 1).fill(false);
   const ocNoche = new Array(NPOS_TOTAL_actual() + 1).fill(false);
+  // Posiciones cerradas en día o en noche: nadie puede tenerlas como estables
+  for (let p = 1; p <= NPOS_TOTAL_actual(); p++) {
+    if (posCerrada(p, 0)) ocDia[p] = true;
+    if (posCerrada(p, 2)) ocNoche[p] = true;
+  }
   const asignEst = []; // {nombreNorm, posGlobal, bloque}
   const ya = new Array(estad.length).fill(false);
 
@@ -1393,23 +1426,27 @@ function buscarAsignEstable(asignEst, nombre) {
 }
 
 function aplicarEstablesAdiaPorDia(semana, asignEst, asig) {
+  // Días en que la posición estable no se pudo aplicar (cerrada en ese turno u
+  // ocupada ya por otra persona): esa persona pasa al relleno normal ese día.
+  asig._sinEstable = new Set();
   for (let d = 0; d < 7; d++) {
     for (const reg of semana[d].regs) {
       const a = buscarAsignEstable(asignEst, reg.nombre);
       if (!a || a.posGlobal <= 0) continue;
       const pos = a.posGlobal;
+      let ts = [];
       switch (reg.turnoFinal) {
-        case TURNO.MANANA: asig.celdas[d][TURNO_IDX.MANANA][pos] = reg.nombre; break;
-        case TURNO.TARDE: asig.celdas[d][TURNO_IDX.TARDE][pos] = reg.nombre; break;
-        case TURNO.NOCHE: asig.celdas[d][TURNO_IDX.NOCHE][pos] = reg.nombre; break;
-        case TURNO.D12:
-          asig.celdas[d][TURNO_IDX.MANANA][pos] = reg.nombre;
-          asig.celdas[d][TURNO_IDX.TARDE][pos] = reg.nombre; break;
-        case TURNO.N12: asig.celdas[d][TURNO_IDX.NOCHE][pos] = reg.nombre; break;
-        case TURNO.DOBLAJE:
-          asig.celdas[d][TURNO_IDX.MANANA][pos] = reg.nombre;
-          asig.celdas[d][TURNO_IDX.TARDE][pos] = reg.nombre; break;
+        case TURNO.MANANA: ts = [TURNO_IDX.MANANA]; break;
+        case TURNO.TARDE: ts = [TURNO_IDX.TARDE]; break;
+        case TURNO.NOCHE: ts = [TURNO_IDX.NOCHE]; break;
+        case TURNO.D12: ts = [TURNO_IDX.MANANA, TURNO_IDX.TARDE]; break;
+        case TURNO.N12: ts = [TURNO_IDX.NOCHE]; break;
+        case TURNO.DOBLAJE: ts = [TURNO_IDX.MANANA, TURNO_IDX.TARDE]; break;
       }
+      if (ts.length === 0) continue;
+      const libre = ts.every(t => !posCerrada(pos, t) && asig.celdas[d][t][pos] === "");
+      if (libre) { for (const t of ts) asig.celdas[d][t][pos] = reg.nombre; }
+      else asig._sinEstable.add(d + "|" + normalizarTexto(reg.nombre));
     }
   }
 }
@@ -1443,7 +1480,7 @@ function rellenarHuecosYExcedentes(semana, asignEst, asig, db, historico, fechaL
       : semana[d].regs;
     for (const reg of regsOrden) {
       const a = buscarAsignEstable(asignEst, reg.nombre);
-      if (a && a.posGlobal > 0) continue;
+      if (a && a.posGlobal > 0 && !(asig._sinEstable && asig._sinEstable.has(d + "|" + normalizarTexto(reg.nombre)))) continue;
       const turnos = [-1, -1, -1];
       let bloque = "M";
       switch (reg.turnoFinal) {
@@ -1464,7 +1501,7 @@ function rellenarHuecosYExcedentes(semana, asignEst, asig, db, historico, fechaL
   for (const idx in asig.excedentes) {
     const lista = asig.excedentes[idx];
     if (!lista || lista.length === 0) continue;
-    asig.excedentes[idx] = repartirExcedentes(lista, db);
+    asig.excedentes[idx] = repartirExcedentes(lista, db, Number(idx) % 3 === TURNO_IDX.NOCHE);
   }
 }
 
@@ -1480,7 +1517,7 @@ function colocarEnDiaTurno(asig, d, turnos, nombre, db, posPreferida, unidadRot)
   // Una posición solo vale si está libre en TODOS los turnos que cubre la
   // persona (un 12 h de día ocupa mañana y tarde). Antes solo se miraba la
   // mañana y se pisaba a quien ya estaba de tarde en esa posición.
-  const libre = (p) => turnos.every(t => t < 0 || asig.celdas[d][t][p] === "");
+  const libre = (p) => turnos.every(t => t < 0 || (asig.celdas[d][t][p] === "" && !posCerrada(p, t)));
   let posElegida = 0;
 
   // 1) Unidad de rotación obligatoria: buscar hueco dentro de esa unidad
@@ -1721,6 +1758,7 @@ function afinarCobertura(asig, semana, db, asignEst) {
     const ap = areaDe(p), aq = areaDe(q);
     for (const t of S) {
       const a = C[d][t][p], b = C[d][t][q];
+      if ((a && posCerrada(q, t)) || (b && posCerrada(p, t))) return false;   // nadie a una posición cerrada
       if (a && (fijos.has(nt(a)) || !puedeIrAArea(db.criterio(a), aq))) return false;
       if (b && (fijos.has(nt(b)) || !puedeIrAArea(db.criterio(b), ap))) return false;
     }
@@ -1765,7 +1803,7 @@ function afinarCobertura(asig, semana, db, asignEst) {
           if (pool.length === 0) break;
           // huecos, empezando por la unidad con menos gente
           const huecos = [];
-          for (let p = 1; p <= nPos; p++) if (!C[d][t][p]) huecos.push(p);
+          for (let p = 1; p <= nPos; p++) if (!C[d][t][p] && !posCerrada(p, t)) huecos.push(p);
           if (huecos.length === 0) break;
           huecos.sort((a, b) => cuentaUnidad(d, t, areaDe(a)) - cuentaUnidad(d, t, areaDe(b)) || a - b);
           let colocado = false;
@@ -1887,7 +1925,7 @@ function afinarCobertura(asig, semana, db, asignEst) {
           const pool = exc(d, t).filter(e => e && e.nombre);
           if (pool.length === 0) break;
           const huecos = [];
-          for (let p = 1; p <= nPos; p++) if (!C[d][t][p]) huecos.push(p);
+          for (let p = 1; p <= nPos; p++) if (!C[d][t][p] && !posCerrada(p, t)) huecos.push(p);
           if (huecos.length === 0) break;
           huecos.sort((a, b) => cuentaUnidad(d, t, areaDe(a)) - cuentaUnidad(d, t, areaDe(b)) || a - b);
           let mejor = null, mejorScore = -Infinity;
@@ -2138,7 +2176,7 @@ function rellenarTarde7h(asig, semana, db, incluirSuplentes) {
     candidatos.sort((a, b) => b.score - a.score);
     const used = new Array(candidatos.length).fill(false);
     for (let p = 1; p <= NPOS_TOTAL_actual(); p++) {
-      if (asig.celdas[d][TURNO_IDX.TARDE][p]) continue;
+      if (asig.celdas[d][TURNO_IDX.TARDE][p] || posCerrada(p, TURNO_IDX.TARDE)) continue;
       const { area } = posGlobalAArea(p);
       let mejorIdx = -1;
       for (let k = 0; k < candidatos.length; k++) {
@@ -2183,7 +2221,7 @@ function ajustarParciales(asig, planilla, db) {
       if (yaUsado.has(normalizarTexto(par.nombre))) continue;
       let mejorIdx = -1;
       for (let p = 1; p <= NPOS_TOTAL_actual(); p++) {
-        if (asig.celdas[d][par.turnoIdx][p]) continue;
+        if (asig.celdas[d][par.turnoIdx][p] || posCerrada(p, par.turnoIdx)) continue;
         const { area } = posGlobalAArea(p);
         if (puedeIrAArea(db.criterio(par.nombre), area)) { mejorIdx = p; break; }
       }
@@ -2888,6 +2926,15 @@ function _estiloPorTurno(turnoFinal, S) {
 
 /* ---------- Construye la grid de una semana (cuadrante + decalajes) ---------- */
 const _DIAS = ["LUN", "MAR", "MIÉ", "JUE", "VIE", "SÁB", "DOM"];
+// Última posición global de un área en un bloque (0 mañana, 1 tarde, 2 noche),
+// según sus posiciones de día o de noche. Si el bloque no tiene posiciones en
+// esa área devuelve pIni - 1.
+function finAreaEnBloque(area, idxBloque) {
+  const n = idxBloque === 2 ? area.posNoche : area.posDia;
+  if (n === undefined || n === null) return area.pFin;
+  return Math.min(area.pFin, area.pIni + n - 1);
+}
+
 const _BLOQUES = [
   { idx: 0, label: "MAÑANA", suf: "MATI", lat: "latMati", fecha: "fechaMati", pos: "posDia" },
   { idx: 1, label: "TARDE", suf: "TARDA", lat: "latTarda", fecha: "fechaTarda", pos: "posDia" },
@@ -2926,13 +2973,19 @@ function _gridSemana(sem, db, ENGINE, S, areasLayout) {
     // filas por área
     areasLayout.forEach((area, areaIdx) => {
       let local = 1;
-      for (let p = area.pIni; p <= area.pFin; p++) {
+      const pFinB = finAreaEnBloque(area, b.idx);   // posiciones de día o de noche
+      const sinPosiciones = pFinB < area.pIni;      // unidad cerrada en este bloque
+      if (sinPosiciones) {
+        const hayExc = [0, 1, 2, 3, 4, 5, 6].some(d => (sem.asig.excedentes[d * 3 + b.idx] || []).some(e => e.area === area.rotacion));
+        if (!hayExc) return;
+      }
+      for (let p = area.pIni; p <= pFinB; p++) {
         const row = [];
         // col A: nombre de área solo en la primera fila
         // (la celda se combina con las de debajo, como en INF_PLANING SETMANAL)
         if (p === area.pIni) {
           row.push({ v: area.nombre + " " + b.suf, s: S[b.lat], t: "s" });
-          if (area.pFin > area.pIni) merges.push(`A${grid.length + 1}:A${grid.length + 1 + area.pFin - area.pIni}`);
+          if (pFinB > area.pIni) merges.push(`A${grid.length + 1}:A${grid.length + 1 + pFinB - area.pIni}`);
         }
         else row.push({ v: "", s: S[b.lat] });
         // col B: número local o etiqueta fija de la posición
@@ -2980,7 +3033,7 @@ function _gridSemana(sem, db, ENGINE, S, areasLayout) {
           if (lista.length > maxExced) maxExced = lista.length;
         }
         for (let e = 0; e < maxExced; e++) {
-          const row = [{ v: "", s: S.normal }, { v: "+", s: S[b.pos], t: "s" }];
+          const row = [(sinPosiciones && e === 0) ? { v: area.nombre + " " + b.suf, s: S[b.lat], t: "s" } : { v: "", s: S.normal }, { v: "+", s: S[b.pos], t: "s" }];
           for (let d = 0; d < 7; d++) {
             const lista = (sem.asig.excedentes[d * 3 + b.idx] || []).filter(x => x.area === area.rotacion);
             const ex = lista[e];
@@ -3052,7 +3105,7 @@ function exportarCronogramaXLSX(resultado, db, ENGINE) {
   const { styleSheet, styleIdx: S } = _buildStyles();
   // Áreas reales del cuadrante (estructura dinámica)
   const est = resultado.estructura || ENGINE.estructuraActiva();
-  const areasLayout = (est.areas || []).map(a => ({ id: a.id, nombre: a.nombre, rotacion: a.rotacion, pIni: a.posIni, pFin: a.posFin, etiquetas: a.etiquetas }));
+  const areasLayout = (est.areas || []).map(a => ({ id: a.id, nombre: a.nombre, rotacion: a.rotacion, pIni: a.posIni, pFin: a.posFin, posDia: a.posDia, posNoche: a.posNoche, etiquetas: a.etiquetas }));
 
   // Una hoja por semana + una hoja de informe
   const hojas = [];
@@ -3130,7 +3183,7 @@ function exportarCronogramaXLSX(resultado, db, ENGINE) {
     resumenHistoricoRotacion, unidadRotacionObligatoria, unidadesCandidatasProf,
     extraerNombresSinVincular,
     turnoNaturalCanon, clasificarJornadaNatural, UMBRAL_H,
-    exportarCronogramaXLSX,
+    exportarCronogramaXLSX, posCerrada, posicionesDiaNoche,
   };
 
 })();
@@ -5382,8 +5435,10 @@ function Sidebar(props) {
     onPlanillaClick, onStaffClick, generar, puedeGenerar, busy, historicoLen,
     resultado, guardarEnHistorico, limpiarHistorico, verEditor, vistaActiva,
     verEstructura, estructura, verHistorico, verReglas, reglas } = props;
-  const nAreas = estructura ? estructura.filter(a => a.activa && a.posiciones > 0).length : 0;
-  const nPos = estructura ? estructura.filter(a => a.activa).reduce((s, a) => s + (a.posiciones || 0), 0) : 0;
+  const dn = (a) => ENGINE.posicionesDiaNoche(a);
+  const nAreas = estructura ? estructura.filter(a => a.activa && Math.max(dn(a).dia, dn(a).noche) > 0).length : 0;
+  const nPos = estructura ? estructura.filter(a => a.activa).reduce((s, a) => s + dn(a).dia, 0) : 0;
+  const nPosNoche = estructura ? estructura.filter(a => a.activa).reduce((s, a) => s + dn(a).noche, 0) : 0;
   return (
     <aside className="sidebar">
       <Section step="1" title="Planilla del mes">
@@ -5417,7 +5472,7 @@ function Sidebar(props) {
         </button>
         {estructura
           ? <div className="filemeta">
-              <strong>{nPos} posiciones · {nAreas} áreas</strong>
+              <strong>{nPos === nPosNoche ? `${nPos} posiciones` : `${nPos} de día · ${nPosNoche} de noche`} · {nAreas} áreas</strong>
               <span>Camas operativas de esta semana</span>
             </div>
           : <p className="hint">Define qué unidades están abiertas y con cuántas posiciones.</p>}
@@ -5611,7 +5666,7 @@ function Cronograma({ semana, db, ENGINE, planilla, estructura, cargarAnotacione
   // Layout de áreas a partir de la estructura real del cuadrante generado.
   const areasLayout = useMemo(() => {
     const est = estructura || ENGINE.estructuraActiva();
-    return (est.areas || []).map(a => ({ id: a.id, nombre: a.nombre, rotacion: a.rotacion, pIni: a.posIni, pFin: a.posFin, etiquetas: a.etiquetas }));
+    return (est.areas || []).map(a => ({ id: a.id, nombre: a.nombre, rotacion: a.rotacion, pIni: a.posIni, pFin: a.posFin, posDia: a.posDia, posNoche: a.posNoche, etiquetas: a.etiquetas }));
   }, [estructura, ENGINE]);
   // Precalcular el turnoFinal y la etiqueta de cada profesional por día
   const turnoPorDiaNombre = useMemo(() => {
@@ -5713,8 +5768,11 @@ function Cronograma({ semana, db, ENGINE, planilla, estructura, cargarAnotacione
                       if (lista.length > maxExced) maxExced = lista.length;
                     }
                   }
-                  const filasArea = (area.pFin - area.pIni + 1) + maxExced;
-                  for (let p = area.pIni; p <= area.pFin; p++) {
+                  const pFinB = finAreaEnBloque(area, b.idx);   // posiciones de día o de noche
+                  const nPosB = Math.max(0, pFinB - area.pIni + 1);
+                  if (nPosB === 0 && maxExced === 0) return null;  // cerrada en este bloque
+                  const filasArea = nPosB + maxExced;
+                  for (let p = area.pIni; p <= pFinB; p++) {
                     const isFirst = p === area.pIni;
                     const etFija = ENGINE.etiquetaDePosicion(area, local);
                     rows.push(
@@ -5759,7 +5817,12 @@ function Cronograma({ semana, db, ENGINE, planilla, estructura, cargarAnotacione
                   // Filas de EXCEDENTES de esta unidad (posiciones extra sin número).
                   for (let e = 0; e < maxExced; e++) {
                     rows.push(
-                      <tr key={"exc-" + area.id + "-" + e} className="exc-row">
+                      <tr key={"exc-" + area.id + "-" + e} className={"exc-row" + (nPosB === 0 && e === 0 ? " area-start" : "")}>
+                        {nPosB === 0 && e === 0 && (
+                          <td className="area-cell" rowSpan={filasArea}>
+                            <span className="area-name">{area.nombre}</span>
+                          </td>
+                        )}
                         <td className="num-cell exc-num" title="Excedente">+</td>
                         {fechas.map((f, d) => {
                           const lista = (semana.asig.excedentes[d * 3 + b.idx] || []).filter(x => x.area === area.rotacion);
@@ -6478,12 +6541,13 @@ function EditorEstructura({ estructura, catalogo, porDefecto, saveEstructura, on
       const guardada = (estructura || []).find(a => a.id === cat.id);
       return guardada
         ? { ...cat, nombre: guardada.nombre || cat.nombre, posiciones: guardada.posiciones,
+            posicionesNoche: ENGINE.posicionesDiaNoche(guardada).noche,
             activa: guardada.activa, etiquetas: guardada.etiquetas || null, esCatalogo: true }
-        : { ...cat, posiciones: cat.posDefecto, activa: false, etiquetas: null, esCatalogo: true };
+        : { ...cat, posiciones: cat.posDefecto, posicionesNoche: cat.posDefecto, activa: false, etiquetas: null, esCatalogo: true };
     });
     const personalizadas = (estructura || [])
       .filter(a => !catalogo.some(c => c.id === a.id))
-      .map(a => ({ ...a, esCatalogo: false }));
+      .map(a => ({ ...a, posicionesNoche: ENGINE.posicionesDiaNoche(a).noche, esCatalogo: false }));
     return [...filasCat, ...personalizadas];
   };
   const [filas, setFilas] = useState(inicial);
@@ -6498,15 +6562,17 @@ function EditorEstructura({ estructura, catalogo, porDefecto, saveEstructura, on
     marca();
   }
   function setActiva(id, val) { setCampo(id, "activa", val); }
-  function setPos(id, val) {
+  // campo: "posiciones" (día: mañana y tarde) o "posicionesNoche"
+  function setPos(id, val, campo = "posiciones") {
     const n = Math.max(0, Math.min(12, parseInt(val, 10) || 0));
-    setFilas(prev => prev.map(f => f.id === id ? { ...f, posiciones: n } : f));
+    setFilas(prev => prev.map(f => f.id === id ? { ...f, [campo]: n } : f));
     marca();
   }
+  const maxPos = (f) => Math.max(f.posiciones || 0, f.posicionesNoche || 0);
   function setEtiqueta(id, posLocal, texto) {
     setFilas(prev => prev.map(f => {
       if (f.id !== id) return f;
-      const base = f.etiquetas || ENGINE.etiquetasPorDefectoDeArea(f.id, f.posiciones);
+      const base = f.etiquetas || ENGINE.etiquetasPorDefectoDeArea(f.id, maxPos(f));
       return { ...f, etiquetas: { ...base, [String(posLocal)]: texto } };
     }));
     marca();
@@ -6515,7 +6581,7 @@ function EditorEstructura({ estructura, catalogo, porDefecto, saveEstructura, on
     const n = filas.filter(f => !f.esCatalogo).length + 1;
     const id = "CUSTOM_" + Date.now();
     setFilas(prev => [...prev, {
-      id, nombre: "Nueva unidad " + n, rotacion: "UCI A", posiciones: 2,
+      id, nombre: "Nueva unidad " + n, rotacion: "UCI A", posiciones: 2, posicionesNoche: 2,
       activa: true, etiquetas: null, esCatalogo: false,
     }]);
     marca();
@@ -6530,7 +6596,7 @@ function EditorEstructura({ estructura, catalogo, porDefecto, saveEstructura, on
     try {
       const config = filas.map(f => ({
         id: f.id, nombre: (f.nombre || "").trim() || f.id, rotacion: f.rotacion,
-        posiciones: f.posiciones, activa: f.activa,
+        posiciones: f.posiciones, posicionesNoche: f.posicionesNoche, activa: f.activa,
         etiquetas: f.etiquetas || null,
       }));
       await saveEstructura(config);
@@ -6544,13 +6610,15 @@ function EditorEstructura({ estructura, catalogo, porDefecto, saveEstructura, on
     const def = porDefecto;
     setFilas(catalogo.map(cat => {
       const d = def.find(a => a.id === cat.id);
-      return { ...cat, posiciones: d ? d.posiciones : cat.posDefecto, activa: d ? d.activa : false, etiquetas: null, esCatalogo: true };
+      const pd = d ? d.posiciones : cat.posDefecto;
+      return { ...cat, posiciones: pd, posicionesNoche: d && d.posicionesNoche != null ? d.posicionesNoche : pd, activa: d ? d.activa : false, etiquetas: null, esCatalogo: true };
     }));
     setAbiertaEtiquetas(null);
     setDirty(true); setMsg("");
   }
 
   const totalPos = filas.filter(f => f.activa).reduce((s, f) => s + (f.posiciones || 0), 0);
+  const totalPosNoche = filas.filter(f => f.activa).reduce((s, f) => s + (f.posicionesNoche || 0), 0);
   const rotacionesDisponibles = ["UCI A", "UCI B", "SEMIS", "REA", "UCCRI"];
 
   return (
@@ -6559,7 +6627,8 @@ function EditorEstructura({ estructura, catalogo, porDefecto, saveEstructura, on
         <div>
           <h2>Estructura de la unidad</h2>
           <p className="section-intro">
-            Marca qué unidades están abiertas, ajusta sus posiciones, cambia su nombre si lo
+            Marca qué unidades están abiertas, ajusta sus posiciones de día (mañana y tarde) y
+            de noche, cambia su nombre si lo
             necesitas, y edita la etiqueta de cada posición (por ejemplo «+ revisió carro»).
             También puedes crear unidades nuevas. Todo se guarda para las próximas generaciones.
           </p>
@@ -6568,16 +6637,17 @@ function EditorEstructura({ estructura, catalogo, porDefecto, saveEstructura, on
       </div>
 
       <div className="est-card">
-        <div className="est-row est-head-row">
+        <div className="est-row est-row-dn est-head-row">
           <span className="est-c-check">Abierta</span>
           <span className="est-c-nombre">Unidad (nombre editable)</span>
           <span className="est-c-rot">Cuenta como</span>
-          <span className="est-c-pos">Posiciones</span>
+          <span className="est-c-pos" title="Posiciones de mañana y tarde">☀ Día</span>
+          <span className="est-c-pos" title="Posiciones de noche">☾ Noche</span>
           <span className="est-c-acciones"></span>
         </div>
         {filas.map(f => (
           <React.Fragment key={f.id}>
-            <div className={"est-row" + (f.activa ? "" : " inactiva")}>
+            <div className={"est-row est-row-dn" + (f.activa ? "" : " inactiva")}>
               <span className="est-c-check">
                 <button className={"chk " + (f.activa ? "on" : "")}
                   onClick={() => setActiva(f.id, !f.activa)}
@@ -6599,11 +6669,16 @@ function EditorEstructura({ estructura, catalogo, porDefecto, saveEstructura, on
               </span>
               <span className="est-c-pos">
                 <input type="number" min="0" max="12" value={f.posiciones}
-                  disabled={!f.activa}
+                  disabled={!f.activa} aria-label="Posiciones de día"
                   onChange={e => setPos(f.id, e.target.value)} />
               </span>
+              <span className="est-c-pos">
+                <input type="number" min="0" max="12" value={f.posicionesNoche}
+                  disabled={!f.activa} aria-label="Posiciones de noche"
+                  onChange={e => setPos(f.id, e.target.value, "posicionesNoche")} />
+              </span>
               <span className="est-c-acciones">
-                <button className="minibtn" disabled={!f.activa || f.posiciones === 0}
+                <button className="minibtn" disabled={!f.activa || maxPos(f) === 0}
                   onClick={() => setAbiertaEtiquetas(abiertaEtiquetas === f.id ? null : f.id)}>
                   {abiertaEtiquetas === f.id ? "Ocultar etiquetas" : "Etiquetas…"}
                 </button>
@@ -6619,8 +6694,8 @@ function EditorEstructura({ estructura, catalogo, porDefecto, saveEstructura, on
                   Si quieres que el texto <strong>sustituya</strong> al número, empieza por «=»
                   (p. ej. <code>=ATURADA+ICTUS+CARRO</code>).
                 </div>
-                {Array.from({ length: f.posiciones }, (_, i) => i + 1).map(pl => {
-                  const base = f.etiquetas || ENGINE.etiquetasPorDefectoDeArea(f.id, f.posiciones);
+                {Array.from({ length: maxPos(f) }, (_, i) => i + 1).map(pl => {
+                  const base = f.etiquetas || ENGINE.etiquetasPorDefectoDeArea(f.id, maxPos(f));
                   return (
                     <div key={pl} className="est-et-row">
                       <span className="est-et-num">Posición {pl}</span>
@@ -6636,7 +6711,10 @@ function EditorEstructura({ estructura, catalogo, porDefecto, saveEstructura, on
         ))}
         <div className="est-total">
           <span>Total de posiciones abiertas</span>
-          <strong>{totalPos}</strong>
+          <span className="est-total-dn">
+            <span>Día <strong>{totalPos}</strong></span>
+            <span>Noche <strong>{totalPosNoche}</strong></span>
+          </span>
         </div>
       </div>
 
@@ -7675,13 +7753,29 @@ td.data-cell:has(.nota-edit) { overflow: visible; }
 .login-foot { margin: 22px 0 0; font-size: 11.5px; line-height: 1.5; color: var(--muted); }
 
 /* ---------- Editor de estructura ---------- */
-.estructura { max-width: 720px; }
+.estructura { max-width: 840px; }
 .est-card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; box-shadow: var(--shadow); }
 .est-row { display: grid; grid-template-columns: 78px 1fr 120px 90px 160px; align-items: center; gap: 10px; padding: 11px 16px; border-bottom: 1px solid var(--line); }
 .est-row:last-of-type { border-bottom: none; }
 .est-head-row { background: var(--panel); font-size: 11.5px; font-weight: 620; color: var(--ink-soft); letter-spacing: .02em; text-transform: uppercase; }
 .est-head-row span { font-size: 11px; }
 .est-row.inactiva { opacity: .5; }
+.est-row.est-row-dn { grid-template-columns: 64px minmax(170px, 1fr) 104px 70px 70px 132px; }
+.est-row-dn .est-nombre-input { width: 100%; box-sizing: border-box; }
+.est-row-dn .est-c-pos input { width: 62px; }
+.est-total-dn { display: flex; gap: 22px; align-items: baseline; }
+.est-total-dn span { display: inline-flex; gap: 7px; align-items: baseline; }
+@media (max-width: 640px) {
+  .est-row.est-row-dn { grid-template-columns: 34px 1fr 64px 64px; grid-template-areas: "chk nom nom nom" "chk rot dia noc" "chk acc acc acc"; row-gap: 8px; }
+  .est-row.est-row-dn.est-head-row { grid-template-areas: "chk nom dia noc"; }
+  .est-row-dn.est-head-row .est-c-check, .est-row-dn.est-head-row .est-c-rot, .est-row-dn.est-head-row .est-c-acciones { display: none; }
+  .est-row-dn.est-head-row .est-c-pos:nth-of-type(4) { grid-area: dia; } .est-row-dn.est-head-row .est-c-pos:nth-of-type(5) { grid-area: noc; }
+  .est-row-dn .est-c-acciones .minibtn { flex: 1; }
+  .est-row-dn .est-c-check { grid-area: chk; } .est-row-dn .est-c-nombre { grid-area: nom; }
+  .est-row-dn .est-c-rot { grid-area: rot; } .est-row-dn .est-c-acciones { grid-area: acc; min-width: 0; }
+  .est-row-dn .est-c-pos:nth-of-type(4) { grid-area: dia; } .est-row-dn .est-c-pos:nth-of-type(5) { grid-area: noc; }
+  .est-row-dn .est-c-pos input { width: 56px; }
+}
 .est-c-nombre { font-size: 14px; font-weight: 560; }
 .rot-tag { display: inline-block; padding: 2px 9px; border-radius: 20px; font-size: 11px; font-weight: 600; background: var(--accent-wash); color: var(--accent-deep); }
 .est-c-pos input { width: 70px; padding: 7px 9px; border: 1px solid var(--line-strong); border-radius: 7px; font: inherit; font-size: 13px; text-align: center; background: var(--surface); color: var(--ink); }
